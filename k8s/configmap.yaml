@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: abyss-backend-config
+  labels:
+    app.kubernetes.io/name: abyss-backend
+data:
+  ABYSS_BACKEND_ADDR: "0.0.0.0:8080"
+  ABYSS_BACKEND_ENV: "self-hosted"
+  ABYSS_BACKEND_LOG_LEVEL: "info"
+  ABYSS_BACKEND_DATABASE_POOL_SIZE: "10"
+  ABYSS_BACKEND_RUN_MIGRATIONS: "true"
+  ABYSS_BACKEND_MAX_INGEST_BATCH_SIZE: "1000"
+  ABYSS_BACKEND_SUMMARY_SCAN_LIMIT: "100000"
+  ABYSS_BACKEND_DEFAULT_PAGE_SIZE: "100"
