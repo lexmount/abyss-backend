@@ -157,6 +157,39 @@ Keep `ABYSS_API_TOKEN` for Agent configuration. The example database password
 is intended only for a host-local deployment; use managed secrets and TLS when
 the service is reachable from other machines.
 
+#### Enable search
+
+Session search is optional. For a host-local deployment, start a single-node
+Elasticsearch container on the same Docker network before starting the backend:
+
+```bash
+docker volume inspect abyss-elasticsearch-data >/dev/null 2>&1 || docker volume create abyss-elasticsearch-data
+
+docker run --detach \
+  --name abyss-elasticsearch \
+  --network abyss-local \
+  --restart unless-stopped \
+  --memory=1536m \
+  --env discovery.type=single-node \
+  --env xpack.security.enabled=false \
+  --env ES_JAVA_OPTS='-Xms512m -Xmx512m' \
+  --volume abyss-elasticsearch-data:/usr/share/elasticsearch/data \
+  docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+```
+
+Add the following option to the `docker run` command for `abyss-backend`:
+
+```bash
+--env ABYSS_BACKEND_ELASTICSEARCH_URL='http://abyss-elasticsearch:9200'
+```
+
+The backend creates the search index and projects existing and newly ingested
+events asynchronously. The disabled Elasticsearch security setting above is
+only for a host-local Docker network. Private deployments should use HTTPS with
+a certificate trusted by the backend image and configure
+`ABYSS_BACKEND_ELASTICSEARCH_USERNAME` and
+`ABYSS_BACKEND_ELASTICSEARCH_PASSWORD` when authentication is enabled.
+
 ### Kubernetes
 
 The `k8s/` Kustomize base expects a Secret named `abyss-backend-secret` with
