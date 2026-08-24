@@ -1,4 +1,9 @@
 //! Standalone bearer authentication mapped to one deployment owner.
+//!
+//! This module is intentionally not a login or SSO implementation. Operators
+//! provision one opaque API token, store only its SHA-256 hash in configuration,
+//! and every valid request maps to [`OWNER_ID`]. This keeps authorization data
+//! ownership explicit until a multi-user identity system is introduced.
 
 use axum::http::{HeaderMap, header};
 use sha2::{Digest, Sha256};
@@ -7,14 +12,20 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 
+/// Stable database owner seeded by the initial migration.
 pub const OWNER_ID: Uuid = Uuid::from_u128(1);
 
 #[derive(Clone)]
+/// Canonical SHA-256 digest of the deployment bearer token.
 pub struct IdentityConfig {
     token_hash: [u8; 32],
 }
 
 impl IdentityConfig {
+    /// Parses exactly 32 bytes encoded as lowercase hexadecimal.
+    ///
+    /// Requiring canonical encoding avoids accepting multiple textual forms of
+    /// the same secret and catches malformed deployment secrets at startup.
     pub fn parse(encoded_hash: &str) -> Result<Self, AppError> {
         let bytes = hex::decode(encoded_hash).map_err(|_error| invalid_hash())?;
         let token_hash = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_error| invalid_hash())?;
@@ -26,19 +37,23 @@ impl IdentityConfig {
 }
 
 #[derive(Clone)]
+/// Validates HTTP bearer credentials for the standalone owner.
 pub struct IdentityAuthenticator {
     config: IdentityConfig,
 }
 
 impl IdentityAuthenticator {
+    /// Creates an authenticator from startup-validated configuration.
     #[must_use]
     pub const fn new(config: IdentityConfig) -> Self {
         Self { config }
     }
 
+    /// Authenticates one request and returns the database owner identifier.
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Uuid, AppError> {
         let token = bearer_token(headers)?;
         let presented_hash = Sha256::digest(token.as_bytes());
+        // Constant-time comparison avoids leaking how many digest bytes match.
         if !bool::from(
             presented_hash
                 .as_slice()

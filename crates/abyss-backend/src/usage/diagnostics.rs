@@ -14,17 +14,27 @@ use serde_json::Value;
 use crate::error::AppError;
 
 #[derive(Deserialize)]
+/// One opaque diagnostic capture correlated with usage events in the batch.
 pub struct IngestDiagnosticCapture {
+    /// Collector-generated idempotency key scoped to the owner.
     pub capture_id: String,
+    /// Time at which the diagnostic evidence was observed.
     pub captured_at: DateTime<Utc>,
+    /// Collector flow identifier used to correlate related captures.
     pub flow_id: String,
+    /// Usage-event identifiers that explain the capture context.
     pub event_ids: Vec<String>,
+    /// Version of the collector that produced the payload.
     pub collector_version: String,
     /// Agent Hook evidence stored without content-level validation.
     pub payload: Value,
 }
 
 impl IngestDiagnosticCapture {
+    /// Ensures every referenced event appears exactly once in the same batch.
+    ///
+    /// Database-backed validation later verifies that the persisted events also
+    /// share an authenticated owner, session, and device context.
     pub fn validate_event_correlation(
         &self,
         request_event_ids: &HashSet<&str>,

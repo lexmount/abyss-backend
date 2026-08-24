@@ -1,4 +1,9 @@
-//! HTTP routes for standalone Agent event ingestion and queries.
+//! HTTP boundary for standalone Agent event ingestion and queries.
+//!
+//! The health endpoints are public, while every event, attachment, summary,
+//! timeline, and search endpoint authenticates the deployment bearer token.
+//! Diesel is synchronous, so all database access is moved onto Tokio's blocking
+//! pool through [`run_db`] rather than running on asynchronous executor threads.
 
 use axum::{
     Json, Router,
@@ -31,16 +36,28 @@ use crate::{
 const MAX_INGEST_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
+/// Cloneable dependencies and request limits shared by all Axum handlers.
 pub struct AppState {
+    /// Deployment label exposed by the informational root endpoint.
     pub environment: String,
+    /// Maximum events and diagnostic captures accepted per ingest request.
     pub max_ingest_batch_size: usize,
+    /// Default upper bound for summary aggregation rows.
     pub summary_scan_limit: i64,
+    /// Default raw-event page size.
     pub default_page_size: i64,
+    /// Deployment-wide bearer-token validator.
     pub identity: IdentityAuthenticator,
+    /// Optional full-text search service.
     pub search: Option<SearchService>,
+    /// PostgreSQL connection pool used by request handlers.
     pub pool: DbPool,
 }
 
+/// Builds the complete HTTP router for one backend process.
+///
+/// The ingest body limit is intentionally route-local so future endpoints do
+/// not inherit a large request allowance by accident.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
@@ -82,6 +99,8 @@ async fn health() -> Json<ServiceStatus> {
 }
 
 async fn ready(State(state): State<AppState>) -> Result<Json<ServiceStatus>, AppError> {
+    // Readiness checks the source of truth only. Search is an optional derived
+    // service and its temporary failure must not remove ingestion capacity.
     run_db(state, db::check_ready).await?;
     Ok(Json(ServiceStatus {
         service: "abyss-backend",
@@ -133,6 +152,8 @@ async fn session_search(
         .ok_or_else(|| AppError::unavailable("session search is not configured".to_owned()))?;
     let execution = search.search(user_id, query).await?;
     let session_ids = execution.session_ids();
+    // Elasticsearch contains only a bounded search projection. Authoritative
+    // session/device details are reloaded from PostgreSQL under the owner scope.
     let details = run_db(state, move |connection| {
         SearchOutboxRepository::session_details(connection, user_id, &session_ids)
     })
@@ -189,6 +210,8 @@ async fn image_attachment(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
     );
+    // Attachments may contain sensitive conversation context. Disallow MIME
+    // sniffing, shared caching, and cross-origin embedding even for valid images.
     response_headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -219,6 +242,8 @@ where
     T: Send + 'static,
     F: FnOnce(&mut PgConnection) -> Result<T, AppError> + Send + 'static,
 {
+    // Diesel and r2d2 are blocking APIs. Acquiring the pool connection inside
+    // spawn_blocking also keeps pool contention off Tokio worker threads.
     task::spawn_blocking(move || {
         let mut connection = state.pool.get()?;
         task_fn(&mut connection)

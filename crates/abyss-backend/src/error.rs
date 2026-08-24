@@ -1,4 +1,8 @@
-//! Shared error types for HTTP and database operations.
+//! Shared error types and their safe HTTP representation.
+//!
+//! Client-actionable failures retain their messages. Configuration, database,
+//! pool, and internal failures are logged server-side and deliberately reduced
+//! to a generic response so implementation details and secrets are not exposed.
 
 use axum::{
     Json,
@@ -8,46 +12,61 @@ use axum::{
 use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
+/// Error vocabulary shared across configuration, HTTP, and persistence layers.
 pub enum AppError {
+    /// Invalid process configuration detected during startup.
     #[error("configuration error: {0}")]
     Config(String),
+    /// Diesel query or transaction failure.
     #[error("database error: {0}")]
     Database(#[from] diesel::result::Error),
+    /// PostgreSQL connection-pool failure.
     #[error("connection pool error: {0}")]
     Pool(#[from] r2d2::Error),
+    /// Authenticated resource does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+    /// Missing or invalid deployment bearer token.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    /// Optional dependency is disabled or temporarily unavailable.
     #[error("unavailable: {0}")]
     Unavailable(String),
+    /// Request data violates an API contract.
     #[error("validation error: {0}")]
     Validation(String),
+    /// Unexpected application invariant or task failure.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 impl AppError {
+    /// Constructs a configuration error.
     pub const fn config(message: String) -> Self {
         Self::Config(message)
     }
 
+    /// Constructs a request validation error.
     pub const fn validation(message: String) -> Self {
         Self::Validation(message)
     }
 
+    /// Constructs a resource-not-found error.
     pub const fn not_found(message: String) -> Self {
         Self::NotFound(message)
     }
 
+    /// Constructs an authentication error.
     pub const fn unauthorized(message: String) -> Self {
         Self::Unauthorized(message)
     }
 
+    /// Constructs a dependency-unavailable error.
     pub const fn unavailable(message: String) -> Self {
         Self::Unavailable(message)
     }
 
+    /// Constructs an unexpected internal error.
     pub const fn internal(message: String) -> Self {
         Self::Internal(message)
     }

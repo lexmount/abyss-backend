@@ -1,4 +1,9 @@
 //! Environment-backed standalone backend configuration.
+//!
+//! Every process setting is read once during startup. Empty or whitespace-only
+//! values are treated as absent, positive numeric settings are rejected at the
+//! boundary, and Elasticsearch is enabled only when its URL is present. This
+//! leaves the rest of the service with a fully validated, immutable snapshot.
 
 use std::{env, net::SocketAddr, num::ParseIntError};
 
@@ -15,22 +20,36 @@ const DEFAULT_SEARCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_SEARCH_POLL_INTERVAL_MILLISECONDS: u64 = 500;
 const DEFAULT_SEARCH_BATCH_SIZE: i64 = 100;
 
+/// Complete runtime configuration shared by process startup and HTTP state.
 pub struct Config {
+    /// Socket address on which the HTTP server listens.
     pub addr: SocketAddr,
+    /// Deployment label returned by the root endpoint and used by safety checks.
     pub environment: String,
+    /// Explicit escape hatch for running black-box instances in containers.
     pub blackbox_allow_non_loopback: bool,
+    /// Default tracing filter used when `RUST_LOG` is not set.
     pub log_level: String,
+    /// PostgreSQL connection string.
     pub database_url: String,
+    /// Maximum number of PostgreSQL connections held by the r2d2 pool.
     pub database_pool_size: u32,
+    /// Whether embedded Diesel migrations run before the listener starts.
     pub run_migrations: bool,
+    /// Maximum events and diagnostic captures accepted in one ingest request.
     pub max_ingest_batch_size: usize,
+    /// Default and maximum row limit used by summary aggregation.
     pub summary_scan_limit: i64,
+    /// Default number of events returned by paginated raw-event queries.
     pub default_page_size: i64,
+    /// Deployment-wide bearer-token authentication configuration.
     pub identity: IdentityConfig,
+    /// Optional Elasticsearch projection configuration.
     pub search: Option<SearchConfig>,
 }
 
 impl Config {
+    /// Reads and validates all `ABYSS_BACKEND_*` environment variables.
     pub fn from_env() -> Result<Self, AppError> {
         let addr = read_env("ABYSS_BACKEND_ADDR", DEFAULT_ADDR)
             .parse::<SocketAddr>()
@@ -73,12 +92,19 @@ impl Config {
 }
 
 #[derive(Clone)]
+/// Settings required by the Elasticsearch client and projection worker.
 pub struct SearchConfig {
+    /// Base Elasticsearch URL, without an index or API path suffix.
     pub endpoint: String,
+    /// Optional HTTP Basic Authentication username.
     pub username: Option<String>,
+    /// Optional HTTP Basic Authentication password.
     pub password: Option<String>,
+    /// Per-request Elasticsearch timeout in seconds.
     pub request_timeout_seconds: u64,
+    /// Idle polling delay for the search outbox worker.
     pub poll_interval_milliseconds: u64,
+    /// Maximum outbox rows claimed or backfilled per worker iteration.
     pub batch_size: i64,
 }
 
@@ -88,6 +114,8 @@ impl SearchConfig {
         let username = env_value("ABYSS_BACKEND_ELASTICSEARCH_USERNAME");
         let password = env_value("ABYSS_BACKEND_ELASTICSEARCH_PASSWORD");
 
+        // Credentials without an endpoint almost always indicate a misspelled
+        // or missing secret, so fail startup instead of silently disabling search.
         let Some(endpoint) = endpoint else {
             if username.is_some() || password.is_some() {
                 return Err(AppError::config(
@@ -98,6 +126,7 @@ impl SearchConfig {
             return Ok(None);
         };
 
+        // Basic Authentication is only meaningful as a complete pair.
         if username.is_some() != password.is_some() {
             return Err(AppError::config(
                 "ABYSS_BACKEND_ELASTICSEARCH_USERNAME and ABYSS_BACKEND_ELASTICSEARCH_PASSWORD must be configured together"
@@ -134,6 +163,8 @@ fn read_required_env(key: &str) -> Result<String, AppError> {
 }
 
 fn env_value(key: &str) -> Option<String> {
+    // Normalizing empty secrets to None makes mounted-but-empty Kubernetes
+    // secrets behave the same as missing environment variables.
     env::var(key)
         .ok()
         .map(|value| value.trim().to_owned())

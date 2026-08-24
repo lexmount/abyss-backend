@@ -1,3 +1,5 @@
+-- Drop in reverse dependency order so every foreign key remains valid while
+-- the consolidated standalone schema is removed.
 DROP TABLE IF EXISTS search_outbox;
 DROP TABLE IF EXISTS agent_diagnostic_capture_events;
 DROP TABLE IF EXISTS agent_diagnostic_captures;

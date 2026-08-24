@@ -1,4 +1,9 @@
 //! Image attachment ingest contracts, validation, and download response models.
+//!
+//! Attachments may carry either metadata alone or inline base64 content. All
+//! declared sizes, hashes, media signatures, positions, and aggregate limits are
+//! checked before a database transaction begins so an invalid image cannot
+//! partially persist the surrounding event batch.
 
 use std::collections::HashSet;
 
@@ -18,17 +23,22 @@ const MAX_BASE64_IMAGE_CHARACTERS: usize = 11_184_812;
 /// Browser-safe raster media types accepted by the audit service.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ImageMediaType {
+    /// Portable Network Graphics image.
     #[serde(rename = "image/png")]
     Png,
+    /// JPEG image.
     #[serde(rename = "image/jpeg")]
     Jpeg,
+    /// WebP image.
     #[serde(rename = "image/webp")]
     Webp,
+    /// Graphics Interchange Format image.
     #[serde(rename = "image/gif")]
     Gif,
 }
 
 impl ImageMediaType {
+    /// Returns the canonical MIME type persisted and emitted by the API.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -39,6 +49,10 @@ impl ImageMediaType {
         }
     }
 
+    /// Parses a media type read from a database row.
+    ///
+    /// An unknown stored value is an internal data-integrity error rather than
+    /// a client validation error because the migration constrains this column.
     pub fn from_stored(value: &str) -> Result<Self, AppError> {
         match value {
             "image/png" => Ok(Self::Png),
@@ -51,6 +65,7 @@ impl ImageMediaType {
         }
     }
 
+    /// Returns the safe file extension used in attachment responses.
     #[must_use]
     pub const fn file_extension(self) -> &'static str {
         match self {
@@ -76,38 +91,57 @@ impl ImageMediaType {
 /// Image attachment supplied with an Agent usage ingest event.
 #[derive(Debug, Deserialize)]
 pub struct IngestImageAttachment {
+    /// Zero-based display position within the event.
     pub position: i32,
+    /// Declared browser-safe raster media type.
     pub media_type: ImageMediaType,
+    /// Declared decoded byte length.
     pub byte_size: u64,
+    /// Lowercase hexadecimal SHA-256 of the decoded content.
     pub sha256: String,
+    /// Optional standard-base64 encoded image bytes.
     pub content_base64: Option<String>,
 }
 
 /// Validated attachment ready for database persistence.
 #[derive(Debug)]
 pub struct ValidatedImageAttachment {
+    /// Unique non-negative display position.
     pub position: i32,
+    /// Media type verified against the file signature when content is present.
     pub media_type: ImageMediaType,
+    /// Decoded size converted to PostgreSQL's signed integer representation.
     pub byte_size: i64,
+    /// Decoded 32-byte SHA-256 digest.
     pub sha256: Vec<u8>,
+    /// Optional decoded image bytes.
     pub content: Option<Vec<u8>>,
 }
 
 /// Attachment metadata returned with usage event APIs.
 #[derive(Debug, Serialize)]
 pub struct UsageEventAttachmentResponse {
+    /// Backend-generated attachment primary key.
     pub id: Uuid,
+    /// Display position within the event.
     pub position: i32,
+    /// Validated image media type.
     pub media_type: ImageMediaType,
+    /// Decoded image byte length.
     pub byte_size: i64,
+    /// Lowercase hexadecimal SHA-256 digest.
     pub sha256: String,
+    /// Whether bytes can be fetched from the attachment endpoint.
     pub content_available: bool,
 }
 
 /// Authorized image bytes returned by the attachment download repository.
 pub struct StoredImageAttachment {
+    /// Validated media type used for the HTTP `Content-Type` header.
     pub media_type: ImageMediaType,
+    /// Lowercase hexadecimal digest used for the HTTP entity tag.
     pub sha256: String,
+    /// Authorized image bytes.
     pub content: Vec<u8>,
 }
 
@@ -148,6 +182,9 @@ pub fn validate_image_attachments(
         }
 
         let sha256 = decode_sha256(&attachment.sha256)?;
+        // Metadata-only attachments intentionally retain a digest and size but
+        // have no downloadable body. When bytes are present, every declaration
+        // is verified before they enter the persistence layer.
         let content = attachment
             .content_base64
             .as_deref()
@@ -186,6 +223,8 @@ fn decode_content(
     expected_size: usize,
     expected_sha256: &[u8],
 ) -> Result<Vec<u8>, AppError> {
+    // Reject overlong encoded data before allocating the decoded buffer. The
+    // limit includes base64 expansion and a small allowance for padding.
     if encoded.len() > MAX_BASE64_IMAGE_CHARACTERS {
         return Err(AppError::validation(
             "image attachment content exceeds the decoded size limit".to_owned(),

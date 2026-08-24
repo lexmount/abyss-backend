@@ -1,4 +1,9 @@
 //! Search document projection and bounded extraction from usage-event metadata.
+//!
+//! Only explicitly allowlisted metadata enters the index. Extraction limits
+//! depth, value count, and character length to bound CPU, allocation, request
+//! size, and accidental indexing of unrelated collector metadata. PostgreSQL
+//! retains the complete source event and remains the recovery source.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -16,30 +21,47 @@ const MAX_JSON_DEPTH: usize = 8;
 /// Elasticsearch representation of one immutable usage event.
 #[derive(Serialize)]
 pub struct SearchDocument {
+    /// Source usage-event primary key and Elasticsearch document identifier.
     pub event_pk: Uuid,
+    /// Owner identifier used as a mandatory search filter.
     pub user_id: Uuid,
+    /// Parent session key used to collapse event hits into sessions.
     pub session_pk: Uuid,
+    /// Agent-native session identifier searchable as text and keyword.
     pub session_id: String,
+    /// Parent turn primary key.
     pub turn_pk: Uuid,
+    /// Backend-normalized turn number.
     pub turn_index: i32,
+    /// Canonical Agent name used for exact filtering.
     pub agent_name: String,
+    /// Canonical LLM provider slug used for exact filtering.
     pub llm_provider: String,
+    /// Provider-specific model identifier used for exact filtering.
     pub llm_model: String,
+    /// Request or response value used for exact filtering.
     pub event_type: String,
+    /// Collector observation time used for range filtering.
     pub observed_at: chrono::DateTime<chrono::Utc>,
+    /// Bounded prompt or response text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Bounded names extracted from tool-call metadata.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_names: Vec<String>,
+    /// Bounded raw tool inputs and outputs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_content: Vec<String>,
+    /// Bounded command strings extracted from structured tool input.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<String>,
+    /// Bounded paths and working directories extracted from allowlisted fields.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub file_paths: Vec<String>,
 }
 
 impl SearchDocument {
+    /// Projects one source event into the strict Elasticsearch mapping.
     #[must_use]
     pub fn from_event(event: UsageEvent) -> Self {
         let metadata = SearchableMetadata::extract(&event.metadata);
@@ -87,6 +109,9 @@ impl SearchableMetadata {
             extracted.push_file_path(working_directory);
         }
 
+        // Deliberately ignore every top-level key except working_directory and
+        // content_segments so headers, credentials, and image data stay out of
+        // the derived index even when present in raw metadata.
         let Some(segments) = metadata.get("content_segments").and_then(Value::as_array) else {
             return extracted;
         };
@@ -131,6 +156,8 @@ impl SearchableMetadata {
                             _ => {}
                         }
                     }
+                    // Recurse after examining the current key so nested command
+                    // or path fields are discoverable without indexing all JSON.
                     self.extract_structured_input(child, remaining_depth.saturating_sub(1));
                 }
             }
@@ -161,6 +188,8 @@ fn push_bounded(values: &mut Vec<String>, value: &str) {
 }
 
 fn sanitize_search_text(value: &str) -> String {
+    // Marker tokens are controlled by this service during highlighting. Strip
+    // collector-supplied copies so clients cannot forge highlighted segments.
     value
         .replace(HIGHLIGHT_START, "")
         .replace(HIGHLIGHT_END, "")

@@ -18,6 +18,10 @@ use crate::db::models::UsageEvent;
 pub struct UsageEventTimelineOrder;
 
 impl UsageEventTimelineOrder {
+    /// Sorts events by turn, provider chain, observation time, side, and ID.
+    ///
+    /// The final event identifier tie-breaker makes output deterministic even
+    /// for corrupt cycles or collectors with identical timestamps.
     pub fn sort(events: &mut [UsageEvent]) {
         let provider_ranks = ProviderResponseRanks::from_events(events);
         events.sort_by(|left, right| {
@@ -44,6 +48,9 @@ struct ProviderResponseRanks {
 impl ProviderResponseRanks {
     fn from_events(events: &[UsageEvent]) -> Self {
         let mut nodes_by_turn = BTreeMap::<i32, HashMap<String, ProviderResponseNode>>::new();
+        // Native provider ordering is safe only when every event in a turn has
+        // a response_id. A partially instrumented turn falls back as a whole so
+        // ranked and unranked events cannot interleave unpredictably.
         let mut native_turns = events
             .iter()
             .map(|event| event.turn_index)
@@ -100,6 +107,8 @@ impl ProviderResponseRanks {
             }
         }
 
+        // Branches can occur after retries or malformed evidence. Sort roots and
+        // siblings by stable observed/event fallback data before traversal.
         let compare_ids = |left: &String, right: &String| {
             nodes
                 .get(left)
@@ -128,6 +137,8 @@ impl ProviderResponseRanks {
             );
         }
 
+        // Cycles have no root. Traversing remaining nodes after rooted chains
+        // guarantees every response still receives a deterministic rank.
         let mut remaining = nodes
             .keys()
             .filter(|response_id| !visited.contains(response_id.as_str()))
@@ -175,6 +186,8 @@ impl ProviderResponseRanks {
         let left_response_id = metadata_string(&left.metadata, "response_id");
         let right_response_id = metadata_string(&right.metadata, "response_id");
 
+        // Request and response observations that describe the same provider
+        // call remain adjacent and request-first regardless of timestamp ties.
         if left_response_id.is_some() && left_response_id == right_response_id {
             return event_side_rank(&left.event_type).cmp(&event_side_rank(&right.event_type));
         }

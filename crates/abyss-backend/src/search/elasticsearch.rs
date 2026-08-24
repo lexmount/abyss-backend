@@ -1,4 +1,9 @@
 //! Minimal Elasticsearch HTTP boundary for fixed-index search and bulk projection.
+//!
+//! This module owns every Elasticsearch-specific request and response shape so
+//! the rest of the service depends on typed domain results. The index name and
+//! strict mapping are fixed by the backend; operators configure only the base
+//! endpoint, optional Basic Authentication, and request timeout.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -12,13 +17,18 @@ use crate::{config::SearchConfig, error::AppError};
 
 use super::{ValidatedSearchQuery, document::SearchDocument};
 
+/// Fixed name of the derived usage-event index.
 pub const SEARCH_INDEX: &str = "abyss_usage_events";
+/// Sentinel inserted before text matched by Elasticsearch highlighting.
 pub const HIGHLIGHT_START: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]";
+/// Sentinel inserted after text matched by Elasticsearch highlighting.
 pub const HIGHLIGHT_END: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]";
 
 /// One idempotent operation submitted through Elasticsearch's Bulk API.
 pub enum BulkOperation {
+    /// Create or replace a document from current source-event state.
     Index(Box<SearchDocument>),
+    /// Remove a document whose source event no longer exists.
     Delete(Uuid),
 }
 
@@ -36,6 +46,7 @@ impl BulkOperation {
 }
 
 #[derive(Clone)]
+/// Small HTTP client for the backend-owned Elasticsearch index.
 pub struct ElasticsearchClient {
     client: reqwest::Client,
     endpoint: Url,
@@ -44,6 +55,7 @@ pub struct ElasticsearchClient {
 }
 
 impl ElasticsearchClient {
+    /// Builds a client after validating endpoint restrictions and credentials.
     pub fn new(config: &SearchConfig) -> Result<Self, AppError> {
         let endpoint = Url::parse(&config.endpoint).map_err(|error| {
             AppError::config(format!(
@@ -66,6 +78,8 @@ impl ElasticsearchClient {
                 "ABYSS_BACKEND_ELASTICSEARCH_URL must not contain a query or fragment".to_owned(),
             ));
         }
+        // Ignore ambient HTTP proxy variables. A private Elasticsearch endpoint
+        // and its credentials should not be routed through an unrelated proxy.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_seconds))
             .no_proxy()
@@ -150,6 +164,7 @@ impl ElasticsearchClient {
             return Err(response_error("write Elasticsearch bulk request", response).await);
         }
         let response = response.json::<BulkResponse>().await?;
+        // Positional correspondence is required to update the durable outbox.
         if response.items.len() != operations.len() {
             return Err(SearchClientError::Protocol(format!(
                 "Elasticsearch bulk response returned {} items for {} operations",
@@ -168,6 +183,7 @@ impl ElasticsearchClient {
             .collect())
     }
 
+    /// Executes an owner-scoped, session-collapsed full-text query.
     pub async fn search(
         &self,
         user_id: Uuid,
@@ -203,45 +219,71 @@ impl ElasticsearchClient {
     }
 }
 
+/// Parsed Elasticsearch page before PostgreSQL hydration.
 pub struct SearchMatchPage {
+    /// Approximate number of distinct matching sessions.
     pub total_sessions: u64,
+    /// Collapsed session hits in Elasticsearch relevance order.
     pub sessions: Vec<SessionMatches>,
 }
 
+/// Matching events collapsed under one session.
 pub struct SessionMatches {
+    /// Backend session primary key.
     pub session_pk: Uuid,
+    /// Total events matching within the session.
     pub match_count: u64,
+    /// Bounded strongest matching events.
     pub events: Vec<MatchedEvent>,
 }
 
+/// Parsed event metadata and raw highlight fragments from Elasticsearch.
 pub struct MatchedEvent {
+    /// Backend event primary key.
     pub event_pk: Uuid,
+    /// Backend turn primary key.
     pub turn_pk: Uuid,
+    /// Normalized turn number.
     pub turn_index: i32,
+    /// Request or response side.
     pub event_type: String,
+    /// Canonical LLM provider slug.
     pub llm_provider: String,
+    /// Provider-specific model identifier.
     pub llm_model: String,
+    /// Collector observation time.
     pub observed_at: DateTime<Utc>,
+    /// Ordered raw fragments containing backend sentinel markers.
     pub fragments: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Failures produced by the Elasticsearch protocol boundary.
 pub enum SearchClientError {
+    /// Transport, TLS, timeout, or response-decoding failure from reqwest.
     #[error("Elasticsearch request failed: {0}")]
     Request(#[from] reqwest::Error),
+    /// Failure while constructing NDJSON or JSON request data.
     #[error("serialize Elasticsearch request: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// Non-success HTTP response with a bounded body for diagnostics.
     #[error("{operation} returned HTTP {status}: {body}")]
     Response {
+        /// Backend operation that received the response.
         operation: &'static str,
+        /// Elasticsearch HTTP status.
         status: StatusCode,
+        /// Response body truncated to a safe diagnostic bound.
         body: String,
     },
+    /// Structurally valid JSON that violates an expected ES response contract.
     #[error("invalid Elasticsearch response: {0}")]
     Protocol(String),
 }
 
 fn index_definition() -> Value {
+    // Strict dynamic mapping rejects accidental expansion when a projection
+    // field is added without an intentional mapping and review.
     json!({
         "mappings": {
             "dynamic": "strict",
@@ -268,6 +310,8 @@ fn index_definition() -> Value {
 }
 
 fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
+    // Authorization is encoded as a mandatory filter rather than a scoring
+    // clause, guaranteeing that foreign documents cannot enter the hit set.
     let mut filters = vec![json!({"term": {"user_id": user_id}})];
     if query.from.is_some() || query.to.is_some() {
         let mut range = serde_json::Map::new();
@@ -309,6 +353,8 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
                 }]
             }
         },
+        // Pagination applies to collapsed sessions, while inner_hits returns a
+        // bounded sample of the strongest matching events for each session.
         "collapse": {
             "field": "session_pk",
             "inner_hits": {
@@ -375,6 +421,8 @@ async fn response_error(operation: &'static str, response: reqwest::Response) ->
 }
 
 async fn bounded_response_body(response: reqwest::Response) -> String {
+    // Elasticsearch errors can echo request data. Bound retained/logged text to
+    // avoid turning a dependency failure into uncontrolled memory or log use.
     let body = response
         .text()
         .await

@@ -1,8 +1,15 @@
 //! Traditional full-text session search backed by a derived Elasticsearch index.
+//!
+//! Search results are grouped by session in Elasticsearch, then hydrated with
+//! authoritative session and device rows from PostgreSQL. The index never acts
+//! as an authorization source: every query includes the authenticated owner and
+//! missing PostgreSQL details cause a stale search hit to be omitted.
 
 mod document;
 mod elasticsearch;
+/// PostgreSQL outbox leasing and hydration queries.
 pub mod outbox;
+/// Background outbox-to-Elasticsearch projection worker.
 pub mod worker;
 
 use std::collections::{HashMap, HashSet};
@@ -25,22 +32,26 @@ const MAX_FILTER_CHARACTERS: usize = 256;
 const MAX_RESULT_WINDOW: u32 = 10_000;
 
 #[derive(Clone)]
+/// Validating facade over the Elasticsearch HTTP client.
 pub struct SearchService {
     client: ElasticsearchClient,
 }
 
 impl SearchService {
+    /// Creates a search service from startup-validated settings.
     pub fn new(config: &SearchConfig) -> Result<Self, AppError> {
         Ok(Self {
             client: ElasticsearchClient::new(config)?,
         })
     }
 
+    /// Returns a cloned client for the background indexer.
     #[must_use]
     pub fn client(&self) -> ElasticsearchClient {
         self.client.clone()
     }
 
+    /// Validates and executes one owner-scoped session search.
     pub async fn search(
         &self,
         user_id: Uuid,
@@ -56,15 +67,25 @@ impl SearchService {
 }
 
 #[derive(Debug, Deserialize)]
+/// Query-string contract for session full-text search.
 pub struct SessionSearchQuery {
+    /// Required full-text query.
     pub q: String,
+    /// Inclusive lower observation-time bound.
     pub from: Option<DateTime<Utc>>,
+    /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
+    /// Optional canonical Agent filter.
     pub agent_name: Option<String>,
+    /// Optional canonical LLM provider filter.
     pub llm_provider: Option<String>,
+    /// Optional model filter.
     pub llm_model: Option<String>,
+    /// Optional request or response filter.
     pub event_type: Option<String>,
+    /// One-based result page.
     pub page: Option<u32>,
+    /// Sessions returned per page.
     pub page_size: Option<u32>,
 }
 
@@ -88,6 +109,8 @@ impl SessionSearchQuery {
                 "page_size must be between 1 and {MAX_PAGE_SIZE}"
             )));
         }
+        // Elasticsearch's from/size pagination has a bounded result window.
+        // Checked arithmetic makes oversized user input a validation error.
         let offset = page
             .saturating_sub(1)
             .checked_mul(page_size)
@@ -126,25 +149,38 @@ impl SessionSearchQuery {
     }
 }
 
+/// Normalized query safe to translate directly into Elasticsearch JSON.
 pub struct ValidatedSearchQuery {
+    /// Trimmed full-text query.
     pub text: String,
+    /// Inclusive lower observation-time bound.
     pub from: Option<DateTime<Utc>>,
+    /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
+    /// Canonical Agent-name filter.
     pub agent_name: Option<String>,
+    /// Canonical provider slug filter.
     pub llm_provider: Option<String>,
+    /// Trimmed model filter.
     pub llm_model: Option<String>,
+    /// Canonical request or response filter.
     pub event_type: Option<String>,
+    /// One-based result page.
     pub page: u32,
+    /// Sessions returned per page.
     pub page_size: u32,
+    /// Zero-based Elasticsearch result offset.
     pub offset: u32,
 }
 
+/// Elasticsearch matches paired with the validated query that produced them.
 pub struct SearchExecution {
     query: ValidatedSearchQuery,
     page: SearchMatchPage,
 }
 
 impl SearchExecution {
+    /// Returns session keys that must be hydrated from PostgreSQL.
     #[must_use]
     pub fn session_ids(&self) -> Vec<Uuid> {
         self.page
@@ -154,6 +190,10 @@ impl SearchExecution {
             .collect()
     }
 
+    /// Combines search matches with authoritative session/device details.
+    ///
+    /// Stale index entries whose session no longer exists are omitted instead
+    /// of returning partially authorized or incomplete data.
     #[must_use]
     pub fn hydrate(
         self,
@@ -227,45 +267,76 @@ impl SearchExecution {
 }
 
 #[derive(Serialize)]
+/// Paginated session search response.
 pub struct SessionSearchResponse {
+    /// Normalized full-text query.
     pub query: String,
+    /// Approximate distinct session count returned by Elasticsearch cardinality.
     pub total_sessions: u64,
+    /// One-based current page.
     pub page: u32,
+    /// Requested sessions per page.
     pub page_size: u32,
+    /// Whether the reported session count extends past this page.
     pub has_more: bool,
+    /// Hydrated matching sessions.
     pub items: Vec<SessionSearchResult>,
 }
 
 #[derive(Serialize)]
+/// One hydrated session with its strongest matching events.
 pub struct SessionSearchResult {
+    /// Backend session primary key.
     pub session_pk: Uuid,
+    /// Agent-native session identifier.
     pub session_id: String,
+    /// Canonical Agent name.
     pub agent_name: String,
+    /// Most recently observed Agent version.
     pub agent_version: Option<String>,
+    /// Authoritative device host name.
     pub host_name: String,
+    /// Authoritative device platform.
     pub platform: String,
+    /// Earliest event observation in the session.
     pub started_at: DateTime<Utc>,
+    /// Latest event observation in the session.
     pub ended_at: Option<DateTime<Utc>>,
+    /// Sorted providers represented by the returned matching events.
     pub providers: Vec<String>,
+    /// Sorted models represented by the returned matching events.
     pub models: Vec<String>,
+    /// Total matching events in the session.
     pub match_count: u64,
+    /// Bounded strongest matching events with fragments.
     pub matches: Vec<SessionSearchMatch>,
 }
 
 #[derive(Serialize)]
+/// Search metadata and fragments for one matching usage event.
 pub struct SessionSearchMatch {
+    /// Backend event primary key.
     pub event_pk: Uuid,
+    /// Backend turn primary key.
     pub turn_pk: Uuid,
+    /// Normalized turn number.
     pub turn_index: i32,
+    /// Request or response side.
     pub event_type: String,
+    /// Canonical LLM provider slug.
     pub llm_provider: String,
+    /// Provider-specific model identifier.
     pub llm_model: String,
+    /// Collector observation time.
     pub observed_at: DateTime<Utc>,
+    /// Safely segmented highlighted snippets.
     pub fragments: Vec<SearchFragment>,
 }
 
 #[derive(Serialize)]
+/// One Elasticsearch highlight fragment split into plain and matching text.
 pub struct SearchFragment {
+    /// Ordered text segments suitable for structured UI rendering.
     pub segments: Vec<SearchFragmentSegment>,
 }
 
@@ -279,6 +350,8 @@ impl SearchFragment {
             let highlighted = tagged
                 .strip_prefix(HIGHLIGHT_START)
                 .expect("the marker position came from find");
+            // Treat malformed or truncated marker pairs as plain text. The API
+            // never emits raw HTML and therefore does not trust ES fragments.
             let Some(end) = highlighted.find(HIGHLIGHT_END) else {
                 push_fragment_segment(&mut segments, tagged, false);
                 remainder = "";
@@ -296,8 +369,11 @@ impl SearchFragment {
 }
 
 #[derive(Serialize)]
+/// Plain or highlighted portion of a search fragment.
 pub struct SearchFragmentSegment {
+    /// Fragment text with internal marker tokens removed by parsing.
     pub text: String,
+    /// Whether this segment matched the full-text query.
     pub highlighted: bool,
 }
 

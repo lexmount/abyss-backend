@@ -1,3 +1,6 @@
+-- The standalone backend currently authenticates one deployment-wide owner.
+-- Keeping the owner as a real row preserves explicit foreign-key ownership and
+-- leaves the event schema ready for a future identity model without nullable IDs.
 CREATE TABLE app_users (
     id uuid PRIMARY KEY,
     email text NOT NULL,
@@ -12,6 +15,8 @@ VALUES (
     'Abyss Owner'
 );
 
+-- A device is a user-visible context, not a hardware identity. Host name and
+-- platform form the stable bucket; observed OS version and time bounds evolve.
 CREATE TABLE devices (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -28,6 +33,8 @@ CREATE TABLE devices (
 CREATE INDEX devices_user_seen_idx
     ON devices (user_id, last_seen_at DESC);
 
+-- Sessions use the Agent-native session ID plus canonical Agent name. The
+-- device reference follows the most recently observed device for that session.
 CREATE TABLE agent_sessions (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -46,6 +53,8 @@ CREATE TABLE agent_sessions (
 CREATE INDEX agent_sessions_user_time_idx
     ON agent_sessions (user_id, started_at DESC);
 
+-- Turn indexes are backend-normalized during ingest when stable provider or
+-- Agent metadata reveals that a collector restarted its local counter.
 CREATE TABLE agent_turns (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -61,6 +70,8 @@ CREATE TABLE agent_turns (
 CREATE INDEX agent_turns_user_session_idx
     ON agent_turns (user_id, session_pk, turn_index);
 
+-- Usage events are immutable source records. event_id provides global ingest
+-- idempotency, while denormalized labels keep filters and aggregation direct.
 CREATE TABLE llm_usage_events (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -100,6 +111,8 @@ CREATE INDEX llm_usage_events_session_turn_idx
 CREATE INDEX llm_usage_events_agent_model_time_idx
     ON llm_usage_events (agent_name, llm_provider, llm_model, observed_at DESC);
 
+-- Attachment content is optional so collectors can report image usage metadata
+-- without uploading bytes. Hash, size, type, and position remain queryable.
 CREATE TABLE llm_usage_event_attachments (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -119,6 +132,8 @@ CREATE TABLE llm_usage_event_attachments (
 CREATE INDEX llm_usage_event_attachments_user_event_idx
     ON llm_usage_event_attachments (user_id, event_pk, position);
 
+-- Diagnostic payloads are deliberately opaque; the join table records the
+-- usage events that establish their owner, session, and device context.
 CREATE TABLE agent_diagnostic_captures (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -148,6 +163,9 @@ CREATE TABLE agent_diagnostic_capture_events (
 CREATE INDEX agent_diagnostic_capture_events_event_idx
     ON agent_diagnostic_capture_events (event_pk);
 
+-- Search is a rebuildable projection. Outbox rows intentionally do not foreign
+-- key event_pk so a delete operation can survive removal of its source row.
+-- Expiring claims and terminal dead letters support concurrent crash recovery.
 CREATE TABLE search_outbox (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     event_pk uuid NOT NULL,

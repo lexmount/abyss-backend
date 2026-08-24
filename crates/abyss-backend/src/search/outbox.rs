@@ -1,4 +1,10 @@
-//! `PostgreSQL` outbox leasing, retry transitions, and session ownership hydration.
+//! PostgreSQL outbox leasing, retry transitions, and session ownership hydration.
+//!
+//! Event ingest and outbox insertion share one transaction, which prevents a
+//! committed source event from being permanently missed by search. Workers use
+//! `FOR UPDATE SKIP LOCKED` and expiring claims so replicas can process rows
+//! concurrently and recover work abandoned by a crashed process. Item failures
+//! are retried with bounded backoff and eventually retained as dead letters.
 
 use std::collections::HashMap;
 
@@ -27,23 +33,33 @@ const MAX_ERROR_CHARACTERS: usize = 2_000;
 
 /// One leased outbox row paired with the Elasticsearch operation it requires.
 pub struct PreparedOutboxTask {
+    /// Durable outbox primary key.
     pub id: i64,
+    /// Number of previously recorded failures.
     pub attempt_count: i32,
+    /// Idempotent Elasticsearch operation derived from current source state.
     pub operation: BulkOperation,
 }
 
 /// Result of one Elasticsearch bulk item, used to advance durable outbox state.
 pub struct OutboxTaskResult {
+    /// Durable outbox primary key.
     pub id: i64,
+    /// Attempt count observed when the task was leased.
     pub attempt_count: i32,
+    /// Per-item Elasticsearch outcome.
     pub result: Result<(), String>,
 }
 
+/// Authoritative PostgreSQL data used to hydrate a search result.
 pub struct SearchSessionDetails {
+    /// Session row visible to the authenticated owner.
     pub session: AgentSession,
+    /// Device row associated with the session.
     pub device: Device,
 }
 
+/// Synchronous persistence boundary for search projection state.
 pub struct SearchOutboxRepository;
 
 impl SearchOutboxRepository {
@@ -52,6 +68,8 @@ impl SearchOutboxRepository {
         connection: &mut PgConnection,
         batch_size: i64,
     ) -> Result<bool, AppError> {
+        // The unique (event_pk, operation) constraint makes every backfill pass
+        // idempotent and allows startup by multiple replicas.
         let queued = sql_query(
             "INSERT INTO search_outbox (event_pk, user_id, operation, created_at) \
              SELECT source.id, source.user_id, 'upsert', source.created_at \
@@ -94,6 +112,8 @@ impl SearchOutboxRepository {
         worker_id: &str,
         batch_size: i64,
     ) -> Result<Vec<PreparedOutboxTask>, AppError> {
+        // SKIP LOCKED distributes rows across replicas without serializing all
+        // workers. A stale claimed_at is eligible again after the lease window.
         let tasks = sql_query(
             "WITH claimable AS (\
                  SELECT id \
@@ -181,6 +201,8 @@ impl SearchOutboxRepository {
                 Err(error) => {
                     let attempt_count = task.attempt_count.saturating_add(1);
                     let error = truncate_error(error);
+                    // Dead letters preserve the final bounded error for operator
+                    // inspection without allowing a poison row to loop forever.
                     if attempt_count >= MAX_OUTBOX_ATTEMPTS {
                         diesel::update(search_outbox::table.find(task.id))
                             .set((
@@ -229,6 +251,9 @@ impl SearchOutboxRepository {
         if session_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        // This owner predicate is authoritative even though Elasticsearch also
+        // applies an owner filter. Defense in depth protects against stale or
+        // incorrectly projected documents.
         let rows = agent_sessions::table
             .inner_join(devices::table)
             .filter(agent_sessions::user_id.eq(user_id))
