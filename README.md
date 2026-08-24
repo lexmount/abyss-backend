@@ -102,11 +102,62 @@ work.
 
 ## Containers and Kubernetes
 
-Build the container from the repository root:
+### Docker
+
+The following example starts PostgreSQL and `abyss-backend` on a private Docker
+network. PostgreSQL data is retained in a named volume, while Elasticsearch
+remains disabled.
 
 ```bash
+export ABYSS_API_TOKEN="$(openssl rand -hex 32)"
+export ABYSS_BACKEND_API_TOKEN_SHA256="$(printf '%s' "${ABYSS_API_TOKEN}" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+
+docker network inspect abyss-local >/dev/null 2>&1 || docker network create abyss-local
+docker volume inspect abyss-postgres-data >/dev/null 2>&1 || docker volume create abyss-postgres-data
+
+docker run --detach \
+  --name abyss-postgres \
+  --network abyss-local \
+  --restart unless-stopped \
+  --env POSTGRES_USER=abyss \
+  --env POSTGRES_PASSWORD=abyss \
+  --env POSTGRES_DB=abyss \
+  --volume abyss-postgres-data:/var/lib/postgresql/data \
+  --health-cmd='pg_isready -U abyss -d abyss' \
+  --health-interval=2s \
+  --health-timeout=5s \
+  --health-retries=30 \
+  postgres:16
+
+until [ "$(docker inspect --format='{{.State.Health.Status}}' abyss-postgres)" = healthy ]; do
+  sleep 1
+done
+
 docker build -t abyss-backend:local .
+
+docker run --detach \
+  --name abyss-backend \
+  --network abyss-local \
+  --restart unless-stopped \
+  --publish 127.0.0.1:8080:8080 \
+  --env ABYSS_BACKEND_DATABASE_URL='postgres://abyss:abyss@abyss-postgres:5432/abyss?sslmode=disable' \
+  --env ABYSS_BACKEND_API_TOKEN_SHA256 \
+  abyss-backend:local
 ```
+
+The backend runs its embedded migration during startup. Confirm that both the
+process and PostgreSQL are ready:
+
+```bash
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/readyz
+```
+
+Keep `ABYSS_API_TOKEN` for Agent configuration. The example database password
+is intended only for a host-local deployment; use managed secrets and TLS when
+the service is reachable from other machines.
+
+### Kubernetes
 
 The `k8s/` Kustomize base expects a Secret named `abyss-backend-secret` with
 the two required variables. Create it before applying the manifests:
