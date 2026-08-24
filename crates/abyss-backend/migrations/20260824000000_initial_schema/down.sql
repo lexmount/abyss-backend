@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS search_outbox;
+DROP TABLE IF EXISTS agent_diagnostic_capture_events;
+DROP TABLE IF EXISTS agent_diagnostic_captures;
+DROP TABLE IF EXISTS llm_usage_event_attachments;
+DROP TABLE IF EXISTS llm_usage_events;
+DROP TABLE IF EXISTS agent_turns;
+DROP TABLE IF EXISTS agent_sessions;
+DROP TABLE IF EXISTS devices;
+DROP TABLE IF EXISTS app_users;
