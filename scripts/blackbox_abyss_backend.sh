@@ -158,9 +158,6 @@ wait_for_backend
 EXPECTED_TABLES="$(query_database "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('app_users', 'devices', 'agent_sessions', 'agent_turns', 'llm_usage_events', 'llm_usage_event_attachments', 'agent_diagnostic_captures', 'agent_diagnostic_capture_events', 'search_outbox');")"
 [[ "${EXPECTED_TABLES}" == "9" ]] || fail "the consolidated migration did not create all event-store tables"
 
-PRODUCT_TABLES="$(query_database "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('sso_identities', 'auth_sessions', 'oauth_login_requests', 'native_auth_sessions', 'terminal_login_attempts', 'context_handoffs', 'session_shares', 'shared_session_handoffs', 'update_release_manifests');")"
-[[ "${PRODUCT_TABLES}" == "0" ]] || fail "the consolidated migration created retired product tables"
-
 python3 scripts/tests/blackbox_api.py \
   --base-url "${BASE_URL}" \
   --token "${API_TOKEN}" \

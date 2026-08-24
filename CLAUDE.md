@@ -4,8 +4,7 @@
 event ingestion, PostgreSQL persistence, event queries, optional Elasticsearch
 projection, and the HTTP API that exposes those capabilities.
 
-Product OIDC/SSO, Native and Terminal login flows, release updates, SaaS
-sharing, handoffs, and product deployment behavior do not belong here.
+Keep the repository focused on these public event-service responsibilities.
 
 ## Architecture
 
@@ -17,8 +16,7 @@ sharing, handoffs, and product deployment behavior do not belong here.
 - `db` owns PostgreSQL pooling, the consolidated migration, and Diesel models.
 
 Keep modules focused and start new Rust module files with a `//!` responsibility
-comment. Do not introduce cross-repository source dependencies on
-`abyss-services`.
+comment. Keep the implementation self-contained within this repository.
 
 ## Commands
 

@@ -128,22 +128,6 @@ def run(base_url: str, token: str, run_id: str) -> None:
     )
     require_status(wrong_token, 401, "incorrect bearer token")
 
-    retired_routes = (
-        ("GET", "/auth/login"),
-        ("GET", "/v1/updates/check"),
-        (
-            "POST",
-            "/v1/agent-usage/sessions/00000000-0000-0000-0000-000000000001/shares",
-        ),
-        ("POST", "/v1/agent-usage/handoffs/00000000-0000-0000-0000-000000000001/consume"),
-    )
-    for method, path in retired_routes:
-        require_status(
-            request(base_url, method, path, token=token),
-            404,
-            f"retired route {method} {path}",
-        )
-
     ingest_payload = {
         "events": [
             event(

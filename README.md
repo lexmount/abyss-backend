@@ -5,9 +5,8 @@ It accepts normalized Agent events, stores them in PostgreSQL, and exposes APIs
 for event history, summaries, session timelines, attachments, and optional
 full-text session search.
 
-This repository is intentionally limited to event-store responsibilities. It
-does not contain Abyss product SSO, browser sessions, Native or Terminal login,
-session sharing, context handoffs, release updates, or other SaaS capabilities.
+This repository is intentionally focused on standalone event storage, queries,
+and optional full-text search.
 
 ## Capabilities
 
