@@ -13,7 +13,6 @@ and optional full-text search.
 - Idempotent Agent event ingestion and raw event queries.
 - Token-usage summaries and ordered session timelines.
 - Validated image attachment storage and authorized download.
-- Opaque diagnostic capture ingestion for Agent troubleshooting.
 - Optional asynchronous Elasticsearch projection and session search.
 - Health and PostgreSQL readiness probes.
 - A consolidated PostgreSQL schema for new standalone deployments.
