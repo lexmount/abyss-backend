@@ -1,5 +1,12 @@
-//! HTTP entrypoint for the Abyss backend service.
+//! Process entrypoint and lifecycle management for the Abyss backend.
+//!
+//! Startup is deliberately ordered: configuration is validated before any
+//! external connection is opened, database migrations finish before the HTTP
+//! listener accepts traffic, and the optional search worker shares the same
+//! shutdown signal as the server. PostgreSQL remains the source of truth;
+//! Elasticsearch is only a derived, eventually consistent projection.
 
+#![warn(missing_docs)]
 #![expect(
     clippy::multiple_crate_versions,
     reason = "Axum and Diesel currently pull a few distinct transitive crate versions."
@@ -31,6 +38,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         run_migrations(&pool)?;
     }
 
+    // Search is optional. Keeping the service itself in an Option makes the
+    // disabled state explicit all the way through routing and worker startup.
     let search = config
         .search
         .as_ref()
@@ -92,6 +101,9 @@ async fn stop_search_worker(worker: Option<tokio::task::JoinHandle<()>>) {
 }
 
 fn validate_runtime_config(config: &Config) -> Result<(), error::AppError> {
+    // Black-box tests use disposable credentials and data. Requiring loopback
+    // prevents an accidentally started test instance from becoming reachable
+    // on the surrounding network; containers must opt out explicitly.
     if config.environment == "blackbox"
         && !config.addr.ip().is_loopback()
         && !config.blackbox_allow_non_loopback
@@ -105,6 +117,8 @@ fn validate_runtime_config(config: &Config) -> Result<(), error::AppError> {
 }
 
 fn init_tracing(config: &Config) {
+    // RUST_LOG takes precedence for standard operational overrides. The
+    // configured level is only the fallback when no valid filter is supplied.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(config.log_level.clone()));
     tracing_subscriber::fmt().with_env_filter(filter).init();

@@ -1,4 +1,9 @@
-//! Background projection worker from the `PostgreSQL` outbox into Elasticsearch.
+//! Background projection worker from the PostgreSQL outbox into Elasticsearch.
+//!
+//! The worker performs blocking database operations on Tokio's blocking pool,
+//! batches Elasticsearch writes, and persists each bulk-item result separately.
+//! It polls only while idle or unhealthy; full batches are drained immediately
+//! to reduce projection lag without busy-looping an empty queue.
 
 use std::time::Duration;
 
@@ -15,9 +20,13 @@ use crate::{
     },
 };
 
+/// Factory for the detached search projection task.
 pub struct SearchIndexer;
 
 impl SearchIndexer {
+    /// Spawns one indexer with a unique lease owner identifier.
+    ///
+    /// The returned handle must be joined or aborted during service shutdown.
     #[must_use]
     pub fn spawn(
         pool: DbPool,
@@ -47,7 +56,9 @@ struct SearchIndexerWorker {
 }
 
 enum PollSchedule {
+    /// Start another iteration without sleeping because work may remain.
     Immediately,
+    /// Wait for the configured interval or shutdown notification.
     AfterInterval,
 }
 
@@ -81,6 +92,8 @@ impl SearchIndexerWorker {
             return PollSchedule::AfterInterval;
         }
 
+        // Historical rows are queued incrementally so enabling search on an
+        // existing installation does not require a separate migration job.
         if !*backfill_complete && let Err(error) = self.advance_backfill(backfill_complete).await {
             tracing::error!(%error, "queue session search backfill batch");
             return PollSchedule::AfterInterval;
@@ -123,6 +136,8 @@ impl SearchIndexerWorker {
         index_ready: &mut bool,
     ) -> usize {
         let task_count = tasks.len();
+        // Keep durable state aligned by position with bulk operations. The ES
+        // boundary guarantees one response result for every submitted item.
         let (task_states, operations): (Vec<_>, Vec<_>) = tasks
             .into_iter()
             .map(|task| ((task.id, task.attempt_count), task.operation))
@@ -135,6 +150,8 @@ impl SearchIndexerWorker {
                 results
             }
             Err(error) => {
+                // A request-level failure has no trustworthy per-item result;
+                // retry every leased task and force the index check to rerun.
                 *index_ready = false;
                 let message = error.to_string();
                 task_states

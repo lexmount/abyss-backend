@@ -1,4 +1,10 @@
 //! Diesel-backed repository functions for Agent usage APIs.
+//!
+//! This module is the transactional boundary for the event hierarchy. Ingest
+//! validates the complete request before opening a transaction, upserts device,
+//! session, and turn aggregates, inserts immutable events idempotently, and
+//! enqueues search projection in the same commit. Query functions always apply
+//! the authenticated owner before returning conversation or attachment data.
 
 use std::collections::{HashMap, HashSet};
 
@@ -96,6 +102,10 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
     ORDER BY total_tokens DESC, agent_name ASC NULLS LAST, user_email ASC NULLS LAST, day ASC NULLS LAST \
     LIMIT $31";
 
+/// Validates and atomically ingests one batch for the authenticated owner.
+///
+/// Collector `event_id` and `(user_id, capture_id)` values are idempotency keys;
+/// replays are counted as duplicates without changing the original rows.
 pub fn ingest_events(
     connection: &mut PgConnection,
     request: &IngestEventsRequest,
@@ -153,6 +163,8 @@ fn ingest_one_diagnostic_capture(
     user_id: Uuid,
     capture: &IngestDiagnosticCapture,
 ) -> Result<bool, AppError> {
+    // Reload event rows rather than trusting request correlation alone. This
+    // establishes authenticated ownership and a single session/device boundary.
     let events = llm_usage_events::table
         .filter(llm_usage_events::user_id.eq(user_id))
         .filter(llm_usage_events::event_id.eq_any(&capture.event_ids))
@@ -212,6 +224,7 @@ fn ingest_one_diagnostic_capture(
     Ok(inserted == 1)
 }
 
+/// Aggregates owner-scoped event and token counts by requested dimensions.
 pub fn usage_summary(
     connection: &mut PgConnection,
     query: &SummaryQuery,
@@ -280,6 +293,9 @@ fn load_filtered_summary_rows(
     let event_type = sql_filters.event_type.unwrap_or_default();
     let has_event_type_filter = !event_type.is_empty();
 
+    // The static query uses boolean gates for optional dimensions and filters.
+    // This keeps user values in typed bind parameters and avoids dynamic SQL.
+    // Bind order intentionally mirrors the numbered placeholders in the query.
     sql_query(SUMMARY_AGGREGATE_SQL)
         .bind::<Bool, _>(dimensions.enabled(SummaryDimension::Day))
         .bind::<Bool, _>(dimensions.enabled(SummaryDimension::User))
@@ -317,6 +333,7 @@ fn load_filtered_summary_rows(
         .map_err(AppError::from)
 }
 
+/// Loads one owner-scoped session with normalized turns and ordered events.
 pub fn session_timeline(
     connection: &mut PgConnection,
     user_id: Uuid,
@@ -392,6 +409,7 @@ pub fn session_timeline(
     })
 }
 
+/// Returns one newest-first page of raw owner-scoped events.
 pub fn raw_events(
     connection: &mut PgConnection,
     query: &RawEventsQuery,
@@ -422,6 +440,8 @@ pub fn raw_events(
             offset,
         },
     )?;
+    // Fetch one sentinel row beyond the requested page so no count query is
+    // needed merely to determine whether a next offset exists.
     let has_next_page = events.len() > page_size_usize;
     if has_next_page {
         events.truncate(page_size_usize);
@@ -446,6 +466,7 @@ pub fn raw_events(
     })
 }
 
+/// Loads authorized attachment bytes and verifies persisted size metadata.
 pub fn image_attachment(
     connection: &mut PgConnection,
     user_id: Uuid,
@@ -470,6 +491,9 @@ pub fn image_attachment(
         )));
     }
     let media_type = ImageMediaType::from_stored(&attachment.media_type)?;
+    // These columns are selected by the reusable Diesel row model but are not
+    // part of the download response. Touch them to keep dead-code linting useful
+    // without creating a second, nearly identical query model.
     std::hint::black_box((
         attachment.user_id,
         attachment.event_pk,
@@ -554,6 +578,8 @@ fn ingest_one_event(
         .do_nothing()
         .execute(connection)?;
 
+    // Child rows are written only for a newly inserted event. A replay must not
+    // replace the attachments associated with the original idempotency key.
     if inserted == 1 && !attachments.is_empty() {
         let attachment_rows = attachments
             .into_iter()
@@ -574,6 +600,8 @@ fn ingest_one_event(
             .execute(connection)?;
     }
 
+    // The enclosing transaction commits the event and its projection task
+    // together, providing at-least-once delivery to Elasticsearch.
     if inserted == 1 {
         diesel::insert_into(search_outbox::table)
             .values(NewSearchOutboxTask {
@@ -677,6 +705,9 @@ fn resolve_turn_index(
     session_pk: Uuid,
     event: &IngestUsageEvent,
 ) -> Result<i32, AppError> {
+    // Older collectors without a stable provider identity retain their supplied
+    // index. Newer evidence lets restarted collectors avoid merging new work
+    // into an already-used local turn number.
     let Some(identity) = turn_identity(event) else {
         return Ok(event.turn_index);
     };
@@ -768,9 +799,13 @@ const fn choose_turn_index(
     existing_turn_index: Option<i32>,
     next_turn_index: i32,
 ) -> i32 {
+    // Events with the same stable provider identity must remain in one turn,
+    // even if collector-local numbering changes between observations.
     if let Some(existing_turn_index) = existing_turn_index {
         return existing_turn_index;
     }
+    // A previously used local number indicates a restarted counter. Append at
+    // the next index; otherwise preserve intentional gaps from the collector.
     if requested_turn_index < next_turn_index {
         next_turn_index
     } else {
@@ -783,6 +818,8 @@ fn turn_identity(event: &IngestUsageEvent) -> Option<TurnIdentity> {
 }
 
 fn turn_identity_from_metadata(metadata: &serde_json::Value) -> Option<TurnIdentity> {
+    // Prefer Agent-level turn identities over provider message/response ids
+    // because a single user turn may contain several provider round trips.
     metadata_string(metadata, "codex_turn_id")
         .map(|value| TurnIdentity {
             kind: TurnIdentityKind::CodexTurnId,
@@ -951,6 +988,8 @@ fn load_attachments_for_events(
     let mut by_event = HashMap::new();
     for attachment in attachments {
         let event_pk = attachment.event_pk;
+        // The shared row model includes authorization/audit columns that are not
+        // repeated in each event response attachment object.
         std::hint::black_box((attachment.user_id, attachment.created_at));
         by_event
             .entry(event_pk)
@@ -972,6 +1011,8 @@ fn event_response(
     device: Option<&Device>,
     attachments: Vec<UsageEventAttachmentResponse>,
 ) -> UsageEventResponse {
+    // created_at is an internal ingestion timestamp; APIs expose observed_at as
+    // the user-facing event time while still selecting a complete Diesel row.
     std::hint::black_box(event.created_at);
     UsageEventResponse {
         id: event.id,
@@ -1039,6 +1080,8 @@ fn validate_batch(
         )));
     }
 
+    // Decode and validate all potentially expensive attachment content before
+    // obtaining a connection transaction and any table locks.
     let mut attachments = Vec::with_capacity(request.events.len());
     for event in &request.events {
         validate_event(event)?;
@@ -1107,6 +1150,8 @@ fn normalized_tokens(event: &IngestUsageEvent) -> Result<NormalizedTokens, AppEr
     let cache_read = normalize_token(event.token_usage.cache_read_tokens, "cache_read_tokens")?;
     let cache_write = normalize_token(event.token_usage.cache_write_tokens, "cache_write_tokens")?;
     let reasoning = normalize_token(event.token_usage.reasoning_tokens, "reasoning_tokens")?;
+    // Preserve an explicit provider total because provider accounting may not
+    // equal the visible component sum; derive only when the field is absent.
     let total = match event.token_usage.total_tokens {
         Some(value) => normalize_token(Some(value), "total_tokens")?,
         None => input
@@ -1145,6 +1190,8 @@ fn validate_event_type(value: &str) -> Result<String, AppError> {
 }
 
 fn parse_group_by(raw: Option<&str>) -> Vec<String> {
+    // Unknown dimensions are ignored and historical aliases remain readable.
+    // Falling back after filtering prevents an empty GROUP BY contract.
     let parsed: Vec<_> = raw
         .unwrap_or("user,agent,provider,model")
         .split(',')
@@ -1233,6 +1280,8 @@ const fn unix_epoch() -> DateTime<Utc> {
 }
 
 fn escape_like_pattern(value: &str) -> String {
+    // The SQL uses LIKE ... ESCAPE '\\'; escape wildcard characters so a user
+    // filter remains a literal substring search rather than a pattern language.
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         if matches!(character, '\\' | '%' | '_') {
