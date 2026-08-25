@@ -21,7 +21,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: abyss-backend
-          image: ghcr.io/lexmount/abyss-backend:latest
+          image: docker.io/lexmount/abyss-backend:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
