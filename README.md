@@ -104,6 +104,17 @@ work.
 
 ### Docker
 
+Successful `main` builds publish the public
+`docker.io/lexmount/abyss-backend` image. Every build receives an immutable
+`sha-<full-git-sha>` tag, while the newest successful `main` build also receives
+`latest`. Version tags such as `v1.2.3` additionally publish `v1.2.3`, `1.2.3`,
+`1.2`, and `1` tags. Automated deployments should pin the published digest
+instead of a mutable tag:
+
+```bash
+docker pull 'lexmount/abyss-backend@sha256:<digest>'
+```
+
 The following example starts PostgreSQL and `abyss-backend` on a private Docker
 network. PostgreSQL data is retained in a named volume, while Elasticsearch
 remains disabled.
