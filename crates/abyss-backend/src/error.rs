@@ -18,13 +18,8 @@ pub enum AppError {
     #[error("configuration error: {0}")]
     Config(String),
     /// Diesel query or transaction failure.
-    #[cfg(feature = "postgres-es")]
     #[error("database error: {0}")]
     Database(#[from] diesel::result::Error),
-    /// SQLite query or transaction failure.
-    #[cfg(feature = "sqlite-fts")]
-    #[error("database error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     /// Database connection-pool failure.
     #[error("connection pool error: {0}")]
     Pool(#[from] r2d2::Error),
@@ -88,10 +83,7 @@ impl AppError {
             Self::Config(_) | Self::Pool(_) | Self::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-            #[cfg(feature = "postgres-es")]
             Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            #[cfg(feature = "sqlite-fts")]
-            Self::Sqlite(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -104,13 +96,7 @@ impl IntoResponse for AppError {
                 tracing::error!(error = %self, "internal error");
                 "internal server error".to_owned()
             }
-            #[cfg(feature = "postgres-es")]
             Self::Database(_) => {
-                tracing::error!(error = %self, "internal error");
-                "internal server error".to_owned()
-            }
-            #[cfg(feature = "sqlite-fts")]
-            Self::Sqlite(_) => {
                 tracing::error!(error = %self, "internal error");
                 "internal server error".to_owned()
             }

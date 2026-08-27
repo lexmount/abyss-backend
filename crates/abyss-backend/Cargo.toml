@@ -12,23 +12,35 @@ default = ["postgres-es"]
 blackbox-bundled-pq = ["postgres-es", "dep:pq-sys"]
 postgres-es = [
     "dep:diesel",
+    "diesel/chrono",
+    "diesel/postgres",
+    "diesel/serde_json",
+    "diesel/uuid",
     "dep:diesel_migrations",
+    "diesel_migrations/postgres",
     "dep:reqwest",
 ]
-sqlite-fts = ["dep:rusqlite"]
+sqlite-fts = [
+    "dep:diesel",
+    "diesel/sqlite",
+    "diesel/returning_clauses_for_sqlite_3_35",
+    "dep:diesel_migrations",
+    "diesel_migrations/sqlite",
+    "dep:libsqlite3-sys",
+]
 
 [dependencies]
 async-trait.workspace = true
 axum = "0.8"
 base64 = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
-diesel = { version = "2.2", features = ["chrono", "postgres", "r2d2", "serde_json", "uuid"], optional = true }
-diesel_migrations = { version = "2.2", features = ["postgres"], optional = true }
+diesel = { version = "2.2", default-features = false, features = ["32-column-tables", "r2d2", "with-deprecated"], optional = true }
+diesel_migrations = { version = "2.2", default-features = false, optional = true }
 hex = "0.4"
+libsqlite3-sys = { version = "0.35", features = ["bundled"], optional = true }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"], optional = true }
 r2d2 = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

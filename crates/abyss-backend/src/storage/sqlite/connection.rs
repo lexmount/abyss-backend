@@ -1,107 +1,82 @@
-//! SQLite connection pooling and per-connection safety configuration.
+//! Diesel SQLite connection pooling and per-connection safety configuration.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
+use std::{fs, path::Path};
+
+use diesel::{
+    QueryableByName, RunQueryDsl, SqliteConnection,
+    connection::SimpleConnection,
+    r2d2::{ConnectionManager, CustomizeConnection, Error as DieselPoolError},
+    sql_query,
+    sql_types::Text,
 };
-
-use r2d2::ManageConnection;
-use rusqlite::{Connection, OpenFlags};
 
 use crate::error::AppError;
 
-pub(super) type SqlitePool = r2d2::Pool<SqliteConnectionManager>;
+pub(super) type SqlitePool = r2d2::Pool<ConnectionManager<SqliteConnection>>;
 
-#[derive(Clone)]
-pub(super) struct SqliteConnectionManager {
-    location: SqliteLocation,
-}
+#[derive(Debug)]
+struct SqliteConnectionCustomizer;
 
-#[derive(Clone)]
-enum SqliteLocation {
-    File(PathBuf),
-    Memory,
-}
-
-impl SqliteConnectionManager {
-    fn new(database_url: &str) -> Result<Self, AppError> {
-        let normalized = database_url
-            .strip_prefix("sqlite://")
-            .unwrap_or(database_url);
-        if normalized == ":memory:" {
-            return Ok(Self {
-                location: SqliteLocation::Memory,
-            });
-        }
-
-        let path = PathBuf::from(normalized);
-        if path.as_os_str().is_empty() {
-            return Err(AppError::config(
-                "ABYSS_BACKEND_DATABASE_URL must contain a SQLite file path".to_owned(),
-            ));
-        }
-        create_parent_directory(&path)?;
-        Ok(Self {
-            location: SqliteLocation::File(path),
-        })
-    }
-
-    fn open(&self) -> Result<Connection, rusqlite::Error> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_FULL_MUTEX;
-        let connection = match &self.location {
-            SqliteLocation::File(path) => Connection::open_with_flags(path, flags)?,
-            SqliteLocation::Memory => Connection::open_in_memory_with_flags(flags)?,
-        };
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
-        Ok(connection)
+impl CustomizeConnection<SqliteConnection, DieselPoolError> for SqliteConnectionCustomizer {
+    fn on_acquire(&self, connection: &mut SqliteConnection) -> Result<(), DieselPoolError> {
+        connection
+            .batch_execute(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA busy_timeout = 5000;
+                 PRAGMA synchronous = NORMAL;",
+            )
+            .map_err(DieselPoolError::from)
     }
 }
 
-impl ManageConnection for SqliteConnectionManager {
-    type Connection = Connection;
-    type Error = rusqlite::Error;
-
-    fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        self.open()
-    }
-
-    fn is_valid(&self, connection: &mut Self::Connection) -> Result<(), Self::Error> {
-        connection.query_row("SELECT 1", [], |_row| Ok(()))
-    }
-
-    fn has_broken(&self, _connection: &mut Self::Connection) -> bool {
-        false
-    }
+#[derive(QueryableByName)]
+struct JournalMode {
+    #[diesel(sql_type = Text)]
+    journal_mode: String,
 }
 
 pub(super) fn create_pool(database_url: &str, pool_size: u32) -> Result<SqlitePool, AppError> {
-    let manager = SqliteConnectionManager::new(database_url)?;
-    let maximum_size = if matches!(manager.location, SqliteLocation::Memory) {
+    let database_url = normalized_database_url(database_url)?;
+    let maximum_size = if database_url == ":memory:" {
         1
     } else {
         pool_size
     };
+    let manager = ConnectionManager::<SqliteConnection>::new(database_url);
     r2d2::Pool::builder()
         .max_size(maximum_size)
+        .connection_customizer(Box::new(SqliteConnectionCustomizer))
         .build(manager)
         .map_err(AppError::from)
 }
 
-pub(super) fn configure_database(connection: &Connection) -> Result<(), AppError> {
-    let journal_mode = connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
-        row.get::<_, String>(0)
-    })?;
+pub(super) fn configure_database(connection: &mut SqliteConnection) -> Result<(), AppError> {
+    let journal_mode = sql_query("PRAGMA journal_mode = WAL")
+        .get_result::<JournalMode>(connection)?
+        .journal_mode;
     if journal_mode != "wal" && journal_mode != "memory" {
         return Err(AppError::internal(format!(
             "SQLite did not enable WAL journal mode: {journal_mode}"
         )));
     }
     Ok(())
+}
+
+fn normalized_database_url(database_url: &str) -> Result<String, AppError> {
+    let normalized = database_url
+        .strip_prefix("sqlite://")
+        .unwrap_or(database_url);
+    if normalized == ":memory:" {
+        return Ok(normalized.to_owned());
+    }
+    let path = Path::new(normalized);
+    if path.as_os_str().is_empty() {
+        return Err(AppError::config(
+            "ABYSS_BACKEND_DATABASE_URL must contain a SQLite file path".to_owned(),
+        ));
+    }
+    create_parent_directory(path)?;
+    Ok(normalized.to_owned())
 }
 
 fn create_parent_directory(path: &Path) -> Result<(), AppError> {

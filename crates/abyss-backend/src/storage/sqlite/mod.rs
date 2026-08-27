@@ -4,10 +4,11 @@ mod connection;
 mod migrations;
 mod models;
 mod repository;
+mod schema;
 mod search;
 
 use async_trait::async_trait;
-use rusqlite::Connection;
+use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
 use uuid::Uuid;
 
 use crate::{
@@ -33,7 +34,7 @@ impl SqliteFtsBackend {
         let pool = connection::create_pool(&config.database_url, config.database_pool_size)?;
         {
             let mut database = pool.get()?;
-            connection::configure_database(&database)?;
+            connection::configure_database(&mut database)?;
             if config.run_migrations {
                 migrations::run(&mut database)?;
             }
@@ -44,7 +45,7 @@ impl SqliteFtsBackend {
     async fn run_db<T, F>(&self, task_fn: F) -> Result<T, AppError>
     where
         T: Send + 'static,
-        F: FnOnce(&mut Connection) -> Result<T, AppError> + Send + 'static,
+        F: FnOnce(&mut SqliteConnection) -> Result<T, AppError> + Send + 'static,
     {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
@@ -60,7 +61,9 @@ impl SqliteFtsBackend {
 impl StorageBackend for SqliteFtsBackend {
     async fn ready(&self) -> Result<(), AppError> {
         self.run_db(|connection| {
-            connection.query_row("SELECT 1", [], |_row| Ok(()))?;
+            schema::app_users::table
+                .select(count_star())
+                .first::<i64>(connection)?;
             Ok(())
         })
         .await

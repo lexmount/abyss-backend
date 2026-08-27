@@ -221,6 +221,7 @@ pub fn non_empty(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+#[cfg(feature = "postgres-es")]
 pub fn non_negative_count(value: i64) -> usize {
     usize::try_from(value.max(0_i64)).unwrap_or(usize::MAX)
 }
@@ -230,6 +231,7 @@ pub const fn unix_epoch() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0_i64, 0_u32).expect("unix epoch must be a valid timestamp")
 }
 
+#[cfg(any(feature = "postgres-es", test))]
 pub fn escape_like_pattern(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {

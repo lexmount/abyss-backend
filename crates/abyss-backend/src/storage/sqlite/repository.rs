@@ -1,12 +1,11 @@
-//! Transactional SQLite implementation of usage ingest and relational queries.
+//! Diesel ORM implementation of SQLite usage ingest and relational queries.
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{
-    Connection, OptionalExtension as _, Row, Transaction, TransactionBehavior, params,
-    params_from_iter,
-    types::{Type, Value as SqlValue},
+use diesel::{
+    ExpressionMethods, QueryDsl, RunQueryDsl, SelectableHelper, SqliteConnection, dsl::max,
+    result::OptionalExtension, sql_query, sql_types::Text,
 };
 use uuid::Uuid;
 
@@ -25,73 +24,81 @@ use crate::{
         event_order::UsageEventTimelineOrder,
         persistence::{
             TurnIdentity, agent_name_filter_values, canonical_agent_name, choose_turn_index,
-            escape_like_pattern, non_empty, non_negative_count, normalize_limit, normalize_slug,
-            normalize_text, normalized_optional, normalized_tokens, parse_group_by, sha256_bytes,
-            turn_identity, validate_batch, validate_event_type,
+            non_empty, normalize_limit, normalize_slug, normalize_text, normalized_optional,
+            normalized_tokens, parse_group_by, sha256_bytes, turn_identity, validate_batch,
+            validate_event_type,
         },
         session_metadata_from_event,
     },
 };
 
-use super::models::{AttachmentRecord, DeviceRecord, EventRecord, SessionRecord, TurnRecord};
+use super::{
+    models::{
+        AttachmentRow, DeviceRecord, DeviceRow, EventRecord, EventRow, NewAttachment, NewDevice,
+        NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewTurn, SessionRow,
+        TurnRow, parse_uuid,
+    },
+    schema::{
+        agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
+        app_users, devices, llm_usage_event_attachments, llm_usage_events,
+    },
+};
 
 pub(super) fn ingest_events(
-    connection: &mut Connection,
+    connection: &mut SqliteConnection,
     request: &IngestEventsRequest,
     user_id: Uuid,
     max_batch_size: usize,
 ) -> Result<IngestEventsResponse, AppError> {
     let validated_attachments = validate_batch(request, max_batch_size)?;
-    // IMMEDIATE obtains the single SQLite write reservation before turn indexes
-    // are allocated, preventing two local writers from merging distinct turns.
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut accepted = 0_usize;
-    let mut duplicates = 0_usize;
-    for (event, attachments) in request.events.iter().zip(validated_attachments) {
-        if ingest_one_event(&transaction, user_id, event, attachments)? {
-            accepted = accepted.saturating_add(1);
-        } else {
-            duplicates = duplicates.saturating_add(1);
-        }
-    }
+    // Reserve the single SQLite writer before allocating turn indexes.
+    let (accepted, duplicates, accepted_captures, duplicate_captures) = connection
+        .immediate_transaction(|transaction| {
+            let mut accepted = 0_usize;
+            let mut duplicates = 0_usize;
+            for (event, attachments) in request.events.iter().zip(validated_attachments) {
+                if ingest_one_event(transaction, user_id, event, attachments)? {
+                    accepted = accepted.saturating_add(1);
+                } else {
+                    duplicates = duplicates.saturating_add(1);
+                }
+            }
 
-    let mut accepted_diagnostic_captures = 0_usize;
-    let mut duplicate_diagnostic_captures = 0_usize;
-    for capture in &request.diagnostic_captures {
-        if ingest_one_diagnostic_capture(&transaction, user_id, capture)? {
-            accepted_diagnostic_captures = accepted_diagnostic_captures.saturating_add(1);
-        } else {
-            duplicate_diagnostic_captures = duplicate_diagnostic_captures.saturating_add(1);
-        }
-    }
-    transaction.commit()?;
+            let mut accepted_captures = 0_usize;
+            let mut duplicate_captures = 0_usize;
+            for capture in &request.diagnostic_captures {
+                if ingest_one_diagnostic_capture(transaction, user_id, capture)? {
+                    accepted_captures = accepted_captures.saturating_add(1);
+                } else {
+                    duplicate_captures = duplicate_captures.saturating_add(1);
+                }
+            }
+            Ok::<_, AppError>((accepted, duplicates, accepted_captures, duplicate_captures))
+        })?;
 
     Ok(IngestEventsResponse {
         accepted,
         duplicates,
         rejected: 0,
         errors: Vec::new(),
-        accepted_diagnostic_captures,
-        duplicate_diagnostic_captures,
+        accepted_diagnostic_captures: accepted_captures,
+        duplicate_diagnostic_captures: duplicate_captures,
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "One linear function keeps the event, attachments, and FTS projection visibly in one transaction."
-)]
 fn ingest_one_event(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     event: &IngestUsageEvent,
     attachments: Vec<ValidatedImageAttachment>,
 ) -> Result<bool, AppError> {
     let event_id = normalize_text(&event.event_id);
-    let exists = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM llm_usage_events WHERE event_id = ?1)",
-        [&event_id],
-        |row| row.get::<_, bool>(0),
-    )?;
+    let exists = llm_usage_events::table
+        .filter(llm_usage_events::event_id.eq(&event_id))
+        .select(llm_usage_events::id)
+        .first::<String>(connection)
+        .optional()?
+        .is_some();
     if exists {
         return Ok(false);
     }
@@ -102,9 +109,9 @@ fn ingest_one_event(
     let agent_version = normalized_optional(event.agent.version.as_deref());
     let provider = normalize_slug(&event.llm.provider);
     let model = normalize_text(&event.llm.model);
-    let device_id = upsert_device(transaction, user_id, event, observed_at, now)?;
-    let session_id = upsert_session(
-        transaction,
+    let device_id = upsert_device(connection, user_id, event, observed_at, now)?;
+    let session_pk = upsert_session(
+        connection,
         user_id,
         device_id,
         event,
@@ -113,11 +120,11 @@ fn ingest_one_event(
         observed_at,
         now,
     )?;
-    let turn_index = resolve_turn_index(transaction, session_id, event)?;
-    let turn_id = upsert_turn(
-        transaction,
+    let turn_index = resolve_turn_index(connection, session_pk, event)?;
+    let turn_pk = upsert_turn(
+        connection,
         user_id,
-        session_id,
+        session_pk,
         turn_index,
         observed_at,
         now,
@@ -125,105 +132,112 @@ fn ingest_one_event(
     let tokens = normalized_tokens(event)?;
     let text = normalized_optional(event.text.as_deref());
     let event_pk = Uuid::now_v7();
-    let metadata = serde_json::to_string(&event.metadata)
-        .map_err(|error| AppError::internal(format!("serialize event metadata: {error}")))?;
+    let metadata = serialize_json(&event.metadata, "event metadata")?;
 
-    let inserted = transaction.execute(
-        "INSERT INTO llm_usage_events (
-             id, user_id, device_context_id, session_pk, turn_pk, event_id,
-             agent_name, agent_version, session_id, turn_index, llm_provider,
-             llm_model, event_type, text, text_sha256, input_tokens,
-             output_tokens, cache_read_tokens, cache_write_tokens,
-             reasoning_tokens, total_tokens, observed_at, metadata, created_at
-         ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
-         ) ON CONFLICT(event_id) DO NOTHING",
-        params![
-            event_pk.to_string(),
-            user_id.to_string(),
-            device_id.to_string(),
-            session_id.to_string(),
-            turn_id.to_string(),
+    let inserted = diesel::insert_into(llm_usage_events::table)
+        .values(NewEvent {
+            id: event_pk.to_string(),
+            user_id: user_id.to_string(),
+            device_context_id: device_id.to_string(),
+            session_pk: session_pk.to_string(),
+            turn_pk: turn_pk.to_string(),
             event_id,
             agent_name,
             agent_version,
-            normalize_text(&event.session_id),
+            session_id: normalize_text(&event.session_id),
             turn_index,
-            provider,
-            model,
-            event.event_type.as_str(),
-            text,
-            text.as_deref().map(sha256_bytes),
-            tokens.input,
-            tokens.output,
-            tokens.cache_read,
-            tokens.cache_write,
-            tokens.reasoning,
-            tokens.total,
+            llm_provider: provider,
+            llm_model: model,
+            event_type: event.event_type.as_str().to_owned(),
+            text: text.clone(),
+            text_sha256: text.as_deref().map(sha256_bytes),
+            input_tokens: tokens.input,
+            output_tokens: tokens.output,
+            cache_read_tokens: tokens.cache_read,
+            cache_write_tokens: tokens.cache_write,
+            reasoning_tokens: tokens.reasoning,
+            total_tokens: tokens.total,
             observed_at,
             metadata,
-            now,
-        ],
-    )?;
+            created_at: now,
+        })
+        .on_conflict(llm_usage_events::event_id)
+        .do_nothing()
+        .execute(connection)?;
     if inserted != 1 {
         return Ok(false);
     }
 
-    for attachment in attachments {
-        transaction.execute(
-            "INSERT INTO llm_usage_event_attachments (
-                 id, user_id, event_pk, position, media_type, byte_size,
-                 sha256, content, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                Uuid::now_v7().to_string(),
-                user_id.to_string(),
-                event_pk.to_string(),
-                attachment.position,
-                attachment.media_type.as_str(),
-                attachment.byte_size,
-                attachment.sha256,
-                attachment.content,
-                now,
-            ],
-        )?;
+    let attachment_rows = attachments
+        .into_iter()
+        .map(|attachment| NewAttachment {
+            id: Uuid::now_v7().to_string(),
+            user_id: user_id.to_string(),
+            event_pk: event_pk.to_string(),
+            position: attachment.position,
+            media_type: attachment.media_type.as_str().to_owned(),
+            byte_size: attachment.byte_size,
+            sha256: attachment.sha256,
+            content: attachment.content,
+            created_at: now,
+        })
+        .collect::<Vec<_>>();
+    if !attachment_rows.is_empty() {
+        diesel::insert_into(llm_usage_event_attachments::table)
+            .values(&attachment_rows)
+            .execute(connection)?;
     }
 
-    insert_search_projection(transaction, event_pk, user_id, session_id, event)?;
+    insert_search_projection(connection, event_pk, user_id, session_pk, event)?;
     Ok(true)
 }
 
 fn upsert_device(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     event: &IngestUsageEvent,
     observed_at: i64,
     now: i64,
 ) -> Result<Uuid, AppError> {
-    let id = transaction.query_row(
-        "INSERT INTO devices (
-             id, user_id, host_name, platform, os_version, first_seen_at,
-             last_seen_at, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7)
-         ON CONFLICT(user_id, host_name, platform) DO UPDATE SET
-             os_version = COALESCE(excluded.os_version, devices.os_version),
-             first_seen_at = MIN(devices.first_seen_at, excluded.first_seen_at),
-             last_seen_at = MAX(devices.last_seen_at, excluded.last_seen_at),
-             updated_at = excluded.updated_at
-         RETURNING id",
-        params![
-            Uuid::now_v7().to_string(),
-            user_id.to_string(),
-            normalize_text(&event.device.host_name),
-            normalize_slug(&event.device.platform),
-            normalized_optional(event.device.os_version.as_deref()),
-            observed_at,
-            now,
-        ],
-        |row| row.get::<_, String>(0),
-    )?;
-    parse_uuid(&id, "device id")
+    let owner = user_id.to_string();
+    let host_name = normalize_text(&event.device.host_name);
+    let platform = normalize_slug(&event.device.platform);
+    let os_version = normalized_optional(event.device.os_version.as_deref());
+    let existing = devices::table
+        .filter(devices::user_id.eq(&owner))
+        .filter(devices::host_name.eq(&host_name))
+        .filter(devices::platform.eq(&platform))
+        .select(DeviceRow::as_select())
+        .first::<DeviceRow>(connection)
+        .optional()?;
+    if let Some(existing) = existing {
+        let id = parse_uuid(&existing.id, "device id")?;
+        diesel::update(devices::table.find(existing.id))
+            .set((
+                devices::os_version.eq(os_version.or(existing.os_version)),
+                devices::first_seen_at.eq(existing.first_seen_at.min(observed_at)),
+                devices::last_seen_at.eq(existing.last_seen_at.max(observed_at)),
+                devices::updated_at.eq(now),
+            ))
+            .execute(connection)?;
+        return Ok(id);
+    }
+
+    let id = Uuid::now_v7();
+    diesel::insert_into(devices::table)
+        .values(NewDevice {
+            id: id.to_string(),
+            user_id: owner,
+            host_name,
+            platform,
+            os_version,
+            first_seen_at: observed_at,
+            last_seen_at: observed_at,
+            created_at: now,
+            updated_at: now,
+        })
+        .execute(connection)?;
+    Ok(id)
 }
 
 #[expect(
@@ -231,7 +245,7 @@ fn upsert_device(
     reason = "The session upsert receives one explicit value for every evolving boundary."
 )]
 fn upsert_session(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     device_id: Uuid,
     event: &IngestUsageEvent,
@@ -240,109 +254,149 @@ fn upsert_session(
     observed_at: i64,
     now: i64,
 ) -> Result<Uuid, AppError> {
-    let metadata = serde_json::to_string(&session_metadata_from_event(&event.metadata))
-        .map_err(|error| AppError::internal(format!("serialize session metadata: {error}")))?;
-    let id = transaction.query_row(
-        "INSERT INTO agent_sessions (
-             id, user_id, device_context_id, agent_name, agent_version,
-             session_id, started_at, ended_at, metadata, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?9)
-         ON CONFLICT(user_id, agent_name, session_id) DO UPDATE SET
-             device_context_id = excluded.device_context_id,
-             agent_version = COALESCE(excluded.agent_version, agent_sessions.agent_version),
-             started_at = MIN(agent_sessions.started_at, excluded.started_at),
-             ended_at = MAX(COALESCE(agent_sessions.ended_at, excluded.ended_at), excluded.ended_at),
-             metadata = json_patch(agent_sessions.metadata, excluded.metadata),
-             updated_at = excluded.updated_at
-         RETURNING id",
-        params![
-            Uuid::now_v7().to_string(),
-            user_id.to_string(),
-            device_id.to_string(),
-            agent_name,
-            agent_version,
-            normalize_text(&event.session_id),
-            observed_at,
-            metadata,
-            now,
-        ],
-        |row| row.get::<_, String>(0),
-    )?;
-    parse_uuid(&id, "session id")
+    let owner = user_id.to_string();
+    let session_id = normalize_text(&event.session_id);
+    let existing = agent_sessions::table
+        .filter(agent_sessions::user_id.eq(&owner))
+        .filter(agent_sessions::agent_name.eq(agent_name))
+        .filter(agent_sessions::session_id.eq(&session_id))
+        .select(SessionRow::as_select())
+        .first::<SessionRow>(connection)
+        .optional()?;
+    let incoming_metadata = session_metadata_from_event(&event.metadata);
+    if let Some(existing) = existing {
+        let id = parse_uuid(&existing.id, "session id")?;
+        let metadata = merge_json(&existing.metadata, &incoming_metadata, "session metadata")?;
+        diesel::update(agent_sessions::table.find(existing.id))
+            .set((
+                agent_sessions::device_context_id.eq(device_id.to_string()),
+                agent_sessions::agent_version
+                    .eq(agent_version.map(str::to_owned).or(existing.agent_version)),
+                agent_sessions::started_at.eq(existing.started_at.min(observed_at)),
+                agent_sessions::ended_at.eq(Some(
+                    existing.ended_at.unwrap_or(observed_at).max(observed_at),
+                )),
+                agent_sessions::metadata.eq(metadata),
+                agent_sessions::updated_at.eq(now),
+            ))
+            .execute(connection)?;
+        return Ok(id);
+    }
+
+    let id = Uuid::now_v7();
+    diesel::insert_into(agent_sessions::table)
+        .values(NewSession {
+            id: id.to_string(),
+            user_id: owner,
+            device_context_id: device_id.to_string(),
+            agent_name: agent_name.to_owned(),
+            agent_version: agent_version.map(str::to_owned),
+            session_id,
+            started_at: observed_at,
+            ended_at: Some(observed_at),
+            metadata: serialize_json(&incoming_metadata, "session metadata")?,
+            created_at: now,
+            updated_at: now,
+        })
+        .execute(connection)?;
+    Ok(id)
 }
 
 fn resolve_turn_index(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     session_pk: Uuid,
     event: &IngestUsageEvent,
 ) -> Result<i32, AppError> {
     let Some(identity) = turn_identity(event) else {
         return Ok(event.turn_index);
     };
-    let existing = existing_turn_index_for_identity(transaction, session_pk, &identity)?;
-    let next = transaction.query_row(
-        "SELECT COALESCE(MAX(turn_index), 0) + 1 FROM agent_turns WHERE session_pk = ?1",
-        [session_pk.to_string()],
-        |row| row.get::<_, i32>(0),
-    )?;
+    let existing = existing_turn_index_for_identity(connection, session_pk, &identity)?;
+    let next = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session_pk.to_string()))
+        .select(max(agent_turns::turn_index))
+        .first::<Option<i32>>(connection)?
+        .unwrap_or(0_i32)
+        .saturating_add(1);
     Ok(choose_turn_index(event.turn_index, existing, next))
 }
 
 fn existing_turn_index_for_identity(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     session_pk: Uuid,
     identity: &TurnIdentity,
 ) -> Result<Option<i32>, AppError> {
-    // Metadata keys come from the closed TurnIdentityKind enum rather than user
-    // input, so selecting a fixed JSON path here cannot alter SQL structure.
-    let path = format!("$.{}", identity.kind.metadata_key());
-    transaction
-        .query_row(
-            "SELECT turn_index
-             FROM llm_usage_events
-             WHERE session_pk = ?1 AND json_extract(metadata, ?2) = ?3
-             ORDER BY observed_at ASC, id ASC
-             LIMIT 1",
-            params![session_pk.to_string(), path, identity.value],
-            |row| row.get::<_, i32>(0),
-        )
-        .optional()
-        .map_err(AppError::from)
+    let rows = llm_usage_events::table
+        .filter(llm_usage_events::session_pk.eq(session_pk.to_string()))
+        .order_by((
+            llm_usage_events::observed_at.asc(),
+            llm_usage_events::id.asc(),
+        ))
+        .select((llm_usage_events::turn_index, llm_usage_events::metadata))
+        .load::<(i32, String)>(connection)?;
+    for (turn_index, metadata) in rows {
+        let metadata = serde_json::from_str::<serde_json::Value>(&metadata).map_err(|error| {
+            AppError::internal(format!("stored event metadata is invalid JSON: {error}"))
+        })?;
+        if metadata
+            .get(identity.kind.metadata_key())
+            .and_then(serde_json::Value::as_str)
+            == Some(identity.value.as_str())
+        {
+            return Ok(Some(turn_index));
+        }
+    }
+    Ok(None)
 }
 
 fn upsert_turn(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
     turn_index: i32,
     observed_at: i64,
     now: i64,
 ) -> Result<Uuid, AppError> {
-    let id = transaction.query_row(
-        "INSERT INTO agent_turns (
-             id, user_id, session_pk, turn_index, started_at, ended_at,
-             created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6)
-         ON CONFLICT(session_pk, turn_index) DO UPDATE SET
-             started_at = MIN(agent_turns.started_at, excluded.started_at),
-             ended_at = MAX(COALESCE(agent_turns.ended_at, excluded.ended_at), excluded.ended_at),
-             updated_at = excluded.updated_at
-         RETURNING id",
-        params![
-            Uuid::now_v7().to_string(),
-            user_id.to_string(),
-            session_pk.to_string(),
+    let session = session_pk.to_string();
+    let existing = agent_turns::table
+        .filter(agent_turns::session_pk.eq(&session))
+        .filter(agent_turns::turn_index.eq(turn_index))
+        .select(TurnRow::as_select())
+        .first::<TurnRow>(connection)
+        .optional()?;
+    if let Some(existing) = existing {
+        let id = parse_uuid(&existing.id, "turn id")?;
+        diesel::update(agent_turns::table.find(existing.id))
+            .set((
+                agent_turns::started_at.eq(existing.started_at.min(observed_at)),
+                agent_turns::ended_at.eq(Some(
+                    existing.ended_at.unwrap_or(observed_at).max(observed_at),
+                )),
+                agent_turns::updated_at.eq(now),
+            ))
+            .execute(connection)?;
+        return Ok(id);
+    }
+
+    let id = Uuid::now_v7();
+    diesel::insert_into(agent_turns::table)
+        .values(NewTurn {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            session_pk: session,
             turn_index,
-            observed_at,
-            now,
-        ],
-        |row| row.get::<_, String>(0),
-    )?;
-    parse_uuid(&id, "turn id")
+            started_at: observed_at,
+            ended_at: Some(observed_at),
+            created_at: now,
+            updated_at: now,
+        })
+        .execute(connection)?;
+    Ok(id)
 }
 
+/// Writes the SQLite FTS5 projection. Virtual tables are intentionally outside
+/// Diesel's relational schema and use a fully bound raw statement.
 fn insert_search_projection(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     event_pk: Uuid,
     user_id: Uuid,
     session_pk: Uuid,
@@ -350,109 +404,100 @@ fn insert_search_projection(
 ) -> Result<(), AppError> {
     let projection =
         SearchProjection::from_source(normalized_optional(event.text.as_deref()), &event.metadata);
-    transaction.execute(
+    sql_query(
         "INSERT INTO usage_events_fts (
              event_pk, user_id, session_pk, session_id, content, tool_names,
              tool_content, commands, file_paths
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            event_pk.to_string(),
-            user_id.to_string(),
-            session_pk.to_string(),
-            normalize_text(&event.session_id),
-            projection.content,
-            projection.tool_names.join("\n"),
-            projection.tool_content.join("\n"),
-            projection.commands.join("\n"),
-            projection.file_paths.join("\n"),
-        ],
-    )?;
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind::<Text, _>(event_pk.to_string())
+    .bind::<Text, _>(user_id.to_string())
+    .bind::<Text, _>(session_pk.to_string())
+    .bind::<Text, _>(normalize_text(&event.session_id))
+    .bind::<diesel::sql_types::Nullable<Text>, _>(projection.content)
+    .bind::<Text, _>(projection.tool_names.join("\n"))
+    .bind::<Text, _>(projection.tool_content.join("\n"))
+    .bind::<Text, _>(projection.commands.join("\n"))
+    .bind::<Text, _>(projection.file_paths.join("\n"))
+    .execute(connection)?;
     Ok(())
 }
 
 fn ingest_one_diagnostic_capture(
-    transaction: &Transaction<'_>,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     capture: &IngestDiagnosticCapture,
 ) -> Result<bool, AppError> {
-    let mut events = Vec::with_capacity(capture.event_ids.len());
-    for event_id in &capture.event_ids {
-        let event = transaction
-            .query_row(
-                "SELECT id, device_context_id, session_pk
-                 FROM llm_usage_events
-                 WHERE user_id = ?1 AND event_id = ?2",
-                params![user_id.to_string(), event_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((event_pk, device_id, session_pk)) = event else {
-            return Err(AppError::validation(
-                "diagnostic capture events were not ingested for the authenticated user".to_owned(),
-            ));
-        };
-        events.push((
-            parse_uuid(&event_pk, "event id")?,
-            parse_uuid(&device_id, "device id")?,
-            parse_uuid(&session_pk, "session id")?,
+    let event_ids = capture
+        .event_ids
+        .iter()
+        .map(|event_id| normalize_text(event_id))
+        .collect::<Vec<_>>();
+    let events = llm_usage_events::table
+        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
+        .filter(llm_usage_events::event_id.eq_any(&event_ids))
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::device_context_id,
+            llm_usage_events::session_pk,
+        ))
+        .load::<(String, String, String)>(connection)?;
+    if events.len() != capture.event_ids.len() {
+        return Err(AppError::validation(
+            "diagnostic capture events were not ingested for the authenticated user".to_owned(),
         ));
     }
-    let Some((_, device_id, session_pk)) = events.first().copied() else {
+    let Some((_, device_id, session_pk)) = events.first() else {
         return Err(AppError::validation(
             "diagnostic capture must reference at least one event".to_owned(),
         ));
     };
     if events
         .iter()
-        .any(|(_, device, session)| *device != device_id || *session != session_pk)
+        .any(|(_, device, session)| device != device_id || session != session_pk)
     {
         return Err(AppError::validation(
             "diagnostic capture events must belong to one session and device".to_owned(),
         ));
     }
 
-    let capture_pk = Uuid::now_v7();
-    let payload = serde_json::to_string(&capture.payload)
-        .map_err(|error| AppError::internal(format!("serialize diagnostic payload: {error}")))?;
-    let inserted = transaction.execute(
-        "INSERT INTO agent_diagnostic_captures (
-             id, user_id, device_context_id, session_pk, capture_id, flow_id,
-             captured_at, collector_version, payload, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(user_id, capture_id) DO NOTHING",
-        params![
-            capture_pk.to_string(),
-            user_id.to_string(),
-            device_id.to_string(),
-            session_pk.to_string(),
-            normalize_text(&capture.capture_id),
-            normalize_text(&capture.flow_id),
-            timestamp_to_micros(capture.captured_at),
-            normalize_text(&capture.collector_version),
-            payload,
-            timestamp_to_micros(Utc::now()),
-        ],
-    )?;
+    let capture_pk = Uuid::now_v7().to_string();
+    let inserted = diesel::insert_into(agent_diagnostic_captures::table)
+        .values(NewDiagnosticCapture {
+            id: capture_pk.clone(),
+            user_id: user_id.to_string(),
+            device_context_id: device_id.clone(),
+            session_pk: session_pk.clone(),
+            capture_id: normalize_text(&capture.capture_id),
+            flow_id: normalize_text(&capture.flow_id),
+            captured_at: timestamp_to_micros(capture.captured_at),
+            collector_version: normalize_text(&capture.collector_version),
+            payload: serialize_json(&capture.payload, "diagnostic payload")?,
+            created_at: timestamp_to_micros(Utc::now()),
+        })
+        .on_conflict((
+            agent_diagnostic_captures::user_id,
+            agent_diagnostic_captures::capture_id,
+        ))
+        .do_nothing()
+        .execute(connection)?;
     if inserted == 1 {
-        for (event_pk, _, _) in events {
-            transaction.execute(
-                "INSERT INTO agent_diagnostic_capture_events (capture_pk, event_pk)
-                 VALUES (?1, ?2)",
-                params![capture_pk.to_string(), event_pk.to_string()],
-            )?;
-        }
+        let links = events
+            .into_iter()
+            .map(|(event_pk, _, _)| NewDiagnosticCaptureEvent {
+                capture_pk: capture_pk.clone(),
+                event_pk,
+            })
+            .collect::<Vec<_>>();
+        diesel::insert_into(agent_diagnostic_capture_events::table)
+            .values(&links)
+            .execute(connection)?;
     }
     Ok(inserted == 1)
 }
 
 pub(super) fn raw_events(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     query: &RawEventsQuery,
     user_id: Uuid,
     default_limit: i64,
@@ -518,90 +563,86 @@ struct EventFilters<'a> {
 }
 
 fn load_filtered_events(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     filters: &EventFilters<'_>,
 ) -> Result<Vec<EventRecord>, AppError> {
-    let mut sql = String::from(EVENT_SELECT_SQL);
-    sql.push_str(" WHERE user_id = ?");
-    let mut values = vec![SqlValue::Text(filters.user_id.to_string())];
+    let mut query = llm_usage_events::table
+        .filter(llm_usage_events::user_id.eq(filters.user_id.to_string()))
+        .into_boxed::<diesel::sqlite::Sqlite>();
     if let Some(from) = filters.from {
-        sql.push_str(" AND observed_at >= ?");
-        values.push(SqlValue::Integer(timestamp_to_micros(from)));
+        query = query.filter(llm_usage_events::observed_at.ge(timestamp_to_micros(from)));
     }
     if let Some(to) = filters.to {
-        sql.push_str(" AND observed_at < ?");
-        values.push(SqlValue::Integer(timestamp_to_micros(to)));
+        query = query.filter(llm_usage_events::observed_at.lt(timestamp_to_micros(to)));
     }
     if let Some(agent_name) = filters.agent_name.and_then(non_empty) {
-        let names = agent_name_filter_values(agent_name);
-        sql.push_str(" AND agent_name IN (");
-        sql.push_str(&placeholders(names.len()));
-        sql.push(')');
-        values.extend(names.into_iter().map(SqlValue::Text));
+        query =
+            query.filter(llm_usage_events::agent_name.eq_any(agent_name_filter_values(agent_name)));
     }
     if let Some(session_id) = filters.session_id.and_then(non_empty) {
-        sql.push_str(" AND session_id = ?");
-        values.push(SqlValue::Text(session_id.trim().to_owned()));
+        query = query.filter(llm_usage_events::session_id.eq(session_id.trim()));
     }
     if let Some(session_pk) = filters.session_pk {
-        sql.push_str(" AND session_pk = ?");
-        values.push(SqlValue::Text(session_pk.to_string()));
+        query = query.filter(llm_usage_events::session_pk.eq(session_pk.to_string()));
     }
     if let Some(turn_index) = filters.turn_index {
-        sql.push_str(" AND turn_index = ?");
-        values.push(SqlValue::Integer(i64::from(turn_index)));
+        query = query.filter(llm_usage_events::turn_index.eq(turn_index));
     }
     if let Some(provider) = filters.llm_provider.and_then(non_empty) {
-        sql.push_str(" AND llm_provider = ?");
-        values.push(SqlValue::Text(normalize_slug(provider)));
+        query = query.filter(llm_usage_events::llm_provider.eq(normalize_slug(provider)));
     }
     if let Some(model) = filters.llm_model.and_then(non_empty) {
-        sql.push_str(" AND llm_model = ?");
-        values.push(SqlValue::Text(model.trim().to_owned()));
+        query = query.filter(llm_usage_events::llm_model.eq(model.trim()));
     }
     if let Some(event_type) = filters.event_type.and_then(non_empty) {
-        sql.push_str(" AND event_type = ?");
-        values.push(SqlValue::Text(validate_event_type(event_type)?));
+        query = query.filter(llm_usage_events::event_type.eq(validate_event_type(event_type)?));
     }
-    sql.push_str(" ORDER BY observed_at DESC, id DESC LIMIT ? OFFSET ?");
-    values.push(SqlValue::Integer(filters.limit));
-    values.push(SqlValue::Integer(filters.offset));
-
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map(params_from_iter(values.iter()), map_event)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+    query
+        .order_by((
+            llm_usage_events::observed_at.desc(),
+            llm_usage_events::id.desc(),
+        ))
+        .limit(filters.limit)
+        .offset(filters.offset)
+        .select(EventRow::as_select())
+        .load::<EventRow>(connection)?
+        .into_iter()
+        .map(EventRow::into_record)
+        .collect()
 }
 
 pub(super) fn session_timeline(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
 ) -> Result<SessionTimelineResponse, AppError> {
-    let session = connection
-        .query_row(
-            "SELECT id, user_id, device_context_id, agent_name, agent_version,
-                    session_id, started_at, ended_at, metadata
-             FROM agent_sessions
-             WHERE id = ?1 AND user_id = ?2",
-            params![session_pk.to_string(), user_id.to_string()],
-            map_session,
-        )
+    let session = agent_sessions::table
+        .filter(agent_sessions::id.eq(session_pk.to_string()))
+        .filter(agent_sessions::user_id.eq(user_id.to_string()))
+        .select(SessionRow::as_select())
+        .first::<SessionRow>(connection)
         .optional()?
-        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
-
-    let mut turn_statement = connection.prepare(
-        "SELECT id, turn_index, started_at, ended_at
-         FROM agent_turns WHERE session_pk = ?1 ORDER BY turn_index ASC",
-    )?;
-    let turns = turn_statement
-        .query_map([session.id.to_string()], map_turn)?
+        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?
+        .into_record()?;
+    let turns = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session.id.to_string()))
+        .order_by(agent_turns::turn_index.asc())
+        .select(TurnRow::as_select())
+        .load::<TurnRow>(connection)?
+        .into_iter()
+        .map(TurnRow::into_record)
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut event_statement = connection.prepare(&format!(
-        "{EVENT_SELECT_SQL} WHERE session_pk = ?1 ORDER BY turn_index, observed_at, id"
-    ))?;
-    let mut events = event_statement
-        .query_map([session.id.to_string()], map_event)?
+    let mut events = llm_usage_events::table
+        .filter(llm_usage_events::session_pk.eq(session.id.to_string()))
+        .order_by((
+            llm_usage_events::turn_index.asc(),
+            llm_usage_events::observed_at.asc(),
+            llm_usage_events::id.asc(),
+        ))
+        .select(EventRow::as_select())
+        .load::<EventRow>(connection)?
+        .into_iter()
+        .map(EventRow::into_record)
         .collect::<Result<Vec<_>, _>>()?;
     UsageEventTimelineOrder::sort(&mut events);
     let devices = load_device_contexts(connection, &events)?;
@@ -646,22 +687,18 @@ pub(super) fn session_timeline(
 }
 
 pub(super) fn image_attachment(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     attachment_id: Uuid,
 ) -> Result<StoredImageAttachment, AppError> {
-    let row = connection
-        .query_row(
-            "SELECT id, event_pk, position, media_type, byte_size, sha256, content
-             FROM llm_usage_event_attachments
-             WHERE id = ?1 AND user_id = ?2",
-            params![attachment_id.to_string(), user_id.to_string()],
-            map_attachment,
-        )
+    let row = llm_usage_event_attachments::table
+        .filter(llm_usage_event_attachments::id.eq(attachment_id.to_string()))
+        .filter(llm_usage_event_attachments::user_id.eq(user_id.to_string()))
+        .select(AttachmentRow::as_select())
+        .first::<AttachmentRow>(connection)
         .optional()?
-        .ok_or_else(|| {
-            AppError::not_found(format!("image attachment not found: {attachment_id}"))
-        })?;
+        .ok_or_else(|| AppError::not_found(format!("image attachment not found: {attachment_id}")))?
+        .into_record()?;
     let content = row.content.ok_or_else(|| {
         AppError::not_found(format!(
             "image attachment content not found: {attachment_id}"
@@ -680,71 +717,56 @@ pub(super) fn image_attachment(
 }
 
 pub(super) fn usage_summary(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     query: &SummaryQuery,
     user_id: Uuid,
-    default_limit: i64,
+    scan_limit: i64,
 ) -> Result<SummaryResponse, AppError> {
     let group_by = parse_group_by(query.group_by.as_deref());
     let dimensions = SummaryDimensions::from_group_by(&group_by);
-    let limit = normalize_limit(query.limit, default_limit, 100_000);
-    let mut sql = summary_select_sql(&dimensions);
-    let mut values = vec![SqlValue::Text(user_id.to_string())];
-    if let Some(from) = query.from {
-        sql.push_str(" AND e.observed_at >= ?");
-        values.push(SqlValue::Integer(timestamp_to_micros(from)));
+    let owner = load_owner(connection, user_id)?;
+    if !owner_matches_filter(user_id, &owner, query.user_filter.as_deref()) {
+        return Ok(empty_summary(query, group_by));
     }
-    if let Some(to) = query.to {
-        sql.push_str(" AND e.observed_at < ?");
-        values.push(SqlValue::Integer(timestamp_to_micros(to)));
+    let events = load_filtered_events(
+        connection,
+        &EventFilters {
+            user_id,
+            from: query.from,
+            to: query.to,
+            agent_name: query.agent_name.as_deref(),
+            session_id: query.session_id.as_deref(),
+            session_pk: None,
+            turn_index: None,
+            llm_provider: query.llm_provider.as_deref(),
+            llm_model: query.llm_model.as_deref(),
+            event_type: query.event_type.as_deref(),
+            limit: scan_limit,
+            offset: 0,
+        },
+    )?;
+    let devices = load_device_contexts(connection, &events)?;
+    let mut buckets: HashMap<SummaryKey, SummaryBucket> = HashMap::new();
+    for event in events {
+        let device = devices.get(&event.device_context_id);
+        let key = SummaryKey::new(&event, device, user_id, &owner, &dimensions);
+        buckets.entry(key).or_default().add(&event);
     }
-    if let Some(user_filter) = query.user_filter.as_deref().and_then(non_empty) {
-        if let Ok(user_filter_id) = Uuid::parse_str(user_filter.trim()) {
-            sql.push_str(" AND e.user_id = ?");
-            values.push(SqlValue::Text(user_filter_id.to_string()));
-        } else {
-            sql.push_str(
-                " AND (lower(u.email) LIKE lower(?) ESCAPE '\\'
-                        OR lower(COALESCE(u.name, '')) LIKE lower(?) ESCAPE '\\')",
-            );
-            let pattern = format!("%{}%", escape_like_pattern(user_filter.trim()));
-            values.push(SqlValue::Text(pattern.clone()));
-            values.push(SqlValue::Text(pattern));
-        }
-    }
-    if let Some(agent_name) = query.agent_name.as_deref().and_then(non_empty) {
-        let names = agent_name_filter_values(agent_name);
-        sql.push_str(" AND e.agent_name IN (");
-        sql.push_str(&placeholders(names.len()));
-        sql.push(')');
-        values.extend(names.into_iter().map(SqlValue::Text));
-    }
-    if let Some(session_id) = query.session_id.as_deref().and_then(non_empty) {
-        sql.push_str(" AND e.session_id = ?");
-        values.push(SqlValue::Text(session_id.trim().to_owned()));
-    }
-    if let Some(provider) = query.llm_provider.as_deref().and_then(non_empty) {
-        sql.push_str(" AND e.llm_provider = ?");
-        values.push(SqlValue::Text(normalize_slug(provider)));
-    }
-    if let Some(model) = query.llm_model.as_deref().and_then(non_empty) {
-        sql.push_str(" AND e.llm_model = ?");
-        values.push(SqlValue::Text(model.trim().to_owned()));
-    }
-    if let Some(event_type) = query.event_type.as_deref().and_then(non_empty) {
-        sql.push_str(" AND e.event_type = ?");
-        values.push(SqlValue::Text(validate_event_type(event_type)?));
-    }
-    sql.push_str(
-        " GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
-          ORDER BY total_tokens DESC, agent_name ASC, user_email ASC, day ASC
-          LIMIT ?",
-    );
-    values.push(SqlValue::Integer(limit));
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement
-        .query_map(params_from_iter(values.iter()), map_summary_row)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = buckets
+        .into_iter()
+        .map(|(key, bucket)| bucket.into_row(key))
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| left.agent_name.cmp(&right.agent_name))
+            .then_with(|| left.user_email.cmp(&right.user_email))
+            .then_with(|| left.day.cmp(&right.day))
+    });
+    let row_limit = usize::try_from(normalize_limit(query.limit, scan_limit, 100_000))
+        .map_err(|error| AppError::internal(format!("invalid summary row limit: {error}")))?;
+    rows.truncate(row_limit);
     Ok(SummaryResponse {
         from: query.from,
         to: query.to,
@@ -752,6 +774,46 @@ pub(super) fn usage_summary(
         rows,
         next_page_token: None,
     })
+}
+
+struct OwnerRecord {
+    email: String,
+    name: Option<String>,
+}
+
+fn load_owner(connection: &mut SqliteConnection, user_id: Uuid) -> Result<OwnerRecord, AppError> {
+    let (email, name) = app_users::table
+        .find(user_id.to_string())
+        .select((app_users::email, app_users::name))
+        .first::<(String, Option<String>)>(connection)?;
+    Ok(OwnerRecord { email, name })
+}
+
+fn owner_matches_filter(user_id: Uuid, owner: &OwnerRecord, user_filter: Option<&str>) -> bool {
+    let Some(filter) = user_filter.and_then(non_empty) else {
+        return true;
+    };
+    if let Ok(filter_id) = Uuid::parse_str(filter.trim()) {
+        return filter_id == user_id;
+    }
+    let filter = filter.trim().to_lowercase();
+    owner.email.to_lowercase().contains(&filter)
+        || owner
+            .name
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(&filter)
+}
+
+const fn empty_summary(query: &SummaryQuery, group_by: Vec<String>) -> SummaryResponse {
+    SummaryResponse {
+        from: query.from,
+        to: query.to,
+        group_by,
+        rows: Vec::new(),
+        next_page_token: None,
+    }
 }
 
 struct SummaryDimensions([bool; 7]);
@@ -800,98 +862,143 @@ impl SummaryDimensions {
     }
 }
 
-fn summary_select_sql(dimensions: &SummaryDimensions) -> String {
-    let selected = |enabled: bool, expression: &str| {
-        if enabled {
-            expression.to_owned()
-        } else {
-            "NULL".to_owned()
+#[derive(Hash, Eq, PartialEq)]
+struct SummaryKey {
+    day: Option<String>,
+    user_id: Option<Uuid>,
+    user_name: Option<String>,
+    user_email: Option<String>,
+    host_name: Option<String>,
+    platform: Option<String>,
+    os_version: Option<String>,
+    agent_name: Option<String>,
+    llm_provider: Option<String>,
+    llm_model: Option<String>,
+    event_type: Option<String>,
+}
+
+impl SummaryKey {
+    fn new(
+        event: &EventRecord,
+        device: Option<&DeviceRecord>,
+        user_id: Uuid,
+        owner: &OwnerRecord,
+        dimensions: &SummaryDimensions,
+    ) -> Self {
+        let include_user = dimensions.enabled(SummaryDimension::User);
+        let include_device = dimensions.enabled(SummaryDimension::Device);
+        Self {
+            day: dimensions
+                .enabled(SummaryDimension::Day)
+                .then(|| event.observed_at.format("%Y-%m-%d").to_string()),
+            user_id: include_user.then_some(user_id),
+            user_name: include_user.then(|| owner.name.clone()).flatten(),
+            user_email: include_user.then(|| owner.email.clone()),
+            host_name: include_device
+                .then(|| device.map(|value| value.host_name.clone()))
+                .flatten(),
+            platform: include_device
+                .then(|| device.map(|value| value.platform.clone()))
+                .flatten(),
+            os_version: include_device
+                .then(|| device.and_then(|value| value.os_version.clone()))
+                .flatten(),
+            agent_name: dimensions
+                .enabled(SummaryDimension::Agent)
+                .then(|| canonical_agent_name(&event.agent_name)),
+            llm_provider: dimensions
+                .enabled(SummaryDimension::Provider)
+                .then(|| event.llm_provider.clone()),
+            llm_model: dimensions
+                .enabled(SummaryDimension::Model)
+                .then(|| event.llm_model.clone()),
+            event_type: dimensions
+                .enabled(SummaryDimension::EventType)
+                .then(|| event.event_type.clone()),
         }
-    };
-    format!(
-        "SELECT
-             {} AS day,
-             {} AS user_id,
-             {} AS user_name,
-             {} AS user_email,
-             {} AS host_name,
-             {} AS platform,
-             {} AS os_version,
-             {} AS agent_name,
-             {} AS llm_provider,
-             {} AS llm_model,
-             {} AS event_type,
-             COUNT(DISTINCT e.session_pk) AS sessions,
-             COUNT(DISTINCT e.turn_pk) AS turns,
-             SUM(CASE WHEN e.event_type = 'request' THEN 1 ELSE 0 END) AS requests,
-             SUM(CASE WHEN e.event_type = 'response' THEN 1 ELSE 0 END) AS responses,
-             COALESCE(SUM(e.input_tokens), 0) AS input_tokens,
-             COALESCE(SUM(e.output_tokens), 0) AS output_tokens,
-             COALESCE(SUM(e.cache_read_tokens), 0) AS cache_read_tokens,
-             COALESCE(SUM(e.cache_write_tokens), 0) AS cache_write_tokens,
-             COALESCE(SUM(e.reasoning_tokens), 0) AS reasoning_tokens,
-             COALESCE(SUM(e.total_tokens), 0) AS total_tokens
-         FROM llm_usage_events e
-         LEFT JOIN app_users u ON u.id = e.user_id
-         LEFT JOIN devices d ON d.id = e.device_context_id
-         WHERE e.user_id = ?",
-        selected(
-            dimensions.enabled(SummaryDimension::Day),
-            "strftime('%Y-%m-%d', e.observed_at / 1000000, 'unixepoch')"
-        ),
-        selected(dimensions.enabled(SummaryDimension::User), "e.user_id"),
-        selected(
-            dimensions.enabled(SummaryDimension::User),
-            "NULLIF(trim(u.name), '')"
-        ),
-        selected(dimensions.enabled(SummaryDimension::User), "u.email"),
-        selected(dimensions.enabled(SummaryDimension::Device), "d.host_name"),
-        selected(dimensions.enabled(SummaryDimension::Device), "d.platform"),
-        selected(dimensions.enabled(SummaryDimension::Device), "d.os_version"),
-        selected(
-            dimensions.enabled(SummaryDimension::Agent),
-            "CASE WHEN e.agent_name IN ('claude', 'claude-code', 'claude-desktop')
-                  THEN 'claude-code' ELSE e.agent_name END"
-        ),
-        selected(
-            dimensions.enabled(SummaryDimension::Provider),
-            "e.llm_provider"
-        ),
-        selected(dimensions.enabled(SummaryDimension::Model), "e.llm_model"),
-        selected(
-            dimensions.enabled(SummaryDimension::EventType),
-            "e.event_type"
-        ),
-    )
+    }
+}
+
+#[derive(Default)]
+struct SummaryBucket {
+    sessions: HashSet<Uuid>,
+    turns: HashSet<Uuid>,
+    requests: i64,
+    responses: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    reasoning_tokens: i64,
+    total_tokens: i64,
+}
+
+impl SummaryBucket {
+    fn add(&mut self, event: &EventRecord) {
+        self.sessions.insert(event.session_pk);
+        self.turns.insert(event.turn_pk);
+        self.requests = self
+            .requests
+            .saturating_add(i64::from(event.event_type == "request"));
+        self.responses = self
+            .responses
+            .saturating_add(i64::from(event.event_type == "response"));
+        self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(event.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(event.cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(event.reasoning_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(event.total_tokens);
+    }
+
+    fn into_row(self, key: SummaryKey) -> SummaryRow {
+        SummaryRow {
+            day: key.day,
+            user_id: key.user_id,
+            user_name: key.user_name,
+            user_email: key.user_email,
+            host_name: key.host_name,
+            platform: key.platform,
+            os_version: key.os_version,
+            agent_name: key.agent_name,
+            llm_provider: key.llm_provider,
+            llm_model: key.llm_model,
+            event_type: key.event_type,
+            sessions: self.sessions.len(),
+            turns: self.turns.len(),
+            requests: self.requests,
+            responses: self.responses,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            total_tokens: self.total_tokens,
+        }
+    }
 }
 
 fn load_device_contexts(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     events: &[EventRecord],
 ) -> Result<HashMap<Uuid, DeviceRecord>, AppError> {
     let ids = events
         .iter()
-        .map(|event| event.device_context_id)
+        .map(|event| event.device_context_id.to_string())
         .collect::<HashSet<_>>();
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut sql = String::from("SELECT id, host_name, platform FROM devices WHERE id IN (");
-    sql.push_str(&placeholders(ids.len()));
-    sql.push(')');
-    let values = ids
+    let devices = devices::table
+        .filter(devices::id.eq_any(ids))
+        .select(DeviceRow::as_select())
+        .load::<DeviceRow>(connection)?
         .into_iter()
-        .map(|id| SqlValue::Text(id.to_string()))
-        .collect::<Vec<_>>();
-    let mut statement = connection.prepare(&sql)?;
-    let devices = statement
-        .query_map(params_from_iter(values.iter()), |row| {
-            Ok(DeviceRecord {
-                id: uuid_at(row, 0)?,
-                host_name: row.get(1)?,
-                platform: row.get(2)?,
-            })
-        })?
+        .map(DeviceRow::into_record)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(devices
         .into_iter()
@@ -900,25 +1007,26 @@ fn load_device_contexts(
 }
 
 fn load_attachments(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     events: &[EventRecord],
 ) -> Result<HashMap<Uuid, Vec<UsageEventAttachmentResponse>>, AppError> {
     if events.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut sql = String::from(
-        "SELECT id, event_pk, position, media_type, byte_size, sha256, content
-         FROM llm_usage_event_attachments WHERE event_pk IN (",
-    );
-    sql.push_str(&placeholders(events.len()));
-    sql.push_str(") ORDER BY event_pk, position");
-    let values = events
+    let event_ids = events
         .iter()
-        .map(|event| SqlValue::Text(event.id.to_string()))
+        .map(|event| event.id.to_string())
         .collect::<Vec<_>>();
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement
-        .query_map(params_from_iter(values.iter()), map_attachment)?
+    let rows = llm_usage_event_attachments::table
+        .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
+        .order_by((
+            llm_usage_event_attachments::event_pk.asc(),
+            llm_usage_event_attachments::position.asc(),
+        ))
+        .select(AttachmentRow::as_select())
+        .load::<AttachmentRow>(connection)?
+        .into_iter()
+        .map(AttachmentRow::into_record)
         .collect::<Result<Vec<_>, _>>()?;
     let mut by_event = HashMap::new();
     for row in rows {
@@ -972,179 +1080,54 @@ fn event_response(
     }
 }
 
-const EVENT_SELECT_SQL: &str = "SELECT
-    id, user_id, device_context_id, session_pk, turn_pk, event_id,
-    agent_name, agent_version, session_id, turn_index, llm_provider,
-    llm_model, event_type, text, text_sha256, input_tokens,
-    output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-    total_tokens, observed_at, metadata
-FROM llm_usage_events";
-
-fn map_event(row: &Row<'_>) -> rusqlite::Result<EventRecord> {
-    Ok(EventRecord {
-        id: uuid_at(row, 0)?,
-        user_id: uuid_at(row, 1)?,
-        device_context_id: uuid_at(row, 2)?,
-        session_pk: uuid_at(row, 3)?,
-        turn_pk: uuid_at(row, 4)?,
-        event_id: row.get(5)?,
-        agent_name: row.get(6)?,
-        agent_version: row.get(7)?,
-        session_id: row.get(8)?,
-        turn_index: row.get(9)?,
-        llm_provider: row.get(10)?,
-        llm_model: row.get(11)?,
-        event_type: row.get(12)?,
-        text: row.get(13)?,
-        text_sha256: row.get(14)?,
-        input_tokens: row.get(15)?,
-        output_tokens: row.get(16)?,
-        cache_read_tokens: row.get(17)?,
-        cache_write_tokens: row.get(18)?,
-        reasoning_tokens: row.get(19)?,
-        total_tokens: row.get(20)?,
-        observed_at: timestamp_at(row, 21)?,
-        metadata: json_at(row, 22)?,
-    })
+fn merge_json(stored: &str, incoming: &serde_json::Value, field: &str) -> Result<String, AppError> {
+    let mut stored = serde_json::from_str::<serde_json::Value>(stored)
+        .map_err(|error| AppError::internal(format!("stored {field} is invalid JSON: {error}")))?;
+    if let (Some(stored), Some(incoming)) = (stored.as_object_mut(), incoming.as_object()) {
+        stored.extend(incoming.clone());
+    }
+    serialize_json(&stored, field)
 }
 
-fn map_session(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
-    Ok(SessionRecord {
-        id: uuid_at(row, 0)?,
-        user_id: uuid_at(row, 1)?,
-        device_context_id: uuid_at(row, 2)?,
-        agent_name: row.get(3)?,
-        agent_version: row.get(4)?,
-        session_id: row.get(5)?,
-        started_at: timestamp_at(row, 6)?,
-        ended_at: optional_timestamp_at(row, 7)?,
-        metadata: json_at(row, 8)?,
-    })
-}
-
-fn map_turn(row: &Row<'_>) -> rusqlite::Result<TurnRecord> {
-    Ok(TurnRecord {
-        id: uuid_at(row, 0)?,
-        turn_index: row.get(1)?,
-        started_at: timestamp_at(row, 2)?,
-        ended_at: optional_timestamp_at(row, 3)?,
-    })
-}
-
-fn map_attachment(row: &Row<'_>) -> rusqlite::Result<AttachmentRecord> {
-    Ok(AttachmentRecord {
-        id: uuid_at(row, 0)?,
-        event_pk: uuid_at(row, 1)?,
-        position: row.get(2)?,
-        media_type: row.get(3)?,
-        byte_size: row.get(4)?,
-        sha256: row.get(5)?,
-        content: row.get(6)?,
-    })
-}
-
-fn map_summary_row(row: &Row<'_>) -> rusqlite::Result<SummaryRow> {
-    let user_id = row
-        .get::<_, Option<String>>(1)?
-        .map(|value| parse_uuid_value(&value, 1))
-        .transpose()?;
-    Ok(SummaryRow {
-        day: row.get(0)?,
-        user_id,
-        user_name: row.get(2)?,
-        user_email: row.get(3)?,
-        host_name: row.get(4)?,
-        platform: row.get(5)?,
-        os_version: row.get(6)?,
-        agent_name: row.get(7)?,
-        llm_provider: row.get(8)?,
-        llm_model: row.get(9)?,
-        event_type: row.get(10)?,
-        sessions: non_negative_count(row.get(11)?),
-        turns: non_negative_count(row.get(12)?),
-        requests: row.get(13)?,
-        responses: row.get(14)?,
-        input_tokens: row.get(15)?,
-        output_tokens: row.get(16)?,
-        cache_read_tokens: row.get(17)?,
-        cache_write_tokens: row.get(18)?,
-        reasoning_tokens: row.get(19)?,
-        total_tokens: row.get(20)?,
-    })
-}
-
-fn uuid_at(row: &Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
-    let value = row.get::<_, String>(index)?;
-    parse_uuid_value(&value, index)
-}
-
-pub(super) fn parse_uuid_value(value: &str, index: usize) -> rusqlite::Result<Uuid> {
-    Uuid::parse_str(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
-    })
-}
-
-fn parse_uuid(value: &str, field: &str) -> Result<Uuid, AppError> {
-    Uuid::parse_str(value)
-        .map_err(|error| AppError::internal(format!("stored {field} is not a UUID: {error}")))
-}
-
-fn json_at(row: &Row<'_>, index: usize) -> rusqlite::Result<serde_json::Value> {
-    let value = row.get::<_, String>(index)?;
-    serde_json::from_str(&value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
-    })
-}
-
-fn timestamp_at(row: &Row<'_>, index: usize) -> rusqlite::Result<DateTime<Utc>> {
-    timestamp_from_micros(row.get(index)?, index)
-}
-
-fn optional_timestamp_at(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
-    row.get::<_, Option<i64>>(index)?
-        .map(|value| timestamp_from_micros(value, index))
-        .transpose()
-}
-
-pub(super) fn timestamp_from_micros(value: i64, index: usize) -> rusqlite::Result<DateTime<Utc>> {
-    DateTime::from_timestamp_micros(value).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            index,
-            Type::Integer,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("timestamp microseconds are out of range: {value}"),
-            )),
-        )
-    })
+fn serialize_json(value: &serde_json::Value, field: &str) -> Result<String, AppError> {
+    serde_json::to_string(value)
+        .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
 }
 
 pub(super) const fn timestamp_to_micros(value: DateTime<Utc>) -> i64 {
     value.timestamp_micros()
 }
 
-fn placeholders(count: usize) -> String {
-    std::iter::repeat_n("?", count)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use diesel::{Connection, QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star, sql_query};
     use serde_json::json;
     use uuid::Uuid;
 
     use crate::{search::SessionSearchQuery, usage::IngestEventsRequest};
 
-    use super::{super::migrations, super::search, ingest_events};
+    use super::{
+        super::{migrations, schema::llm_usage_events, search},
+        ingest_events,
+    };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
 
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    fn database() -> SqliteConnection {
+        let mut database = SqliteConnection::establish(":memory:").expect("SQLite should open");
+        migrations::run(&mut database).expect("migration should succeed");
+        database
+    }
+
     #[test]
     fn ingest_is_idempotent_and_searchable_in_the_same_transaction() {
-        let mut database = Connection::open_in_memory().expect("SQLite should open");
-        migrations::run(&mut database).expect("migration should succeed");
+        let mut database = database();
         let request = request_with_text("sqlite searchable response");
 
         let first = ingest_events(&mut database, &request, OWNER_ID, 100)
@@ -1156,14 +1139,13 @@ mod tests {
         assert_eq!(duplicate.accepted, 0);
         assert_eq!(duplicate.duplicates, 1);
 
-        let projection_count = database
-            .query_row("SELECT count(*) FROM usage_events_fts", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("FTS projection should be queryable");
+        let projection_count = sql_query("SELECT count(*) AS count FROM usage_events_fts")
+            .get_result::<Count>(&mut database)
+            .expect("FTS projection should be queryable")
+            .count;
         assert_eq!(projection_count, 1);
         let results = search::session_search(
-            &database,
+            &mut database,
             OWNER_ID,
             SessionSearchQuery {
                 q: "searchable response".to_owned(),
@@ -1193,21 +1175,23 @@ mod tests {
 
     #[test]
     fn validation_failure_leaves_relational_and_fts_tables_empty() {
-        let mut database = Connection::open_in_memory().expect("SQLite should open");
-        migrations::run(&mut database).expect("migration should succeed");
+        let mut database = database();
         let mut request = request_with_text("invalid event");
         request.events[0].token_usage.input_tokens = Some(-1);
 
         ingest_events(&mut database, &request, OWNER_ID, 100)
             .expect_err("negative tokens should reject the batch");
-        for table in ["llm_usage_events", "usage_events_fts"] {
-            let count = database
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .expect("table should be queryable");
-            assert_eq!(count, 0, "{table} should remain empty");
-        }
+        let relational_count = llm_usage_events::table
+            .select(count_star())
+            .first::<i64>(&mut database)
+            .expect("relational table should be queryable");
+        assert_eq!(relational_count, 0);
+
+        let fts_count = sql_query("SELECT count(*) AS count FROM usage_events_fts")
+            .get_result::<Count>(&mut database)
+            .expect("FTS table should be queryable")
+            .count;
+        assert_eq!(fts_count, 0);
     }
 
     fn request_with_text(text: &str) -> IngestEventsRequest {

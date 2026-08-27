@@ -1,9 +1,15 @@
-//! Owner-scoped SQLite FTS5 session search and relational result hydration.
+//! SQLite FTS5 raw queries with Diesel ORM hydration of relational session data.
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Row, params_from_iter, types::Value as SqlValue};
+use diesel::{
+    ExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl, SqliteConnection,
+    query_builder::{BoxedSqlQuery, SqlQuery},
+    sql_query,
+    sql_types::{BigInt, Integer, Nullable, Text},
+    sqlite::Sqlite,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -15,18 +21,22 @@ use crate::{
     usage::persistence::canonical_agent_name,
 };
 
-use super::repository::{parse_uuid_value, timestamp_from_micros, timestamp_to_micros};
+use super::{
+    models::{parse_uuid, timestamp_from_micros},
+    repository::timestamp_to_micros,
+    schema::{agent_sessions, devices},
+};
 
 pub(super) fn session_search(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     query: SessionSearchQuery,
 ) -> Result<SessionSearchResponse, AppError> {
     let query = query.validate()?;
-    let (match_sql, match_values) = match_source(&query, user_id);
-    let total_sessions = count_sessions(connection, &match_sql, &match_values)?;
-    let session_ids = load_session_page(connection, &query, &match_sql, &match_values)?;
-    let matches = load_matches(connection, &session_ids, &match_sql, &match_values)?;
+    let source = MatchSource::new(&query, user_id);
+    let total_sessions = count_sessions(connection, &source)?;
+    let session_ids = load_session_page(connection, &query, &source)?;
+    let matches = load_matches(connection, &session_ids, &source)?;
     let mut details = load_session_details(connection, user_id, &session_ids)?;
 
     let items = session_ids
@@ -81,54 +91,67 @@ pub(super) fn session_search(
     })
 }
 
-fn match_source(query: &ValidatedSearchQuery, user_id: Uuid) -> (String, Vec<SqlValue>) {
-    let mut sql = String::from(
-        "FROM usage_events_fts
-         INNER JOIN llm_usage_events e ON e.id = usage_events_fts.event_pk
-         WHERE usage_events_fts MATCH ? AND e.user_id = ?",
-    );
-    let mut values = vec![
-        SqlValue::Text(fts_query(&query.text)),
-        SqlValue::Text(user_id.to_string()),
-    ];
-    if let Some(from) = query.from {
-        sql.push_str(" AND e.observed_at >= ?");
-        values.push(SqlValue::Integer(timestamp_to_micros(from)));
+#[derive(Clone)]
+enum FtsBind {
+    Text(String),
+    BigInt(i64),
+}
+
+struct MatchSource {
+    sql: String,
+    binds: Vec<FtsBind>,
+}
+
+impl MatchSource {
+    fn new(query: &ValidatedSearchQuery, user_id: Uuid) -> Self {
+        let mut sql = String::from(
+            "FROM usage_events_fts
+             INNER JOIN llm_usage_events e ON e.id = usage_events_fts.event_pk
+             WHERE usage_events_fts MATCH ? AND e.user_id = ?",
+        );
+        let mut binds = vec![
+            FtsBind::Text(fts_query(&query.text)),
+            FtsBind::Text(user_id.to_string()),
+        ];
+        if let Some(from) = query.from {
+            sql.push_str(" AND e.observed_at >= ?");
+            binds.push(FtsBind::BigInt(timestamp_to_micros(from)));
+        }
+        if let Some(to) = query.to {
+            sql.push_str(" AND e.observed_at < ?");
+            binds.push(FtsBind::BigInt(timestamp_to_micros(to)));
+        }
+        push_exact_filter(
+            &mut sql,
+            &mut binds,
+            "e.agent_name",
+            query.agent_name.as_deref(),
+        );
+        push_exact_filter(
+            &mut sql,
+            &mut binds,
+            "e.llm_provider",
+            query.llm_provider.as_deref(),
+        );
+        push_exact_filter(
+            &mut sql,
+            &mut binds,
+            "e.llm_model",
+            query.llm_model.as_deref(),
+        );
+        push_exact_filter(
+            &mut sql,
+            &mut binds,
+            "e.event_type",
+            query.event_type.as_deref(),
+        );
+        Self { sql, binds }
     }
-    if let Some(to) = query.to {
-        sql.push_str(" AND e.observed_at < ?");
-        values.push(SqlValue::Integer(timestamp_to_micros(to)));
-    }
-    push_exact_filter(
-        &mut sql,
-        &mut values,
-        "e.agent_name",
-        query.agent_name.as_deref(),
-    );
-    push_exact_filter(
-        &mut sql,
-        &mut values,
-        "e.llm_provider",
-        query.llm_provider.as_deref(),
-    );
-    push_exact_filter(
-        &mut sql,
-        &mut values,
-        "e.llm_model",
-        query.llm_model.as_deref(),
-    );
-    push_exact_filter(
-        &mut sql,
-        &mut values,
-        "e.event_type",
-        query.event_type.as_deref(),
-    );
-    (sql, values)
 }
 
 fn push_exact_filter(
     sql: &mut String,
-    values: &mut Vec<SqlValue>,
+    binds: &mut Vec<FtsBind>,
     column: &str,
     value: Option<&str>,
 ) {
@@ -136,39 +159,60 @@ fn push_exact_filter(
         sql.push_str(" AND ");
         sql.push_str(column);
         sql.push_str(" = ?");
-        values.push(SqlValue::Text(value.to_owned()));
+        binds.push(FtsBind::Text(value.to_owned()));
     }
 }
 
+fn bound_query(sql: String, binds: Vec<FtsBind>) -> BoxedSqlQuery<'static, Sqlite, SqlQuery> {
+    let mut query = sql_query(sql).into_boxed::<Sqlite>();
+    for bind in binds {
+        query = match bind {
+            FtsBind::Text(value) => query.bind::<Text, _>(value),
+            FtsBind::BigInt(value) => query.bind::<BigInt, _>(value),
+        };
+    }
+    query
+}
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
 fn count_sessions(
-    connection: &Connection,
-    match_sql: &str,
-    values: &[SqlValue],
+    connection: &mut SqliteConnection,
+    source: &MatchSource,
 ) -> Result<u64, AppError> {
-    let sql = format!("SELECT COUNT(DISTINCT e.session_pk) {match_sql}");
-    let count = connection.query_row(&sql, params_from_iter(values.iter()), |row| {
-        row.get::<_, i64>(0)
-    })?;
+    let sql = format!(
+        "SELECT COUNT(DISTINCT e.session_pk) AS count {}",
+        source.sql
+    );
+    let count = bound_query(sql, source.binds.clone())
+        .get_result::<CountRow>(connection)?
+        .count;
     u64::try_from(count.max(0))
         .map_err(|error| AppError::internal(format!("invalid FTS session count: {error}")))
 }
 
+#[derive(QueryableByName)]
+struct SessionIdRow {
+    #[diesel(sql_type = Text)]
+    session_pk: String,
+}
+
 fn load_session_page(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     query: &ValidatedSearchQuery,
-    match_sql: &str,
-    values: &[SqlValue],
+    source: &MatchSource,
 ) -> Result<Vec<Uuid>, AppError> {
     let sql = format!(
-        "SELECT e.session_pk
-         {match_sql}
-         ORDER BY bm25(usage_events_fts) ASC, e.observed_at DESC, e.session_pk ASC"
+        "SELECT e.session_pk AS session_pk
+         {}
+         ORDER BY bm25(usage_events_fts) ASC, e.observed_at DESC, e.session_pk ASC",
+        source.sql
     );
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map(params_from_iter(values.iter()), |row| {
-        let value = row.get::<_, String>(0)?;
-        parse_uuid_value(&value, 0)
-    })?;
+    let rows = bound_query(sql, source.binds.clone()).load::<SessionIdRow>(connection)?;
     let page_start = usize::try_from(query.offset)
         .map_err(|error| AppError::internal(format!("invalid FTS page offset: {error}")))?;
     let page_size = usize::try_from(query.page_size)
@@ -177,7 +221,7 @@ fn load_session_page(
     let mut seen = HashSet::new();
     let mut sessions = Vec::with_capacity(page_size);
     for row in rows {
-        let session_pk = row?;
+        let session_pk = parse_uuid(&row.session_pk, "FTS session id")?;
         if !seen.insert(session_pk) {
             continue;
         }
@@ -193,10 +237,9 @@ fn load_session_page(
 }
 
 fn load_matches(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     session_ids: &[Uuid],
-    match_sql: &str,
-    values: &[SqlValue],
+    source: &MatchSource,
 ) -> Result<HashMap<Uuid, Vec<MatchedEvent>>, AppError> {
     if session_ids.is_empty() {
         return Ok(HashMap::new());
@@ -207,35 +250,38 @@ fn load_matches(
     let sql = format!(
         "SELECT
              e.id AS event_pk,
-             e.session_pk,
-             e.turn_pk,
-             e.turn_index,
-             e.event_type,
-             e.llm_provider,
-             e.llm_model,
-             e.observed_at,
-             snippet(usage_events_fts, 4, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32),
-             snippet(usage_events_fts, 7, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32),
-             snippet(usage_events_fts, 8, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32),
-             snippet(usage_events_fts, 5, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32),
+             e.session_pk AS session_pk,
+             e.turn_pk AS turn_pk,
+             e.turn_index AS turn_index,
+             e.event_type AS event_type,
+             e.llm_provider AS llm_provider,
+             e.llm_model AS llm_model,
+             e.observed_at AS observed_at,
+             snippet(usage_events_fts, 4, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
+                 AS content_fragment,
+             snippet(usage_events_fts, 7, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
+                 AS command_fragment,
+             snippet(usage_events_fts, 8, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
+                 AS path_fragment,
+             snippet(usage_events_fts, 5, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
+                 AS tool_name_fragment,
              snippet(usage_events_fts, 6, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
-         {match_sql}
+                 AS tool_content_fragment
+         {}
            AND e.session_pk IN ({selected_placeholders})
-         ORDER BY bm25(usage_events_fts) ASC, e.observed_at DESC, e.id ASC"
+         ORDER BY bm25(usage_events_fts) ASC, e.observed_at DESC, e.id ASC",
+        source.sql
     );
-
-    let mut parameters = values.to_vec();
-    parameters.extend(
+    let mut binds = source.binds.clone();
+    binds.extend(
         session_ids
             .iter()
-            .map(|session_pk| SqlValue::Text(session_pk.to_string())),
+            .map(|session_pk| FtsBind::Text(session_pk.to_string())),
     );
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement
-        .query_map(params_from_iter(parameters.iter()), map_match)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = bound_query(sql, binds).load::<MatchedEventRow>(connection)?;
     let mut by_session: HashMap<Uuid, (u64, Vec<MatchedEvent>)> = HashMap::new();
-    for matched in rows {
+    for row in rows {
+        let matched = row.into_matched()?;
         let entry = by_session
             .entry(matched.session_pk)
             .or_insert_with(|| (0, Vec::new()));
@@ -253,6 +299,65 @@ fn load_matches(
             (session_pk, matches)
         })
         .collect())
+}
+
+#[derive(QueryableByName)]
+struct MatchedEventRow {
+    #[diesel(sql_type = Text)]
+    event_pk: String,
+    #[diesel(sql_type = Text)]
+    session_pk: String,
+    #[diesel(sql_type = Text)]
+    turn_pk: String,
+    #[diesel(sql_type = Integer)]
+    turn_index: i32,
+    #[diesel(sql_type = Text)]
+    event_type: String,
+    #[diesel(sql_type = Text)]
+    llm_provider: String,
+    #[diesel(sql_type = Text)]
+    llm_model: String,
+    #[diesel(sql_type = BigInt)]
+    observed_at: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    content_fragment: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    command_fragment: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    path_fragment: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    tool_name_fragment: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    tool_content_fragment: Option<String>,
+}
+
+impl MatchedEventRow {
+    fn into_matched(self) -> Result<MatchedEvent, AppError> {
+        let fragments = [
+            self.content_fragment,
+            self.command_fragment,
+            self.path_fragment,
+            self.tool_name_fragment,
+            self.tool_content_fragment,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|fragment| fragment.contains(HIGHLIGHT_START))
+        .take(2)
+        .collect();
+        Ok(MatchedEvent {
+            event_pk: parse_uuid(&self.event_pk, "FTS event id")?,
+            session_pk: parse_uuid(&self.session_pk, "FTS session id")?,
+            turn_pk: parse_uuid(&self.turn_pk, "FTS turn id")?,
+            turn_index: self.turn_index,
+            event_type: self.event_type,
+            llm_provider: self.llm_provider,
+            llm_model: self.llm_model,
+            observed_at: timestamp_from_micros(self.observed_at)?,
+            match_count: 0,
+            fragments,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -288,30 +393,6 @@ impl MatchedEvent {
     }
 }
 
-fn map_match(row: &Row<'_>) -> rusqlite::Result<MatchedEvent> {
-    let mut fragments = Vec::new();
-    for index in 8..13 {
-        if let Some(fragment) = row.get::<_, Option<String>>(index)?
-            && fragment.contains(HIGHLIGHT_START)
-            && fragments.len() < 2
-        {
-            fragments.push(fragment);
-        }
-    }
-    Ok(MatchedEvent {
-        event_pk: parse_uuid_value(&row.get::<_, String>(0)?, 0)?,
-        session_pk: parse_uuid_value(&row.get::<_, String>(1)?, 1)?,
-        turn_pk: parse_uuid_value(&row.get::<_, String>(2)?, 2)?,
-        turn_index: row.get(3)?,
-        event_type: row.get(4)?,
-        llm_provider: row.get(5)?,
-        llm_model: row.get(6)?,
-        observed_at: timestamp_from_micros(row.get(7)?, 7)?,
-        match_count: 0,
-        fragments,
-    })
-}
-
 struct SessionDetails {
     session_id: String,
     agent_name: String,
@@ -323,52 +404,65 @@ struct SessionDetails {
 }
 
 fn load_session_details(
-    connection: &Connection,
+    connection: &mut SqliteConnection,
     user_id: Uuid,
     session_ids: &[Uuid],
 ) -> Result<HashMap<Uuid, SessionDetails>, AppError> {
     if session_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = std::iter::repeat_n("?", session_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT s.id, s.session_id, s.agent_name, s.agent_version,
-                d.host_name, d.platform, s.started_at, s.ended_at
-         FROM agent_sessions s
-         INNER JOIN devices d ON d.id = s.device_context_id
-         WHERE s.user_id = ? AND s.id IN ({placeholders})"
-    );
-    let mut values = vec![SqlValue::Text(user_id.to_string())];
-    values.extend(
-        session_ids
-            .iter()
-            .map(|session_pk| SqlValue::Text(session_pk.to_string())),
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement
-        .query_map(params_from_iter(values.iter()), |row| {
-            let session_pk = parse_uuid_value(&row.get::<_, String>(0)?, 0)?;
-            let ended_at = row
-                .get::<_, Option<i64>>(7)?
-                .map(|value| timestamp_from_micros(value, 7))
-                .transpose()?;
-            Ok((
+    let ids = session_ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
+    let rows = agent_sessions::table
+        .inner_join(devices::table)
+        .filter(agent_sessions::user_id.eq(user_id.to_string()))
+        .filter(agent_sessions::id.eq_any(ids))
+        .select((
+            agent_sessions::id,
+            agent_sessions::session_id,
+            agent_sessions::agent_name,
+            agent_sessions::agent_version,
+            devices::host_name,
+            devices::platform,
+            agent_sessions::started_at,
+            agent_sessions::ended_at,
+        ))
+        .load::<(
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            i64,
+            Option<i64>,
+        )>(connection)?;
+    rows.into_iter()
+        .map(
+            |(
                 session_pk,
-                SessionDetails {
-                    session_id: row.get(1)?,
-                    agent_name: row.get(2)?,
-                    agent_version: row.get(3)?,
-                    host_name: row.get(4)?,
-                    platform: row.get(5)?,
-                    started_at: timestamp_from_micros(row.get(6)?, 6)?,
-                    ended_at,
-                },
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows.into_iter().collect())
+                session_id,
+                agent_name,
+                agent_version,
+                host_name,
+                platform,
+                started_at,
+                ended_at,
+            )| {
+                Ok((
+                    parse_uuid(&session_pk, "session id")?,
+                    SessionDetails {
+                        session_id,
+                        agent_name,
+                        agent_version,
+                        host_name,
+                        platform,
+                        started_at: timestamp_from_micros(started_at)?,
+                        ended_at: ended_at.map(timestamp_from_micros).transpose()?,
+                    },
+                ))
+            },
+        )
+        .collect()
 }
 
 fn fts_query(value: &str) -> String {
