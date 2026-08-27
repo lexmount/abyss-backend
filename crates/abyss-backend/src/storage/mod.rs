@@ -10,9 +10,8 @@ mod postgres;
 #[cfg(feature = "sqlite-fts")]
 mod sqlite;
 
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
-use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::{
@@ -25,59 +24,61 @@ use crate::{
     },
 };
 
-/// Complete event-store contract consumed by the HTTP layer.
-#[async_trait]
+/// Sendable heap-allocated future returned across the dynamic storage boundary.
+pub type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Complete object-safe event-store contract consumed by the HTTP layer.
 pub trait StorageBackend: Send + Sync {
     /// Verifies that the authoritative database can serve requests.
-    async fn ready(&self) -> Result<(), AppError>;
+    fn ready(&self) -> BoxedFuture<'_, Result<(), AppError>>;
 
     /// Validates and atomically ingests one owner-scoped event batch.
-    async fn ingest_events(
+    fn ingest_events(
         &self,
         user_id: Uuid,
         request: IngestEventsRequest,
         max_batch_size: usize,
-    ) -> Result<IngestEventsResponse, AppError>;
+    ) -> BoxedFuture<'_, Result<IngestEventsResponse, AppError>>;
 
     /// Returns one newest-first page of owner-scoped raw events.
-    async fn raw_events(
+    fn raw_events(
         &self,
         user_id: Uuid,
         query: RawEventsQuery,
         default_page_size: i64,
-    ) -> Result<RawEventsResponse, AppError>;
+    ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>>;
 
     /// Aggregates owner-scoped event and token usage.
-    async fn usage_summary(
+    fn usage_summary(
         &self,
         user_id: Uuid,
         query: SummaryQuery,
         summary_limit: i64,
-    ) -> Result<SummaryResponse, AppError>;
+    ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>>;
 
     /// Loads one owner-scoped session timeline.
-    async fn session_timeline(
+    fn session_timeline(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
-    ) -> Result<SessionTimelineResponse, AppError>;
+    ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>>;
 
     /// Loads authorized image bytes by attachment identifier.
-    async fn image_attachment(
+    fn image_attachment(
         &self,
         user_id: Uuid,
         attachment_id: Uuid,
-    ) -> Result<StoredImageAttachment, AppError>;
+    ) -> BoxedFuture<'_, Result<StoredImageAttachment, AppError>>;
 
     /// Executes one owner-scoped full-text session search.
-    async fn session_search(
+    fn session_search(
         &self,
         user_id: Uuid,
         query: SessionSearchQuery,
-    ) -> Result<SessionSearchResponse, AppError>;
+    ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>>;
 
     /// Stops backend-owned background work and releases lifecycle resources.
-    async fn shutdown(&self);
+    fn shutdown(&self) -> BoxedFuture<'_, ()>;
 }
 
 /// Builds the one storage implementation selected by Cargo features.

@@ -4,7 +4,6 @@ mod search;
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use diesel::PgConnection;
 use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
@@ -14,7 +13,7 @@ use crate::{
     db::{self, DbPool},
     error::AppError,
     search::{SessionSearchQuery, SessionSearchResponse},
-    storage::StorageBackend,
+    storage::{BoxedFuture, StorageBackend},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionTimelineResponse, SummaryQuery, SummaryResponse, attachments::StoredImageAttachment,
@@ -81,106 +80,118 @@ impl PostgresEsBackend {
     }
 }
 
-#[async_trait]
 impl StorageBackend for PostgresEsBackend {
-    async fn ready(&self) -> Result<(), AppError> {
-        self.run_db(db::check_ready).await
+    fn ready(&self) -> BoxedFuture<'_, Result<(), AppError>> {
+        Box::pin(async move { self.run_db(db::check_ready).await })
     }
 
-    async fn ingest_events(
+    fn ingest_events(
         &self,
         user_id: Uuid,
         request: IngestEventsRequest,
         max_batch_size: usize,
-    ) -> Result<IngestEventsResponse, AppError> {
-        self.run_db(move |connection| {
-            usage_repository::ingest_events(connection, &request, user_id, max_batch_size)
+    ) -> BoxedFuture<'_, Result<IngestEventsResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                usage_repository::ingest_events(connection, &request, user_id, max_batch_size)
+            })
+            .await
         })
-        .await
     }
 
-    async fn raw_events(
+    fn raw_events(
         &self,
         user_id: Uuid,
         query: RawEventsQuery,
         default_page_size: i64,
-    ) -> Result<RawEventsResponse, AppError> {
-        self.run_db(move |connection| {
-            usage_repository::raw_events(connection, &query, user_id, default_page_size)
+    ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                usage_repository::raw_events(connection, &query, user_id, default_page_size)
+            })
+            .await
         })
-        .await
     }
 
-    async fn usage_summary(
+    fn usage_summary(
         &self,
         user_id: Uuid,
         query: SummaryQuery,
         summary_limit: i64,
-    ) -> Result<SummaryResponse, AppError> {
-        self.run_db(move |connection| {
-            usage_repository::usage_summary(connection, &query, user_id, summary_limit)
+    ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                usage_repository::usage_summary(connection, &query, user_id, summary_limit)
+            })
+            .await
         })
-        .await
     }
 
-    async fn session_timeline(
+    fn session_timeline(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
-    ) -> Result<SessionTimelineResponse, AppError> {
-        self.run_db(move |connection| {
-            usage_repository::session_timeline(connection, user_id, session_pk)
+    ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                usage_repository::session_timeline(connection, user_id, session_pk)
+            })
+            .await
         })
-        .await
     }
 
-    async fn image_attachment(
+    fn image_attachment(
         &self,
         user_id: Uuid,
         attachment_id: Uuid,
-    ) -> Result<StoredImageAttachment, AppError> {
-        self.run_db(move |connection| {
-            usage_repository::image_attachment(connection, user_id, attachment_id)
+    ) -> BoxedFuture<'_, Result<StoredImageAttachment, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                usage_repository::image_attachment(connection, user_id, attachment_id)
+            })
+            .await
         })
-        .await
     }
 
-    async fn session_search(
+    fn session_search(
         &self,
         user_id: Uuid,
         query: SessionSearchQuery,
-    ) -> Result<SessionSearchResponse, AppError> {
-        let search = self
-            .search
-            .clone()
-            .ok_or_else(|| AppError::unavailable("session search is not configured".to_owned()))?;
-        let execution = search.search(user_id, query).await?;
-        let session_ids = execution.session_ids();
-        let details = self
-            .run_db(move |connection| {
-                SearchOutboxRepository::session_details(connection, user_id, &session_ids)
-            })
-            .await?;
-        Ok(execution.hydrate(details))
+    ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>> {
+        Box::pin(async move {
+            let search = self.search.clone().ok_or_else(|| {
+                AppError::unavailable("session search is not configured".to_owned())
+            })?;
+            let execution = search.search(user_id, query).await?;
+            let session_ids = execution.session_ids();
+            let details = self
+                .run_db(move |connection| {
+                    SearchOutboxRepository::session_details(connection, user_id, &session_ids)
+                })
+                .await?;
+            Ok(execution.hydrate(details))
+        })
     }
 
-    async fn shutdown(&self) {
-        let Some(worker) = &self.search_worker else {
-            return;
-        };
-        if worker.shutdown.send(true).is_err() {
-            tracing::trace!("session search indexer already stopped");
-        }
-        let Some(mut handle) = worker.handle.lock().await.take() else {
-            return;
-        };
-        match tokio::time::timeout(Duration::from_secs(15), &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "session search indexer task failed"),
-            Err(_elapsed) => {
-                tracing::warn!("session search indexer did not stop before timeout");
-                handle.abort();
+    fn shutdown(&self) -> BoxedFuture<'_, ()> {
+        Box::pin(async move {
+            let Some(worker) = &self.search_worker else {
+                return;
+            };
+            if worker.shutdown.send(true).is_err() {
+                tracing::trace!("session search indexer already stopped");
             }
-        }
+            let Some(mut handle) = worker.handle.lock().await.take() else {
+                return;
+            };
+            match tokio::time::timeout(Duration::from_secs(15), &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "session search indexer task failed"),
+                Err(_elapsed) => {
+                    tracing::warn!("session search indexer did not stop before timeout");
+                    handle.abort();
+                }
+            }
+        })
     }
 }

@@ -7,7 +7,6 @@ mod repository;
 mod schema;
 mod search;
 
-use async_trait::async_trait;
 use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
 use uuid::Uuid;
 
@@ -15,7 +14,7 @@ use crate::{
     config::Config,
     error::AppError,
     search::{SessionSearchQuery, SessionSearchResponse},
-    storage::StorageBackend,
+    storage::{BoxedFuture, StorageBackend},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionTimelineResponse, SummaryQuery, SummaryResponse, attachments::StoredImageAttachment,
@@ -57,82 +56,99 @@ impl SqliteFtsBackend {
     }
 }
 
-#[async_trait]
 impl StorageBackend for SqliteFtsBackend {
-    async fn ready(&self) -> Result<(), AppError> {
-        self.run_db(|connection| {
-            schema::app_users::table
-                .select(count_star())
-                .first::<i64>(connection)?;
-            Ok(())
+    fn ready(&self) -> BoxedFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            self.run_db(|connection| {
+                schema::app_users::table
+                    .select(count_star())
+                    .first::<i64>(connection)?;
+                Ok(())
+            })
+            .await
         })
-        .await
     }
 
-    async fn ingest_events(
+    fn ingest_events(
         &self,
         user_id: Uuid,
         request: IngestEventsRequest,
         max_batch_size: usize,
-    ) -> Result<IngestEventsResponse, AppError> {
-        self.run_db(move |connection| {
-            repository::ingest_events(connection, &request, user_id, max_batch_size)
+    ) -> BoxedFuture<'_, Result<IngestEventsResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::ingest_events(connection, &request, user_id, max_batch_size)
+            })
+            .await
         })
-        .await
     }
 
-    async fn raw_events(
+    fn raw_events(
         &self,
         user_id: Uuid,
         query: RawEventsQuery,
         default_page_size: i64,
-    ) -> Result<RawEventsResponse, AppError> {
-        self.run_db(move |connection| {
-            repository::raw_events(connection, &query, user_id, default_page_size)
+    ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::raw_events(connection, &query, user_id, default_page_size)
+            })
+            .await
         })
-        .await
     }
 
-    async fn usage_summary(
+    fn usage_summary(
         &self,
         user_id: Uuid,
         query: SummaryQuery,
         summary_limit: i64,
-    ) -> Result<SummaryResponse, AppError> {
-        self.run_db(move |connection| {
-            repository::usage_summary(connection, &query, user_id, summary_limit)
+    ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::usage_summary(connection, &query, user_id, summary_limit)
+            })
+            .await
         })
-        .await
     }
 
-    async fn session_timeline(
+    fn session_timeline(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
-    ) -> Result<SessionTimelineResponse, AppError> {
-        self.run_db(move |connection| repository::session_timeline(connection, user_id, session_pk))
+    ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::session_timeline(connection, user_id, session_pk)
+            })
             .await
+        })
     }
 
-    async fn image_attachment(
+    fn image_attachment(
         &self,
         user_id: Uuid,
         attachment_id: Uuid,
-    ) -> Result<StoredImageAttachment, AppError> {
-        self.run_db(move |connection| {
-            repository::image_attachment(connection, user_id, attachment_id)
+    ) -> BoxedFuture<'_, Result<StoredImageAttachment, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::image_attachment(connection, user_id, attachment_id)
+            })
+            .await
         })
-        .await
     }
 
-    async fn session_search(
+    fn session_search(
         &self,
         user_id: Uuid,
         query: SessionSearchQuery,
-    ) -> Result<SessionSearchResponse, AppError> {
-        self.run_db(move |connection| search::session_search(connection, user_id, query))
-            .await
+    ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| search::session_search(connection, user_id, query))
+                .await
+        })
     }
 
-    async fn shutdown(&self) {}
+    fn shutdown(&self) -> BoxedFuture<'_, ()> {
+        Box::pin(async {})
+    }
 }

@@ -30,7 +30,6 @@ sqlite-fts = [
 ]
 
 [dependencies]
-async-trait.workspace = true
 axum = "0.8"
 base64 = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
