@@ -1,5 +1,6 @@
 //! PostgreSQL source-of-truth and Elasticsearch projection implementation.
 
+mod repository;
 mod search;
 
 use std::time::Duration;
@@ -17,7 +18,6 @@ use crate::{
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionTimelineResponse, SummaryQuery, SummaryResponse, attachments::StoredImageAttachment,
-        repository as usage_repository,
     },
 };
 
@@ -93,7 +93,7 @@ impl StorageBackend for PostgresEsBackend {
     ) -> BoxedFuture<'_, Result<IngestEventsResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                usage_repository::ingest_events(connection, &request, user_id, max_batch_size)
+                repository::ingest_events(connection, &request, user_id, max_batch_size)
             })
             .await
         })
@@ -107,7 +107,7 @@ impl StorageBackend for PostgresEsBackend {
     ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                usage_repository::raw_events(connection, &query, user_id, default_page_size)
+                repository::raw_events(connection, &query, user_id, default_page_size)
             })
             .await
         })
@@ -121,7 +121,7 @@ impl StorageBackend for PostgresEsBackend {
     ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                usage_repository::usage_summary(connection, &query, user_id, summary_limit)
+                repository::usage_summary(connection, &query, user_id, summary_limit)
             })
             .await
         })
@@ -134,7 +134,7 @@ impl StorageBackend for PostgresEsBackend {
     ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                usage_repository::session_timeline(connection, user_id, session_pk)
+                repository::session_timeline(connection, user_id, session_pk)
             })
             .await
         })
@@ -147,7 +147,7 @@ impl StorageBackend for PostgresEsBackend {
     ) -> BoxedFuture<'_, Result<StoredImageAttachment, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                usage_repository::image_attachment(connection, user_id, attachment_id)
+                repository::image_attachment(connection, user_id, attachment_id)
             })
             .await
         })

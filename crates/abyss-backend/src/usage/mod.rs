@@ -1,9 +1,9 @@
 //! API contracts and shared transformations for Agent usage collection.
 //!
 //! Ingest types preserve collector-provided observations, while response types
-//! expose the normalized device/session/turn hierarchy stored by PostgreSQL.
-//! Repository code owns persistence and validation that requires database state;
-//! small deterministic metadata transformations remain in this module.
+//! expose the normalized device/session/turn hierarchy returned by every storage
+//! backend. Deterministic validation and metadata transformations live here;
+//! backend-specific persistence stays behind the storage compatibility layer.
 
 /// Image attachment contracts and validation.
 pub mod attachments;
@@ -11,9 +11,6 @@ pub mod attachments;
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
-/// PostgreSQL-backed ingest and query operations.
-#[cfg(feature = "postgres-es")]
-pub mod repository;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -107,7 +104,7 @@ pub enum UsageEventType {
 }
 
 impl UsageEventType {
-    /// Returns the canonical value stored in PostgreSQL and returned by APIs.
+    /// Returns the canonical value stored by backends and returned by APIs.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Request => "request",

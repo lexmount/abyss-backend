@@ -1,4 +1,4 @@
-//! Diesel-backed repository functions for Agent usage APIs.
+//! PostgreSQL-backed repository functions for Agent usage APIs.
 //!
 //! This module is the transactional boundary for the event hierarchy. Ingest
 //! validates the complete request before opening a transaction, upserts device,
