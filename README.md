@@ -1,9 +1,8 @@
 # abyss-backend
 
 `abyss-backend` is the open-source, self-hostable Agent event store for Abyss.
-It accepts normalized Agent events, stores them in PostgreSQL, and exposes APIs
-for event history, summaries, session timelines, attachments, and optional
-full-text session search.
+It accepts normalized Agent events and exposes APIs for event history,
+summaries, session timelines, attachments, and full-text session search.
 
 This repository is intentionally focused on standalone event storage, queries,
 and optional full-text search.
@@ -13,12 +12,17 @@ and optional full-text search.
 - Idempotent Agent event ingestion and raw event queries.
 - Token-usage summaries and ordered session timelines.
 - Validated image attachment storage and authorized download.
-- Optional asynchronous Elasticsearch projection and session search.
-- Health and PostgreSQL readiness probes.
-- A consolidated PostgreSQL schema for new standalone deployments.
+- Full-text session search through Elasticsearch or embedded SQLite FTS5.
+- Health and storage-readiness probes.
+- Embedded migrations for both supported storage profiles.
 
-PostgreSQL is the only supported database in this migration step. SQLite is a
-future addition and is not implemented here.
+Exactly one storage profile is compiled into a binary:
+
+- `postgres-es` uses PostgreSQL as the source of truth and optionally projects
+  search documents to Elasticsearch. It is the default profile.
+- `sqlite-fts` stores both authoritative data and its transactional FTS5 index
+  in one local SQLite file. It does not compile Diesel, PostgreSQL, reqwest, or
+  Elasticsearch worker code into the binary.
 
 ## Authentication
 
@@ -34,7 +38,21 @@ export ABYSS_BACKEND_API_TOKEN_SHA256="$(printf '%s' "${ABYSS_API_TOKEN}" | open
 The plaintext token is never stored by `abyss-backend`. Put it in the Agent
 collector configuration and keep the digest in the backend secret store.
 
-## Run locally
+## Run locally with SQLite
+
+The SQLite profile has no external service dependency:
+
+```bash
+export ABYSS_BACKEND_DATABASE_URL='./data/abyss.sqlite'
+cargo run --locked --package abyss-backend \
+  --no-default-features --features sqlite-fts
+```
+
+The backend creates the parent directory, database, schema, and FTS5 index on
+startup. A `sqlite://` prefix is also accepted, for example
+`sqlite://./data/abyss.sqlite`.
+
+## Run with PostgreSQL
 
 Start PostgreSQL, then configure the required environment variables:
 
@@ -43,8 +61,8 @@ export ABYSS_BACKEND_DATABASE_URL='postgres://abyss:abyss@127.0.0.1:5432/abyss?s
 cargo run --locked --package abyss-backend
 ```
 
-The service listens on `0.0.0.0:8080` and runs its embedded migration by
-default. Verify it with:
+Both profiles listen on `0.0.0.0:8080` and run their embedded migrations by
+default. Verify the selected store with:
 
 ```bash
 curl http://127.0.0.1:8080/healthz
@@ -64,13 +82,13 @@ curl \
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/healthz` | Process liveness. |
-| `GET` | `/readyz` | PostgreSQL readiness. |
+| `GET` | `/readyz` | Selected storage readiness. |
 | `POST` | `/v1/agent-usage/events` | Ingest events and correlated diagnostic captures. |
 | `GET` | `/v1/agent-usage/events` | Query raw events. |
 | `GET` | `/v1/agent-usage/attachments/{id}` | Download stored image content. |
 | `GET` | `/v1/agent-usage/summary` | Aggregate event and token usage. |
 | `GET` | `/v1/agent-usage/sessions/{id}` | Read an ordered session timeline. |
-| `GET` | `/v1/agent-usage/search` | Search sessions when Elasticsearch is configured. |
+| `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite FTS5. |
 
 Every `/v1/agent-usage/*` endpoint requires the bearer token. Health and
 readiness endpoints are unauthenticated for orchestrator probes.
@@ -79,12 +97,12 @@ readiness endpoints are unauthenticated for orchestrator probes.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `ABYSS_BACKEND_DATABASE_URL` | yes | — | PostgreSQL connection URL. |
+| `ABYSS_BACKEND_DATABASE_URL` | yes | — | PostgreSQL URL or SQLite file path, depending on the compiled profile. |
 | `ABYSS_BACKEND_API_TOKEN_SHA256` | yes | — | Lowercase, 64-character SHA-256 bearer-token digest. |
 | `ABYSS_BACKEND_ADDR` | no | `0.0.0.0:8080` | HTTP listen address. |
 | `ABYSS_BACKEND_ENV` | no | `local` | Environment label reported at `/`. |
 | `ABYSS_BACKEND_LOG_LEVEL` | no | `info` | Default tracing filter. |
-| `ABYSS_BACKEND_DATABASE_POOL_SIZE` | no | `10` | PostgreSQL pool size. |
+| `ABYSS_BACKEND_DATABASE_POOL_SIZE` | no | `10` | Selected database pool size. |
 | `ABYSS_BACKEND_RUN_MIGRATIONS` | no | `true` | Run embedded migrations during startup. |
 | `ABYSS_BACKEND_MAX_INGEST_BATCH_SIZE` | no | `1000` | Maximum event count per ingest request. |
 | `ABYSS_BACKEND_SUMMARY_SCAN_LIMIT` | no | `100000` | Maximum source rows scanned by a summary query. |
@@ -96,9 +114,10 @@ readiness endpoints are unauthenticated for orchestrator probes.
 | `ABYSS_BACKEND_SEARCH_POLL_INTERVAL_MILLISECONDS` | no | `500` | Search outbox polling interval. |
 | `ABYSS_BACKEND_SEARCH_BATCH_SIZE` | no | `100` | Search outbox batch size. |
 
-Elasticsearch username and password must be provided together. Search remains
-disabled when no URL is configured; event storage and queries continue to
-work.
+Elasticsearch settings exist only in `postgres-es` builds. Username and
+password must be provided together. Search remains disabled in that profile
+when no URL is configured; event storage and queries continue to work. The
+`sqlite-fts` profile always provides search through the local FTS5 index.
 
 ## Containers and Kubernetes
 
@@ -221,11 +240,13 @@ the example `:latest` reference for production promotion.
 ```bash
 make check
 make test-blackbox
+make test-blackbox-sqlite
 make docker-build
 make k8s-render
 ```
 
-The black-box test starts an ephemeral PostgreSQL container and an
-Elasticsearch contract double, then verifies the consolidated schema,
-authentication, event ingestion, attachment retrieval, raw diagnostic
-retention, summary, timeline, and search behavior.
+`make test-blackbox` runs the same API contract against both storage profiles.
+The PostgreSQL case starts an ephemeral container and an Elasticsearch contract
+double; the SQLite case uses only a temporary local database file. Both verify
+schema creation, authentication, event ingestion, attachment retrieval, raw
+diagnostic retention, summary, timeline, and search behavior.

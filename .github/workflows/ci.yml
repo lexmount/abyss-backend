@@ -43,14 +43,23 @@ jobs:
       - name: Check workspace
         run: cargo check --locked --workspace --all-targets
 
+      - name: Check SQLite feature set
+        run: cargo check --locked --no-default-features --features sqlite-fts --workspace --all-targets
+
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run Clippy for SQLite
+        run: cargo clippy --locked --no-default-features --features sqlite-fts --workspace --all-targets -- -D warnings
 
       - name: Run unit tests
         run: cargo test --locked --workspace
 
+      - name: Run SQLite unit tests
+        run: cargo test --locked --no-default-features --features sqlite-fts --workspace
+
   blackbox:
-    name: PostgreSQL black-box
+    name: Storage black-box
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

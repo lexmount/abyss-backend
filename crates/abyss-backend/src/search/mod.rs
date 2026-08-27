@@ -1,70 +1,27 @@
-//! Traditional full-text session search backed by a derived Elasticsearch index.
+//! Backend-independent full-text search contracts and safe source projection.
 //!
-//! Search results are grouped by session in Elasticsearch, then hydrated with
-//! authoritative session and device rows from PostgreSQL. The index never acts
-//! as an authorization source: every query includes the authenticated owner and
-//! missing PostgreSQL details cause a stale search hit to be omitted.
+//! Concrete search engines live inside their selected storage backend. This
+//! module defines only the query, response, highlight, and bounded projection
+//! types shared by those implementations and the HTTP layer.
 
-mod document;
-mod elasticsearch;
-/// PostgreSQL outbox leasing and hydration queries.
-pub mod outbox;
-/// Background outbox-to-Elasticsearch projection worker.
-pub mod worker;
-
-use std::collections::{HashMap, HashSet};
+pub mod projection;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{config::SearchConfig, error::AppError};
+use crate::error::AppError;
 
-use self::{
-    elasticsearch::{ElasticsearchClient, HIGHLIGHT_END, HIGHLIGHT_START, SearchMatchPage},
-    outbox::SearchSessionDetails,
-};
+/// Sentinel inserted before text matched by either search implementation.
+pub const HIGHLIGHT_START: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]";
+/// Sentinel inserted after text matched by either search implementation.
+pub const HIGHLIGHT_END: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]";
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const MAX_PAGE_SIZE: u32 = 50;
 const MAX_QUERY_CHARACTERS: usize = 256;
 const MAX_FILTER_CHARACTERS: usize = 256;
 const MAX_RESULT_WINDOW: u32 = 10_000;
-
-#[derive(Clone)]
-/// Validating facade over the Elasticsearch HTTP client.
-pub struct SearchService {
-    client: ElasticsearchClient,
-}
-
-impl SearchService {
-    /// Creates a search service from startup-validated settings.
-    pub fn new(config: &SearchConfig) -> Result<Self, AppError> {
-        Ok(Self {
-            client: ElasticsearchClient::new(config)?,
-        })
-    }
-
-    /// Returns a cloned client for the background indexer.
-    #[must_use]
-    pub fn client(&self) -> ElasticsearchClient {
-        self.client.clone()
-    }
-
-    /// Validates and executes one owner-scoped session search.
-    pub async fn search(
-        &self,
-        user_id: Uuid,
-        query: SessionSearchQuery,
-    ) -> Result<SearchExecution, AppError> {
-        let query = query.validate()?;
-        let page = self.client.search(user_id, &query).await.map_err(|error| {
-            tracing::warn!(%error, %user_id, "session search request failed");
-            AppError::unavailable("session search is temporarily unavailable".to_owned())
-        })?;
-        Ok(SearchExecution { query, page })
-    }
-}
 
 #[derive(Debug, Deserialize)]
 /// Query-string contract for session full-text search.
@@ -90,7 +47,7 @@ pub struct SessionSearchQuery {
 }
 
 impl SessionSearchQuery {
-    fn validate(self) -> Result<ValidatedSearchQuery, AppError> {
+    pub(crate) fn validate(self) -> Result<ValidatedSearchQuery, AppError> {
         let text = normalized_required(&self.q, "q", MAX_QUERY_CHARACTERS)?;
         if let (Some(from), Some(to)) = (self.from, self.to)
             && from >= to
@@ -109,7 +66,7 @@ impl SessionSearchQuery {
                 "page_size must be between 1 and {MAX_PAGE_SIZE}"
             )));
         }
-        // Elasticsearch's from/size pagination has a bounded result window.
+        // Both search implementations expose the same bounded result window.
         // Checked arithmetic makes oversized user input a validation error.
         let offset = page
             .saturating_sub(1)
@@ -149,7 +106,7 @@ impl SessionSearchQuery {
     }
 }
 
-/// Normalized query safe to translate directly into Elasticsearch JSON.
+/// Normalized query safe to translate into a backend-specific search request.
 pub struct ValidatedSearchQuery {
     /// Trimmed full-text query.
     pub text: String,
@@ -169,101 +126,8 @@ pub struct ValidatedSearchQuery {
     pub page: u32,
     /// Sessions returned per page.
     pub page_size: u32,
-    /// Zero-based Elasticsearch result offset.
+    /// Zero-based search result offset.
     pub offset: u32,
-}
-
-/// Elasticsearch matches paired with the validated query that produced them.
-pub struct SearchExecution {
-    query: ValidatedSearchQuery,
-    page: SearchMatchPage,
-}
-
-impl SearchExecution {
-    /// Returns session keys that must be hydrated from PostgreSQL.
-    #[must_use]
-    pub fn session_ids(&self) -> Vec<Uuid> {
-        self.page
-            .sessions
-            .iter()
-            .map(|session| session.session_pk)
-            .collect()
-    }
-
-    /// Combines search matches with authoritative session/device details.
-    ///
-    /// Stale index entries whose session no longer exists are omitted instead
-    /// of returning partially authorized or incomplete data.
-    #[must_use]
-    pub fn hydrate(
-        self,
-        mut details: HashMap<Uuid, SearchSessionDetails>,
-    ) -> SessionSearchResponse {
-        let items = self
-            .page
-            .sessions
-            .into_iter()
-            .filter_map(|matches| {
-                let details = details.remove(&matches.session_pk)?;
-                let mut models = matches
-                    .events
-                    .iter()
-                    .map(|event| event.llm_model.clone())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                models.sort();
-                let mut providers = matches
-                    .events
-                    .iter()
-                    .map(|event| event.llm_provider.clone())
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                providers.sort();
-                Some(SessionSearchResult {
-                    session_pk: details.session.id,
-                    session_id: details.session.session_id,
-                    agent_name: details.session.agent_name,
-                    agent_version: details.session.agent_version,
-                    host_name: details.device.host_name,
-                    platform: details.device.platform,
-                    started_at: details.session.started_at,
-                    ended_at: details.session.ended_at,
-                    providers,
-                    models,
-                    match_count: matches.match_count,
-                    matches: matches
-                        .events
-                        .into_iter()
-                        .map(|event| SessionSearchMatch {
-                            event_pk: event.event_pk,
-                            turn_pk: event.turn_pk,
-                            turn_index: event.turn_index,
-                            event_type: event.event_type,
-                            llm_provider: event.llm_provider,
-                            llm_model: event.llm_model,
-                            observed_at: event.observed_at,
-                            fragments: event
-                                .fragments
-                                .into_iter()
-                                .map(|fragment| SearchFragment::parse(&fragment))
-                                .collect(),
-                        })
-                        .collect(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let consumed = u64::from(self.query.page).saturating_mul(u64::from(self.query.page_size));
-        SessionSearchResponse {
-            query: self.query.text,
-            total_sessions: self.page.total_sessions,
-            page: self.query.page,
-            page_size: self.query.page_size,
-            has_more: consumed < self.page.total_sessions,
-            items,
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -271,7 +135,7 @@ impl SearchExecution {
 pub struct SessionSearchResponse {
     /// Normalized full-text query.
     pub query: String,
-    /// Approximate distinct session count returned by Elasticsearch cardinality.
+    /// Distinct matching-session count reported by the selected backend.
     pub total_sessions: u64,
     /// One-based current page.
     pub page: u32,
@@ -334,14 +198,14 @@ pub struct SessionSearchMatch {
 }
 
 #[derive(Serialize)]
-/// One Elasticsearch highlight fragment split into plain and matching text.
+/// One search highlight fragment split into plain and matching text.
 pub struct SearchFragment {
     /// Ordered text segments suitable for structured UI rendering.
     pub segments: Vec<SearchFragmentSegment>,
 }
 
 impl SearchFragment {
-    fn parse(fragment: &str) -> Self {
+    pub(crate) fn parse(fragment: &str) -> Self {
         let mut segments = Vec::new();
         let mut remainder = fragment;
         while let Some(start) = remainder.find(HIGHLIGHT_START) {

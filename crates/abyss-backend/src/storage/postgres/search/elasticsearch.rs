@@ -13,17 +13,16 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{config::SearchConfig, error::AppError};
+use crate::{
+    config::SearchConfig,
+    error::AppError,
+    search::{HIGHLIGHT_END, HIGHLIGHT_START, ValidatedSearchQuery},
+};
 
-use super::{ValidatedSearchQuery, document::SearchDocument};
+use super::document::SearchDocument;
 
 /// Fixed name of the derived usage-event index.
 pub const SEARCH_INDEX: &str = "abyss_usage_events";
-/// Sentinel inserted before text matched by Elasticsearch highlighting.
-pub const HIGHLIGHT_START: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]";
-/// Sentinel inserted after text matched by Elasticsearch highlighting.
-pub const HIGHLIGHT_END: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]";
-
 /// One idempotent operation submitted through Elasticsearch's Bulk API.
 pub enum BulkOperation {
     /// Create or replace a document from current source-event state.

@@ -10,14 +10,11 @@ use std::time::Duration;
 use tokio::{sync::watch, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{
-    config::SearchConfig,
-    db::DbPool,
-    error::AppError,
-    search::{
-        elasticsearch::ElasticsearchClient,
-        outbox::{OutboxTaskResult, SearchOutboxRepository},
-    },
+use crate::{config::SearchConfig, db::DbPool, error::AppError};
+
+use super::{
+    elasticsearch::ElasticsearchClient,
+    outbox::{OutboxTaskResult, SearchOutboxRepository},
 };
 
 /// Factory for the detached search projection task.

@@ -2,9 +2,7 @@
 //!
 //! Startup is deliberately ordered: configuration is validated before any
 //! external connection is opened, database migrations finish before the HTTP
-//! listener accepts traffic, and the optional search worker shares the same
-//! shutdown signal as the server. PostgreSQL remains the source of truth;
-//! Elasticsearch is only a derived, eventually consistent projection.
+//! listener accepts traffic, and backend-owned workers stop after the server.
 
 #![warn(missing_docs)]
 #![expect(
@@ -14,16 +12,23 @@
 
 mod api;
 mod config;
+#[cfg(feature = "postgres-es")]
 mod db;
 mod error;
 mod identity;
 mod search;
+mod storage;
 mod usage;
 
-use std::{error::Error, time::Duration};
+#[cfg(all(feature = "postgres-es", feature = "sqlite-fts"))]
+compile_error!("features postgres-es and sqlite-fts are mutually exclusive");
+
+#[cfg(not(any(feature = "postgres-es", feature = "sqlite-fts")))]
+compile_error!("one of features postgres-es or sqlite-fts must be enabled");
+
+use std::error::Error;
 
 use config::Config;
-use db::{create_pool, run_migrations};
 use identity::IdentityAuthenticator;
 use tracing_subscriber::EnvFilter;
 
@@ -33,28 +38,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     validate_runtime_config(&config)?;
     init_tracing(&config);
 
-    let pool = create_pool(&config)?;
-    if config.run_migrations {
-        run_migrations(&pool)?;
-    }
-
-    // Search is optional. Keeping the service itself in an Option makes the
-    // disabled state explicit all the way through routing and worker startup.
-    let search = config
-        .search
-        .as_ref()
-        .map(search::SearchService::new)
-        .transpose()?;
-    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
-    let search_worker = match (&search, config.search.as_ref()) {
-        (Some(search), Some(search_config)) => Some(search::worker::SearchIndexer::spawn(
-            pool.clone(),
-            search.client(),
-            search_config,
-            shutdown_receiver,
-        )),
-        _ => None,
-    };
+    let storage = storage::build(&config)?;
 
     let address = config.addr;
     let app = api::router(api::AppState {
@@ -63,8 +47,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         summary_scan_limit: config.summary_scan_limit,
         default_page_size: config.default_page_size,
         identity: IdentityAuthenticator::new(config.identity),
-        search,
-        pool,
+        storage: storage.clone(),
     });
 
     let listener = tokio::net::TcpListener::bind(&address).await?;
@@ -73,31 +56,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        if shutdown_sender.send(true).is_err() {
-            tracing::trace!("session search indexer already stopped");
-        }
-    })
+    .with_graceful_shutdown(shutdown_signal())
     .await;
-    stop_search_worker(search_worker).await;
+    storage.shutdown().await;
     server_result?;
 
     Ok(())
-}
-
-async fn stop_search_worker(worker: Option<tokio::task::JoinHandle<()>>) {
-    let Some(mut worker) = worker else {
-        return;
-    };
-    match tokio::time::timeout(Duration::from_secs(15), &mut worker).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(%error, "session search indexer task failed"),
-        Err(_elapsed) => {
-            tracing::warn!("session search indexer did not stop before timeout");
-            worker.abort();
-        }
-    }
 }
 
 fn validate_runtime_config(config: &Config) -> Result<(), error::AppError> {
@@ -180,6 +144,7 @@ mod tests {
             summary_scan_limit: 1,
             default_page_size: 1,
             identity: IdentityConfig::parse(&"0".repeat(64)).expect("test token hash should parse"),
+            #[cfg(feature = "postgres-es")]
             search: None,
         }
     }
