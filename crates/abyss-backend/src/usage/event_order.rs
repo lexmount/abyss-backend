@@ -12,7 +12,37 @@ use std::{
 
 use chrono::{DateTime, Utc};
 
-use crate::db::models::UsageEvent;
+/// Event fields required by deterministic timeline ordering.
+pub trait TimelineEvent {
+    fn turn_index(&self) -> i32;
+    fn metadata(&self) -> &serde_json::Value;
+    fn observed_at(&self) -> DateTime<Utc>;
+    fn event_type(&self) -> &str;
+    fn event_id(&self) -> &str;
+}
+
+#[cfg(feature = "postgres-es")]
+impl TimelineEvent for crate::db::models::UsageEvent {
+    fn turn_index(&self) -> i32 {
+        self.turn_index
+    }
+
+    fn metadata(&self) -> &serde_json::Value {
+        &self.metadata
+    }
+
+    fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    fn event_id(&self) -> &str {
+        &self.event_id
+    }
+}
 
 /// Applies the authoritative event order used by owned and shared timelines.
 pub struct UsageEventTimelineOrder;
@@ -22,18 +52,18 @@ impl UsageEventTimelineOrder {
     ///
     /// The final event identifier tie-breaker makes output deterministic even
     /// for corrupt cycles or collectors with identical timestamps.
-    pub fn sort(events: &mut [UsageEvent]) {
+    pub fn sort<T: TimelineEvent>(events: &mut [T]) {
         let provider_ranks = ProviderResponseRanks::from_events(events);
         events.sort_by(|left, right| {
-            left.turn_index.cmp(&right.turn_index).then_with(|| {
+            left.turn_index().cmp(&right.turn_index()).then_with(|| {
                 provider_ranks.compare_events(left, right).then_with(|| {
-                    left.observed_at
-                        .cmp(&right.observed_at)
+                    left.observed_at()
+                        .cmp(&right.observed_at())
                         .then_with(|| {
-                            event_side_rank(&left.event_type)
-                                .cmp(&event_side_rank(&right.event_type))
+                            event_side_rank(left.event_type())
+                                .cmp(&event_side_rank(right.event_type()))
                         })
-                        .then_with(|| left.event_id.cmp(&right.event_id))
+                        .then_with(|| left.event_id().cmp(right.event_id()))
                 })
             })
         });
@@ -46,31 +76,31 @@ struct ProviderResponseRanks {
 }
 
 impl ProviderResponseRanks {
-    fn from_events(events: &[UsageEvent]) -> Self {
+    fn from_events<T: TimelineEvent>(events: &[T]) -> Self {
         let mut nodes_by_turn = BTreeMap::<i32, HashMap<String, ProviderResponseNode>>::new();
         // Native provider ordering is safe only when every event in a turn has
         // a response_id. A partially instrumented turn falls back as a whole so
         // ranked and unranked events cannot interleave unpredictably.
         let mut native_turns = events
             .iter()
-            .map(|event| event.turn_index)
+            .map(TimelineEvent::turn_index)
             .collect::<HashSet<_>>();
         for event in events {
-            let Some(response_id) = metadata_string(&event.metadata, "response_id") else {
-                native_turns.remove(&event.turn_index);
+            let Some(response_id) = metadata_string(event.metadata(), "response_id") else {
+                native_turns.remove(&event.turn_index());
                 continue;
             };
             let previous_response_id =
-                metadata_string(&event.metadata, "previous_response_id").map(str::to_owned);
-            let nodes = nodes_by_turn.entry(event.turn_index).or_default();
+                metadata_string(event.metadata(), "previous_response_id").map(str::to_owned);
+            let nodes = nodes_by_turn.entry(event.turn_index()).or_default();
             let node =
                 nodes
                     .entry(response_id.to_owned())
                     .or_insert_with(|| ProviderResponseNode {
                         response_id: response_id.to_owned(),
                         previous_response_id: previous_response_id.clone(),
-                        first_observed_at: event.observed_at,
-                        first_event_id: event.event_id.clone(),
+                        first_observed_at: event.observed_at(),
+                        first_event_id: event.event_id().to_owned(),
                     });
             node.merge_evidence(event, previous_response_id);
         }
@@ -178,24 +208,27 @@ impl ProviderResponseRanks {
         }
     }
 
-    fn compare_events(&self, left: &UsageEvent, right: &UsageEvent) -> Ordering {
-        if left.turn_index != right.turn_index || !self.native_turns.contains(&left.turn_index) {
+    fn compare_events<T: TimelineEvent>(&self, left: &T, right: &T) -> Ordering {
+        if left.turn_index() != right.turn_index()
+            || !self.native_turns.contains(&left.turn_index())
+        {
             return Ordering::Equal;
         }
 
-        let left_response_id = metadata_string(&left.metadata, "response_id");
-        let right_response_id = metadata_string(&right.metadata, "response_id");
+        let left_response_id = metadata_string(left.metadata(), "response_id");
+        let right_response_id = metadata_string(right.metadata(), "response_id");
 
         // Request and response observations that describe the same provider
         // call remain adjacent and request-first regardless of timestamp ties.
         if left_response_id.is_some() && left_response_id == right_response_id {
-            return event_side_rank(&left.event_type).cmp(&event_side_rank(&right.event_type));
+            return event_side_rank(left.event_type()).cmp(&event_side_rank(right.event_type()));
         }
 
         let native_order = left_response_id
-            .and_then(|response_id| self.ranks.get(&(left.turn_index, response_id.to_owned())))
+            .and_then(|response_id| self.ranks.get(&(left.turn_index(), response_id.to_owned())))
             .zip(right_response_id.and_then(|response_id| {
-                self.ranks.get(&(right.turn_index, response_id.to_owned()))
+                self.ranks
+                    .get(&(right.turn_index(), response_id.to_owned()))
             }))
             .map(|(left_rank, right_rank)| left_rank.cmp(right_rank));
         if let Some(ordering) = native_order.filter(|ordering| !ordering.is_eq()) {
@@ -214,15 +247,19 @@ struct ProviderResponseNode {
 }
 
 impl ProviderResponseNode {
-    fn merge_evidence(&mut self, event: &UsageEvent, previous_response_id: Option<String>) {
+    fn merge_evidence<T: TimelineEvent>(
+        &mut self,
+        event: &T,
+        previous_response_id: Option<String>,
+    ) {
         if self.previous_response_id.is_none() {
             self.previous_response_id = previous_response_id;
         }
-        if (event.observed_at, event.event_id.as_str())
+        if (event.observed_at(), event.event_id())
             < (self.first_observed_at, self.first_event_id.as_str())
         {
-            self.first_observed_at = event.observed_at;
-            self.first_event_id.clone_from(&event.event_id);
+            self.first_observed_at = event.observed_at();
+            event.event_id().clone_into(&mut self.first_event_id);
         }
     }
 
@@ -250,7 +287,7 @@ const fn event_side_rank(event_type: &str) -> u8 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres-es"))]
 mod tests {
     use chrono::{TimeZone as _, Timelike as _, Utc};
     use serde_json::json;

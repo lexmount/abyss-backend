@@ -5,25 +5,39 @@
 //! as an authorization source: every query includes the authenticated owner and
 //! missing PostgreSQL details cause a stale search hit to be omitted.
 
+#[cfg(feature = "postgres-es")]
 mod document;
+#[cfg(feature = "postgres-es")]
 mod elasticsearch;
 /// PostgreSQL outbox leasing and hydration queries.
+#[cfg(feature = "postgres-es")]
 pub mod outbox;
+pub mod projection;
 /// Background outbox-to-Elasticsearch projection worker.
+#[cfg(feature = "postgres-es")]
 pub mod worker;
 
+#[cfg(feature = "postgres-es")]
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{config::SearchConfig, error::AppError};
+#[cfg(feature = "postgres-es")]
+use crate::config::SearchConfig;
+use crate::error::AppError;
 
+#[cfg(feature = "postgres-es")]
 use self::{
-    elasticsearch::{ElasticsearchClient, HIGHLIGHT_END, HIGHLIGHT_START, SearchMatchPage},
+    elasticsearch::{ElasticsearchClient, SearchMatchPage},
     outbox::SearchSessionDetails,
 };
+
+/// Sentinel inserted before text matched by either search implementation.
+pub const HIGHLIGHT_START: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]";
+/// Sentinel inserted after text matched by either search implementation.
+pub const HIGHLIGHT_END: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]";
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const MAX_PAGE_SIZE: u32 = 50;
@@ -32,11 +46,13 @@ const MAX_FILTER_CHARACTERS: usize = 256;
 const MAX_RESULT_WINDOW: u32 = 10_000;
 
 #[derive(Clone)]
+#[cfg(feature = "postgres-es")]
 /// Validating facade over the Elasticsearch HTTP client.
 pub struct SearchService {
     client: ElasticsearchClient,
 }
 
+#[cfg(feature = "postgres-es")]
 impl SearchService {
     /// Creates a search service from startup-validated settings.
     pub fn new(config: &SearchConfig) -> Result<Self, AppError> {
@@ -90,7 +106,7 @@ pub struct SessionSearchQuery {
 }
 
 impl SessionSearchQuery {
-    fn validate(self) -> Result<ValidatedSearchQuery, AppError> {
+    pub(crate) fn validate(self) -> Result<ValidatedSearchQuery, AppError> {
         let text = normalized_required(&self.q, "q", MAX_QUERY_CHARACTERS)?;
         if let (Some(from), Some(to)) = (self.from, self.to)
             && from >= to
@@ -109,7 +125,7 @@ impl SessionSearchQuery {
                 "page_size must be between 1 and {MAX_PAGE_SIZE}"
             )));
         }
-        // Elasticsearch's from/size pagination has a bounded result window.
+        // Both search implementations expose the same bounded result window.
         // Checked arithmetic makes oversized user input a validation error.
         let offset = page
             .saturating_sub(1)
@@ -169,16 +185,18 @@ pub struct ValidatedSearchQuery {
     pub page: u32,
     /// Sessions returned per page.
     pub page_size: u32,
-    /// Zero-based Elasticsearch result offset.
+    /// Zero-based search result offset.
     pub offset: u32,
 }
 
 /// Elasticsearch matches paired with the validated query that produced them.
+#[cfg(feature = "postgres-es")]
 pub struct SearchExecution {
     query: ValidatedSearchQuery,
     page: SearchMatchPage,
 }
 
+#[cfg(feature = "postgres-es")]
 impl SearchExecution {
     /// Returns session keys that must be hydrated from PostgreSQL.
     #[must_use]
@@ -271,7 +289,7 @@ impl SearchExecution {
 pub struct SessionSearchResponse {
     /// Normalized full-text query.
     pub query: String,
-    /// Approximate distinct session count returned by Elasticsearch cardinality.
+    /// Distinct matching-session count reported by the selected backend.
     pub total_sessions: u64,
     /// One-based current page.
     pub page: u32,
@@ -334,14 +352,14 @@ pub struct SessionSearchMatch {
 }
 
 #[derive(Serialize)]
-/// One Elasticsearch highlight fragment split into plain and matching text.
+/// One search highlight fragment split into plain and matching text.
 pub struct SearchFragment {
     /// Ordered text segments suitable for structured UI rendering.
     pub segments: Vec<SearchFragmentSegment>,
 }
 
 impl SearchFragment {
-    fn parse(fragment: &str) -> Self {
+    pub(crate) fn parse(fragment: &str) -> Self {
         let mut segments = Vec::new();
         let mut remainder = fragment;
         while let Some(start) = remainder.find(HIGHLIGHT_START) {

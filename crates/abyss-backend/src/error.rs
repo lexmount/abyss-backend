@@ -18,9 +18,14 @@ pub enum AppError {
     #[error("configuration error: {0}")]
     Config(String),
     /// Diesel query or transaction failure.
+    #[cfg(feature = "postgres-es")]
     #[error("database error: {0}")]
     Database(#[from] diesel::result::Error),
-    /// PostgreSQL connection-pool failure.
+    /// SQLite query or transaction failure.
+    #[cfg(feature = "sqlite-fts")]
+    #[error("database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    /// Database connection-pool failure.
     #[error("connection pool error: {0}")]
     Pool(#[from] r2d2::Error),
     /// Authenticated resource does not exist.
@@ -30,6 +35,7 @@ pub enum AppError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     /// Optional dependency is disabled or temporarily unavailable.
+    #[cfg(feature = "postgres-es")]
     #[error("unavailable: {0}")]
     Unavailable(String),
     /// Request data violates an API contract.
@@ -62,6 +68,7 @@ impl AppError {
     }
 
     /// Constructs a dependency-unavailable error.
+    #[cfg(feature = "postgres-es")]
     pub const fn unavailable(message: String) -> Self {
         Self::Unavailable(message)
     }
@@ -75,11 +82,16 @@ impl AppError {
         match self {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            #[cfg(feature = "postgres-es")]
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Config(_) | Self::Database(_) | Self::Pool(_) | Self::Internal(_) => {
+            Self::Config(_) | Self::Pool(_) | Self::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            #[cfg(feature = "postgres-es")]
+            Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            #[cfg(feature = "sqlite-fts")]
+            Self::Sqlite(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -88,14 +100,23 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let error = match &self {
-            Self::Config(_) | Self::Database(_) | Self::Pool(_) | Self::Internal(_) => {
+            Self::Config(_) | Self::Pool(_) | Self::Internal(_) => {
                 tracing::error!(error = %self, "internal error");
                 "internal server error".to_owned()
             }
-            Self::NotFound(_)
-            | Self::Unauthorized(_)
-            | Self::Unavailable(_)
-            | Self::Validation(_) => self.to_string(),
+            #[cfg(feature = "postgres-es")]
+            Self::Database(_) => {
+                tracing::error!(error = %self, "internal error");
+                "internal server error".to_owned()
+            }
+            #[cfg(feature = "sqlite-fts")]
+            Self::Sqlite(_) => {
+                tracing::error!(error = %self, "internal error");
+                "internal server error".to_owned()
+            }
+            Self::NotFound(_) | Self::Unauthorized(_) | Self::Validation(_) => self.to_string(),
+            #[cfg(feature = "postgres-es")]
+            Self::Unavailable(_) => self.to_string(),
         };
         let body = ErrorResponse { error };
         (status, Json(body)).into_response()

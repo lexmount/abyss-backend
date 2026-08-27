@@ -9,8 +9,10 @@
 pub mod attachments;
 /// Opaque diagnostic-capture ingest contracts.
 pub mod diagnostics;
-mod event_order;
+pub mod event_order;
+pub mod persistence;
 /// PostgreSQL-backed ingest and query operations.
+#[cfg(feature = "postgres-es")]
 pub mod repository;
 
 use chrono::{DateTime, Utc};

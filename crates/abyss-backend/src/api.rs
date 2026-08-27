@@ -2,8 +2,7 @@
 //!
 //! The health endpoints are public, while every event, attachment, summary,
 //! timeline, and search endpoint authenticates the deployment bearer token.
-//! Diesel is synchronous, so all database access is moved onto Tokio's blocking
-//! pool through [`run_db`] rather than running on asynchronous executor threads.
+//! Storage implementation details remain behind the configured backend trait.
 
 use axum::{
     Json, Router,
@@ -13,23 +12,18 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use diesel::PgConnection;
 use serde::Serialize;
-use tokio::task;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::{
-    db::{self, DbPool},
     error::AppError,
     identity::IdentityAuthenticator,
-    search::{
-        SearchService, SessionSearchQuery, SessionSearchResponse, outbox::SearchOutboxRepository,
-    },
+    search::{SessionSearchQuery, SessionSearchResponse},
+    storage::StorageBackend,
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionTimelineResponse, SummaryFields, SummaryQuery, TokenUsageSummaryResponse,
-        repository as usage_repository,
     },
 };
 
@@ -48,10 +42,8 @@ pub struct AppState {
     pub default_page_size: i64,
     /// Deployment-wide bearer-token validator.
     pub identity: IdentityAuthenticator,
-    /// Optional full-text search service.
-    pub search: Option<SearchService>,
-    /// PostgreSQL connection pool used by request handlers.
-    pub pool: DbPool,
+    /// Compile-time-selected event storage and full-text search implementation.
+    pub storage: std::sync::Arc<dyn StorageBackend>,
 }
 
 /// Builds the complete HTTP router for one backend process.
@@ -99,9 +91,10 @@ async fn health() -> Json<ServiceStatus> {
 }
 
 async fn ready(State(state): State<AppState>) -> Result<Json<ServiceStatus>, AppError> {
-    // Readiness checks the source of truth only. Search is an optional derived
-    // service and its temporary failure must not remove ingestion capacity.
-    run_db(state, db::check_ready).await?;
+    // Readiness checks the authoritative database. In the PostgreSQL profile,
+    // a temporary failure of the optional search projection must not remove
+    // ingestion capacity.
+    state.storage.ready().await?;
     Ok(Json(ServiceStatus {
         service: "abyss-backend",
         status: "ok",
@@ -115,10 +108,10 @@ async fn ingest_events(
 ) -> Result<Json<IngestEventsResponse>, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
     let max_batch_size = state.max_ingest_batch_size;
-    let response = run_db(state, move |connection| {
-        usage_repository::ingest_events(connection, &request, user_id, max_batch_size)
-    })
-    .await?;
+    let response = state
+        .storage
+        .ingest_events(user_id, request, max_batch_size)
+        .await?;
     Ok(Json(response))
 }
 
@@ -130,10 +123,10 @@ async fn usage_summary(
     let user_id = state.identity.authenticate(&headers)?;
     let scan_limit = state.summary_scan_limit;
     let fields = query.fields.unwrap_or(SummaryFields::Full);
-    let response = run_db(state, move |connection| {
-        usage_repository::usage_summary(connection, &query, user_id, scan_limit)
-    })
-    .await?;
+    let response = state
+        .storage
+        .usage_summary(user_id, query, scan_limit)
+        .await?;
     if fields == SummaryFields::TokenUsage {
         return Ok(Json(TokenUsageSummaryResponse::from_summary(response)).into_response());
     }
@@ -146,19 +139,7 @@ async fn session_search(
     Query(query): Query<SessionSearchQuery>,
 ) -> Result<Json<SessionSearchResponse>, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
-    let search = state
-        .search
-        .clone()
-        .ok_or_else(|| AppError::unavailable("session search is not configured".to_owned()))?;
-    let execution = search.search(user_id, query).await?;
-    let session_ids = execution.session_ids();
-    // Elasticsearch contains only a bounded search projection. Authoritative
-    // session/device details are reloaded from PostgreSQL under the owner scope.
-    let details = run_db(state, move |connection| {
-        SearchOutboxRepository::session_details(connection, user_id, &session_ids)
-    })
-    .await?;
-    Ok(Json(execution.hydrate(details)))
+    Ok(Json(state.storage.session_search(user_id, query).await?))
 }
 
 async fn session_timeline(
@@ -167,10 +148,7 @@ async fn session_timeline(
     Path(session_pk): Path<Uuid>,
 ) -> Result<Json<SessionTimelineResponse>, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
-    let response = run_db(state, move |connection| {
-        usage_repository::session_timeline(connection, user_id, session_pk)
-    })
-    .await?;
+    let response = state.storage.session_timeline(user_id, session_pk).await?;
     Ok(Json(response))
 }
 
@@ -180,10 +158,10 @@ async fn image_attachment(
     Path(attachment_id): Path<Uuid>,
 ) -> Result<Response, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
-    let attachment = run_db(state, move |connection| {
-        usage_repository::image_attachment(connection, user_id, attachment_id)
-    })
-    .await?;
+    let attachment = state
+        .storage
+        .image_attachment(user_id, attachment_id)
+        .await?;
 
     let mut response = Bytes::from(attachment.content).into_response();
     let response_headers = response.headers_mut();
@@ -230,26 +208,11 @@ async fn raw_events(
 ) -> Result<Json<RawEventsResponse>, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
     let default_page_size = state.default_page_size;
-    let response = run_db(state, move |connection| {
-        usage_repository::raw_events(connection, &query, user_id, default_page_size)
-    })
-    .await?;
+    let response = state
+        .storage
+        .raw_events(user_id, query, default_page_size)
+        .await?;
     Ok(Json(response))
-}
-
-async fn run_db<T, F>(state: AppState, task_fn: F) -> Result<T, AppError>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut PgConnection) -> Result<T, AppError> + Send + 'static,
-{
-    // Diesel and r2d2 are blocking APIs. Acquiring the pool connection inside
-    // spawn_blocking also keeps pool contention off Tokio worker threads.
-    task::spawn_blocking(move || {
-        let mut connection = state.pool.get()?;
-        task_fn(&mut connection)
-    })
-    .await
-    .map_err(|error| AppError::internal(format!("database task failed: {error}")))?
 }
 
 #[derive(Serialize)]

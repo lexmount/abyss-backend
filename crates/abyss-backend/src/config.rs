@@ -16,8 +16,11 @@ const DEFAULT_POOL_SIZE: u32 = 10;
 const DEFAULT_MAX_INGEST_BATCH_SIZE: usize = 1_000;
 const DEFAULT_SUMMARY_SCAN_LIMIT: i64 = 100_000;
 const DEFAULT_PAGE_SIZE: i64 = 100;
+#[cfg(feature = "postgres-es")]
 const DEFAULT_SEARCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
+#[cfg(feature = "postgres-es")]
 const DEFAULT_SEARCH_POLL_INTERVAL_MILLISECONDS: u64 = 500;
+#[cfg(feature = "postgres-es")]
 const DEFAULT_SEARCH_BATCH_SIZE: i64 = 100;
 
 /// Complete runtime configuration shared by process startup and HTTP state.
@@ -30,11 +33,11 @@ pub struct Config {
     pub blackbox_allow_non_loopback: bool,
     /// Default tracing filter used when `RUST_LOG` is not set.
     pub log_level: String,
-    /// PostgreSQL connection string.
+    /// PostgreSQL URL or SQLite file path selected by the compiled backend.
     pub database_url: String,
-    /// Maximum number of PostgreSQL connections held by the r2d2 pool.
+    /// Maximum number of database connections held by the backend pool.
     pub database_pool_size: u32,
-    /// Whether embedded Diesel migrations run before the listener starts.
+    /// Whether embedded backend migrations run before the listener starts.
     pub run_migrations: bool,
     /// Maximum events and diagnostic captures accepted in one ingest request.
     pub max_ingest_batch_size: usize,
@@ -45,6 +48,7 @@ pub struct Config {
     /// Deployment-wide bearer-token authentication configuration.
     pub identity: IdentityConfig,
     /// Optional Elasticsearch projection configuration.
+    #[cfg(feature = "postgres-es")]
     pub search: Option<SearchConfig>,
 }
 
@@ -86,12 +90,14 @@ impl Config {
                 DEFAULT_PAGE_SIZE,
             )?,
             identity: IdentityConfig::parse(&read_required_env("ABYSS_BACKEND_API_TOKEN_SHA256")?)?,
+            #[cfg(feature = "postgres-es")]
             search: SearchConfig::from_env()?,
         })
     }
 }
 
 #[derive(Clone)]
+#[cfg(feature = "postgres-es")]
 /// Settings required by the Elasticsearch client and projection worker.
 pub struct SearchConfig {
     /// Base Elasticsearch URL, without an index or API path suffix.
@@ -108,6 +114,7 @@ pub struct SearchConfig {
     pub batch_size: i64,
 }
 
+#[cfg(feature = "postgres-es")]
 impl SearchConfig {
     fn from_env() -> Result<Option<Self>, AppError> {
         let endpoint = env_value("ABYSS_BACKEND_ELASTICSEARCH_URL");
@@ -189,6 +196,7 @@ fn read_positive_u32_env(key: &str, fallback: u32) -> Result<u32, AppError> {
     require_positive(key, value)
 }
 
+#[cfg(feature = "postgres-es")]
 fn read_positive_u64_env(key: &str, fallback: u64) -> Result<u64, AppError> {
     let value = parse_env(key, fallback, str::parse::<u64>)?;
     require_positive(key, value)
