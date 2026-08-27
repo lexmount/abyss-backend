@@ -1,5 +1,7 @@
 //! PostgreSQL source-of-truth and Elasticsearch projection implementation.
 
+mod search;
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,9 +13,7 @@ use crate::{
     config::Config,
     db::{self, DbPool},
     error::AppError,
-    search::{
-        SearchService, SessionSearchQuery, SessionSearchResponse, outbox::SearchOutboxRepository,
-    },
+    search::{SessionSearchQuery, SessionSearchResponse},
     storage::StorageBackend,
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
@@ -21,6 +21,8 @@ use crate::{
         repository as usage_repository,
     },
 };
+
+use self::search::{SearchIndexer, SearchOutboxRepository, SearchService};
 
 struct SearchWorker {
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -47,12 +49,8 @@ impl PostgresEsBackend {
         let search_worker = match (&search, config.search.as_ref()) {
             (Some(search), Some(search_config)) => {
                 let (shutdown, receiver) = tokio::sync::watch::channel(false);
-                let handle = crate::search::worker::SearchIndexer::spawn(
-                    pool.clone(),
-                    search.client(),
-                    search_config,
-                    receiver,
-                );
+                let handle =
+                    SearchIndexer::spawn(pool.clone(), search.client(), search_config, receiver);
                 Some(SearchWorker {
                     shutdown,
                     handle: Mutex::new(Some(handle)),

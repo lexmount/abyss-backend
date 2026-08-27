@@ -13,9 +13,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{config::SearchConfig, error::AppError};
+use crate::{
+    config::SearchConfig,
+    error::AppError,
+    search::{HIGHLIGHT_END, HIGHLIGHT_START, ValidatedSearchQuery},
+};
 
-use super::{HIGHLIGHT_END, HIGHLIGHT_START, ValidatedSearchQuery, document::SearchDocument};
+use super::document::SearchDocument;
 
 /// Fixed name of the derived usage-event index.
 pub const SEARCH_INDEX: &str = "abyss_usage_events";

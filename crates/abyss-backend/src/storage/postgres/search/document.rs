@@ -8,15 +8,15 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::db::models::UsageEvent;
+use crate::{
+    db::models::UsageEvent,
+    search::projection::{SearchProjection, sanitize_search_text},
+};
 
 #[cfg(test)]
-use super::projection::MAX_CONTENT_CHARACTERS;
-use super::projection::{SearchProjection, sanitize_search_text};
-#[cfg(test)]
-use super::{HIGHLIGHT_END, HIGHLIGHT_START};
+use crate::search::{HIGHLIGHT_END, HIGHLIGHT_START, projection::MAX_CONTENT_CHARACTERS};
 
-/// Elasticsearch representation of one immutable usage event.
+/// Full-text search document for one immutable usage event.
 #[derive(Serialize)]
 pub struct SearchDocument {
     /// Source usage-event primary key and Elasticsearch document identifier.
