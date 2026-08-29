@@ -21,8 +21,9 @@ Exactly one storage profile is compiled into a binary:
 - `postgres-es` uses PostgreSQL as the source of truth and optionally projects
   search documents to Elasticsearch. It is the default profile.
 - `sqlite-fts` stores both authoritative data and its transactional FTS5 index
-  in one local SQLite file. It does not compile Diesel, PostgreSQL, reqwest, or
-  Elasticsearch worker code into the binary.
+  in one local SQLite file through Diesel, with FTS5 operations expressed as
+  SQL. It does not compile PostgreSQL, reqwest, or Elasticsearch worker code
+  into the binary.
 
 ## Authentication
 
@@ -118,6 +119,20 @@ Elasticsearch settings exist only in `postgres-es` builds. Username and
 password must be provided together. Search remains disabled in that profile
 when no URL is configured; event storage and queries continue to work. The
 `sqlite-fts` profile always provides search through the local FTS5 index.
+
+## Native releases
+
+Version tags publish checksummed `sqlite-fts` executables on the repository's
+GitHub Release. The current native targets are:
+
+- `aarch64-apple-darwin` for macOS ARM64.
+- `x86_64-unknown-linux-musl` for Linux x86_64.
+
+Each filename contains the tag and Rust target, for example
+`abyss-backend-v1.0.0-aarch64-apple-darwin`. `SHA256SUMS` in the same release
+authenticates the downloaded bytes. These artifacts are consumed by
+`abyss deploy-local`; they do not require Docker, PostgreSQL, Elasticsearch, or
+a Rust toolchain on the destination machine.
 
 ## Containers and Kubernetes
 

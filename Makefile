@@ -12,6 +12,7 @@ clippy:
 test:
 	cargo test --locked --workspace
 	cargo test --locked --no-default-features --features sqlite-fts --workspace
+	python3 scripts/tests/test_native_release_contract.py
 
 test-blackbox: test-blackbox-postgres test-blackbox-sqlite
 
