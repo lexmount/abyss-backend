@@ -92,6 +92,69 @@ jobs:
       - name: Render Kubernetes manifests
         run: kubectl kustomize k8s > /tmp/abyss-backend.yaml
 
+  native:
+    name: Native SQLite+FTS binary (${{ matrix.target }})
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build SQLite+FTS backend
+        run: |
+          cargo build \
+            --locked \
+            --release \
+            --package abyss-backend \
+            --no-default-features \
+            --features sqlite-fts \
+            --target "${{ matrix.target }}"
+
+      - name: Stage native binary
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "v${version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "release tag must use the v<version> form" >&2
+            exit 1
+          fi
+          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [[ "${version}" != "${cargo_version}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match Cargo version ${cargo_version}" >&2
+            exit 1
+          fi
+          asset="abyss-backend-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/abyss-backend" "dist/${asset}"
+          chmod 0755 "dist/${asset}"
+          file "dist/${asset}"
+
+      - name: Upload native binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: abyss-backend-${{ matrix.target }}
+          path: dist/abyss-backend-*
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish Docker Hub image
     if: github.event_name == 'push'
@@ -159,3 +222,44 @@ jobs:
               echo "- \`${image_tag}\`"
             done <<< "${IMAGE_TAGS}"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+  release-native:
+    name: Publish native GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - native
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download native binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: abyss-backend-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum abyss-backend-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create \
+              "${GITHUB_REF_NAME}" \
+              dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "abyss-backend ${GITHUB_REF_NAME}"
+          fi
