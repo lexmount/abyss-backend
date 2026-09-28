@@ -11,6 +11,7 @@ pub mod attachments;
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
+pub mod trajectory;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -411,11 +412,85 @@ pub struct UsageEventResponse {
 
 #[derive(Debug, Serialize)]
 /// Session metadata and its ordered turn timelines.
-pub struct SessionTimelineResponse {
+///
+/// `E` is the per-event representation: complete events for the full
+/// timeline, or [`UsageEventOutline`] for the content-free outline.
+pub struct SessionTimelineResponse<E = UsageEventResponse> {
     /// Authoritative session information.
     pub session: SessionInfo,
     /// Turns ordered by normalized turn index.
-    pub turns: Vec<TurnTimeline>,
+    pub turns: Vec<TurnTimeline<E>>,
+}
+
+/// Session timeline whose events omit text and metadata bodies.
+pub type SessionOutlineResponse = SessionTimelineResponse<UsageEventOutline>;
+
+/// Maximum number of characters returned in an outline event preview.
+pub const OUTLINE_PREVIEW_CHARS: i64 = 200;
+
+#[derive(Debug, Serialize)]
+/// Content-free representation of one event, sized independently of its text.
+///
+/// Full content is loaded separately by event primary key.
+pub struct UsageEventOutline {
+    /// Backend-generated event primary key.
+    pub id: Uuid,
+    /// Collector-generated idempotency key.
+    pub event_id: String,
+    /// Owning turn, used only to group events.
+    #[serde(skip)]
+    pub turn_pk: Uuid,
+    /// Backend-normalized turn number.
+    pub turn_index: i32,
+    /// Canonical LLM provider slug.
+    pub llm_provider: String,
+    /// Provider-specific model identifier.
+    pub llm_model: String,
+    /// Canonical request or response value.
+    pub event_type: String,
+    /// Normalized input-token count.
+    pub input_tokens: i64,
+    /// Normalized output-token count.
+    pub output_tokens: i64,
+    /// Normalized cache-read-token count.
+    pub cache_read_tokens: i64,
+    /// Normalized cache-write-token count.
+    pub cache_write_tokens: i64,
+    /// Normalized reasoning-token count.
+    pub reasoning_tokens: i64,
+    /// Provider-reported or derived total-token count.
+    pub total_tokens: i64,
+    /// Whether the collector estimated token usage.
+    pub token_usage_estimated: bool,
+    /// Collector observation timestamp.
+    pub observed_at: DateTime<Utc>,
+    /// Text length in characters; zero when text is absent.
+    pub text_chars: i64,
+    /// Up to [`OUTLINE_PREVIEW_CHARS`] characters of text: the tail of a
+    /// request, where the newest prompt is, or the head of a response.
+    pub preview: Option<String>,
+    /// Number of image attachments on the event.
+    pub attachment_count: i64,
+    /// Provider response-chain identifiers needed by timeline ordering.
+    #[serde(skip)]
+    pub ordering_metadata: Value,
+}
+
+impl UsageEventOutline {
+    /// Builds the minimal metadata object consumed by timeline ordering.
+    pub fn ordering_metadata(
+        response_id: Option<String>,
+        previous_response_id: Option<String>,
+    ) -> Value {
+        let mut metadata = serde_json::Map::new();
+        if let Some(value) = response_id {
+            metadata.insert("response_id".to_owned(), Value::String(value));
+        }
+        if let Some(value) = previous_response_id {
+            metadata.insert("previous_response_id".to_owned(), Value::String(value));
+        }
+        Value::Object(metadata)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -462,7 +537,7 @@ pub fn session_metadata_from_event(metadata: &Value) -> Value {
 
 #[derive(Debug, Serialize)]
 /// One normalized turn and its deterministically ordered events.
-pub struct TurnTimeline {
+pub struct TurnTimeline<E = UsageEventResponse> {
     /// Backend turn primary key.
     pub turn_pk: Uuid,
     /// Backend-normalized turn number.
@@ -472,7 +547,7 @@ pub struct TurnTimeline {
     /// Latest event observation time in the turn.
     pub ended_at: Option<DateTime<Utc>>,
     /// Request and response events in authoritative timeline order.
-    pub events: Vec<UsageEventResponse>,
+    pub events: Vec<E>,
 }
 
 /// Returns the JSON object used when optional metadata is absent.

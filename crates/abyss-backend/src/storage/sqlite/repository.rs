@@ -4,8 +4,11 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use diesel::{
-    ExpressionMethods, QueryDsl, RunQueryDsl, SelectableHelper, SqliteConnection, dsl::max,
-    result::OptionalExtension, sql_query, sql_types::Text,
+    ExpressionMethods, QueryDsl, RunQueryDsl, SelectableHelper, SqliteConnection,
+    dsl::{count_star, max, sql},
+    result::OptionalExtension,
+    sql_query,
+    sql_types::{BigInt, Bool, Nullable, Text},
 };
 use uuid::Uuid;
 
@@ -13,9 +16,10 @@ use crate::{
     error::AppError,
     search::projection::SearchProjection,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
-        RawEventsResponse, SessionInfo, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        SummaryRow, TurnTimeline, UsageEventResponse,
+        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, OUTLINE_PREVIEW_CHARS,
+        RawEventsQuery, RawEventsResponse, SessionInfo, SessionOutlineResponse,
+        SessionTimelineResponse, SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline,
+        UsageEventOutline, UsageEventResponse,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -35,8 +39,8 @@ use crate::{
 use super::{
     models::{
         AttachmentRow, DeviceRecord, DeviceRow, EventRecord, EventRow, NewAttachment, NewDevice,
-        NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewTurn, SessionRow,
-        TurnRow, parse_uuid,
+        NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewTurn,
+        SessionRecord, SessionRow, TurnRecord, TurnRow, parse_uuid, timestamp_from_micros,
     },
     schema::{
         agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
@@ -616,22 +620,7 @@ pub(super) fn session_timeline(
     user_id: Uuid,
     session_pk: Uuid,
 ) -> Result<SessionTimelineResponse, AppError> {
-    let session = agent_sessions::table
-        .filter(agent_sessions::id.eq(session_pk.to_string()))
-        .filter(agent_sessions::user_id.eq(user_id.to_string()))
-        .select(SessionRow::as_select())
-        .first::<SessionRow>(connection)
-        .optional()?
-        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?
-        .into_record()?;
-    let turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session.id.to_string()))
-        .order_by(agent_turns::turn_index.asc())
-        .select(TurnRow::as_select())
-        .load::<TurnRow>(connection)?
-        .into_iter()
-        .map(TurnRow::into_record)
-        .collect::<Result<Vec<_>, _>>()?;
+    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
     let mut events = llm_usage_events::table
         .filter(llm_usage_events::session_pk.eq(session.id.to_string()))
         .order_by((
@@ -660,6 +649,184 @@ pub(super) fn session_timeline(
                 attachments.remove(&event_pk).unwrap_or_default(),
             ));
     }
+    Ok(assemble_timeline(session, turns, events_by_turn))
+}
+
+type OutlineRow = (
+    String,
+    String,
+    String,
+    i32,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    bool,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
+pub(super) fn session_outline(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<SessionOutlineResponse, AppError> {
+    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
+    // Only fixed-size columns and SQL-computed summaries are selected, so the
+    // outline stays small no matter how large event text or metadata grows.
+    let rows = llm_usage_events::table
+        .filter(llm_usage_events::session_pk.eq(session.id.to_string()))
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::event_id,
+            llm_usage_events::turn_pk,
+            llm_usage_events::turn_index,
+            llm_usage_events::llm_provider,
+            llm_usage_events::llm_model,
+            llm_usage_events::event_type,
+            llm_usage_events::input_tokens,
+            llm_usage_events::output_tokens,
+            llm_usage_events::cache_read_tokens,
+            llm_usage_events::cache_write_tokens,
+            llm_usage_events::reasoning_tokens,
+            llm_usage_events::total_tokens,
+            sql::<Bool>("json_type(metadata, '$.token_usage_estimated') IS 'true'"),
+            llm_usage_events::observed_at,
+            sql::<BigInt>("coalesce(length(text), 0)"),
+            sql::<Nullable<Text>>(&format!(
+                "CASE WHEN event_type = 'request' THEN substr(text, -{OUTLINE_PREVIEW_CHARS}) \
+                 ELSE substr(text, 1, {OUTLINE_PREVIEW_CHARS}) END"
+            )),
+            sql::<Nullable<Text>>(
+                "CASE WHEN json_type(metadata, '$.response_id') = 'text' \
+                 THEN json_extract(metadata, '$.response_id') END",
+            ),
+            sql::<Nullable<Text>>(
+                "CASE WHEN json_type(metadata, '$.previous_response_id') = 'text' \
+                 THEN json_extract(metadata, '$.previous_response_id') END",
+            ),
+            // SQLite text functions stop at the first NUL character, so the
+            // length and preview above are wrong for text containing NUL.
+            sql::<Bool>("coalesce(instr(CAST(text AS BLOB), x'00') > 0, 0)"),
+        ))
+        .load::<OutlineRow>(connection)?;
+    let nul_text_ids = rows
+        .iter()
+        .filter(|row| row.19)
+        .map(|row| row.0.clone())
+        .collect::<Vec<_>>();
+    let nul_texts = if nul_text_ids.is_empty() {
+        HashMap::new()
+    } else {
+        llm_usage_events::table
+            .filter(llm_usage_events::id.eq_any(nul_text_ids))
+            .select((llm_usage_events::id, llm_usage_events::text))
+            .load::<(String, Option<String>)>(connection)?
+            .into_iter()
+            .filter_map(|(id, text)| text.map(|text| (id, text)))
+            .collect::<HashMap<_, _>>()
+    };
+    let event_ids = rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>();
+    let attachment_counts = llm_usage_event_attachments::table
+        .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
+        .group_by(llm_usage_event_attachments::event_pk)
+        .select((llm_usage_event_attachments::event_pk, count_star()))
+        .load::<(String, i64)>(connection)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let mut events = rows
+        .into_iter()
+        .map(|mut row| {
+            let attachment_count = attachment_counts.get(&row.0).copied().unwrap_or(0);
+            if let Some(text) = nul_texts.get(&row.0) {
+                (row.15, row.16) = text_outline(text, &row.6)?;
+            }
+            Ok(UsageEventOutline {
+                id: parse_uuid(&row.0, "event id")?,
+                event_id: row.1,
+                turn_pk: parse_uuid(&row.2, "event turn id")?,
+                turn_index: row.3,
+                llm_provider: row.4,
+                llm_model: row.5,
+                event_type: row.6,
+                input_tokens: row.7,
+                output_tokens: row.8,
+                cache_read_tokens: row.9,
+                cache_write_tokens: row.10,
+                reasoning_tokens: row.11,
+                total_tokens: row.12,
+                token_usage_estimated: row.13,
+                observed_at: timestamp_from_micros(row.14)?,
+                text_chars: row.15,
+                preview: row.16,
+                attachment_count,
+                ordering_metadata: UsageEventOutline::ordering_metadata(row.17, row.18),
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    UsageEventTimelineOrder::sort(&mut events);
+    let mut events_by_turn: HashMap<Uuid, Vec<UsageEventOutline>> = HashMap::new();
+    for event in events {
+        events_by_turn.entry(event.turn_pk).or_default().push(event);
+    }
+    Ok(assemble_timeline(session, turns, events_by_turn))
+}
+
+/// Computes the outline length and preview in Rust for text SQLite cannot measure.
+fn text_outline(text: &str, event_type: &str) -> Result<(i64, Option<String>), AppError> {
+    let chars = text.chars().count();
+    let preview_chars = usize::try_from(OUTLINE_PREVIEW_CHARS)
+        .map_err(|error| AppError::internal(format!("invalid outline preview size: {error}")))?;
+    let preview = if event_type == "request" {
+        text.chars()
+            .skip(chars.saturating_sub(preview_chars))
+            .collect()
+    } else {
+        text.chars().take(preview_chars).collect()
+    };
+    let chars = i64::try_from(chars)
+        .map_err(|error| AppError::internal(format!("invalid event text length: {error}")))?;
+    Ok((chars, Some(preview)))
+}
+
+fn load_session_turns(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<(SessionRecord, Vec<TurnRecord>), AppError> {
+    let session = agent_sessions::table
+        .filter(agent_sessions::id.eq(session_pk.to_string()))
+        .filter(agent_sessions::user_id.eq(user_id.to_string()))
+        .select(SessionRow::as_select())
+        .first::<SessionRow>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?
+        .into_record()?;
+    let turns = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session.id.to_string()))
+        .order_by(agent_turns::turn_index.asc())
+        .select(TurnRow::as_select())
+        .load::<TurnRow>(connection)?
+        .into_iter()
+        .map(TurnRow::into_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((session, turns))
+}
+
+fn assemble_timeline<E>(
+    session: SessionRecord,
+    turns: Vec<TurnRecord>,
+    mut events_by_turn: HashMap<Uuid, Vec<E>>,
+) -> SessionTimelineResponse<E> {
     let turn_timelines = turns
         .into_iter()
         .map(|turn| TurnTimeline {
@@ -670,7 +837,7 @@ pub(super) fn session_timeline(
             events: events_by_turn.remove(&turn.id).unwrap_or_default(),
         })
         .collect();
-    Ok(SessionTimelineResponse {
+    SessionTimelineResponse {
         session: SessionInfo {
             session_pk: session.id,
             user_id: session.user_id,
@@ -683,7 +850,33 @@ pub(super) fn session_timeline(
             metadata: session.metadata,
         },
         turns: turn_timelines,
-    })
+    }
+}
+
+pub(super) fn usage_event(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+) -> Result<UsageEventResponse, AppError> {
+    let event = llm_usage_events::table
+        .filter(llm_usage_events::id.eq(event_pk.to_string()))
+        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
+        .select(EventRow::as_select())
+        .first::<EventRow>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("usage event not found: {event_pk}")))?
+        .into_record()?;
+    let events = [event];
+    let devices = load_device_contexts(connection, &events)?;
+    let mut attachments = load_attachments(connection, &events)?;
+    let [event] = events;
+    let event_pk = event.id;
+    let device_id = event.device_context_id;
+    Ok(event_response(
+        event,
+        devices.get(&device_id),
+        attachments.remove(&event_pk).unwrap_or_default(),
+    ))
 }
 
 pub(super) fn image_attachment(
@@ -1108,7 +1301,7 @@ mod tests {
 
     use super::{
         super::{migrations, schema::llm_usage_events, search},
-        ingest_events,
+        ingest_events, session_outline,
     };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -1192,6 +1385,29 @@ mod tests {
             .expect("FTS table should be queryable")
             .count;
         assert_eq!(fts_count, 0);
+    }
+
+    #[test]
+    fn outline_measures_text_containing_nul_characters() {
+        let mut database = database();
+        let text = format!("ab\0{}", "c".repeat(300));
+        ingest_events(&mut database, &request_with_text(&text), OWNER_ID, 100)
+            .expect("ingest should succeed");
+        let session_pk = llm_usage_events::table
+            .select(llm_usage_events::session_pk)
+            .first::<String>(&mut database)
+            .expect("event should exist");
+        let session_pk = Uuid::parse_str(&session_pk).expect("session pk should be a UUID");
+
+        let outline =
+            session_outline(&mut database, OWNER_ID, session_pk).expect("outline should load");
+
+        let event = &outline.turns[0].events[0];
+        assert_eq!(event.text_chars, 303);
+        assert_eq!(
+            event.preview.as_deref(),
+            Some(format!("ab\0{}", "c".repeat(197)).as_str())
+        );
     }
 
     fn request_with_text(text: &str) -> IngestEventsRequest {

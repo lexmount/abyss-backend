@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use diesel::{
     Connection, ExpressionMethods, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
-    dsl::{max, sql},
+    dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
     sql_types::{
@@ -35,9 +35,10 @@ use crate::{
     },
     error::AppError,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
-        RawEventsResponse, SessionInfo, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        SummaryRow, TurnTimeline, UsageEventResponse,
+        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, OUTLINE_PREVIEW_CHARS,
+        RawEventsQuery, RawEventsResponse, SessionInfo, SessionOutlineResponse,
+        SessionTimelineResponse, SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline,
+        UsageEventOutline, UsageEventResponse,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -347,20 +348,7 @@ pub fn session_timeline(
     user_id: Uuid,
     session_pk: Uuid,
 ) -> Result<SessionTimelineResponse, AppError> {
-    // Timeline views include prompt/response text, so they are always limited
-    // to the owner.
-    let session = agent_sessions::table
-        .filter(agent_sessions::id.eq(session_pk))
-        .filter(agent_sessions::user_id.eq(user_id))
-        .first::<AgentSession>(connection)
-        .optional()?
-        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
-    touch_session_metadata(&session);
-
-    let turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session.id))
-        .order(agent_turns::turn_index.asc())
-        .load::<AgentTurn>(connection)?;
+    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
 
     let mut events = llm_usage_events::table
         .filter(llm_usage_events::session_pk.eq(session.id))
@@ -386,7 +374,140 @@ pub fn session_timeline(
                 attachments_by_event.remove(&event_pk).unwrap_or_default(),
             ));
     }
+    Ok(assemble_timeline(session, turns, events_by_turn))
+}
 
+type OutlineRow = (
+    Uuid,
+    String,
+    Uuid,
+    i32,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    bool,
+    DateTime<Utc>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Loads one owner-scoped session timeline without event content bodies.
+pub fn session_outline(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<SessionOutlineResponse, AppError> {
+    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
+    // Only fixed-size columns and SQL-computed summaries are selected, so the
+    // outline stays small no matter how large event text or metadata grows.
+    let rows = llm_usage_events::table
+        .filter(llm_usage_events::session_pk.eq(session.id))
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::event_id,
+            llm_usage_events::turn_pk,
+            llm_usage_events::turn_index,
+            llm_usage_events::llm_provider,
+            llm_usage_events::llm_model,
+            llm_usage_events::event_type,
+            llm_usage_events::input_tokens,
+            llm_usage_events::output_tokens,
+            llm_usage_events::cache_read_tokens,
+            llm_usage_events::cache_write_tokens,
+            llm_usage_events::reasoning_tokens,
+            llm_usage_events::total_tokens,
+            sql::<Bool>("coalesce(metadata -> 'token_usage_estimated' = 'true'::jsonb, false)"),
+            llm_usage_events::observed_at,
+            sql::<BigInt>("coalesce(char_length(text), 0)::bigint"),
+            sql::<Nullable<Text>>(&format!(
+                "CASE WHEN event_type = 'request' THEN right(text, {OUTLINE_PREVIEW_CHARS}) \
+                 ELSE left(text, {OUTLINE_PREVIEW_CHARS}) END"
+            )),
+            sql::<Nullable<Text>>(
+                "CASE WHEN jsonb_typeof(metadata -> 'response_id') = 'string' \
+                 THEN metadata ->> 'response_id' END",
+            ),
+            sql::<Nullable<Text>>(
+                "CASE WHEN jsonb_typeof(metadata -> 'previous_response_id') = 'string' \
+                 THEN metadata ->> 'previous_response_id' END",
+            ),
+        ))
+        .load::<OutlineRow>(connection)?;
+    let event_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+    let attachment_counts = llm_usage_event_attachments::table
+        .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
+        .group_by(llm_usage_event_attachments::event_pk)
+        .select((llm_usage_event_attachments::event_pk, count_star()))
+        .load::<(Uuid, i64)>(connection)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let mut events = rows
+        .into_iter()
+        .map(|row| UsageEventOutline {
+            id: row.0,
+            event_id: row.1,
+            turn_pk: row.2,
+            turn_index: row.3,
+            llm_provider: row.4,
+            llm_model: row.5,
+            event_type: row.6,
+            input_tokens: row.7,
+            output_tokens: row.8,
+            cache_read_tokens: row.9,
+            cache_write_tokens: row.10,
+            reasoning_tokens: row.11,
+            total_tokens: row.12,
+            token_usage_estimated: row.13,
+            observed_at: row.14,
+            text_chars: row.15,
+            preview: row.16,
+            attachment_count: attachment_counts.get(&row.0).copied().unwrap_or(0),
+            ordering_metadata: UsageEventOutline::ordering_metadata(row.17, row.18),
+        })
+        .collect::<Vec<_>>();
+    UsageEventTimelineOrder::sort(&mut events);
+    let mut events_by_turn: HashMap<Uuid, Vec<UsageEventOutline>> = HashMap::new();
+    for event in events {
+        events_by_turn.entry(event.turn_pk).or_default().push(event);
+    }
+    Ok(assemble_timeline(session, turns, events_by_turn))
+}
+
+fn load_session_turns(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<(AgentSession, Vec<AgentTurn>), AppError> {
+    // Timeline views include prompt/response text, so they are always limited
+    // to the owner.
+    let session = agent_sessions::table
+        .filter(agent_sessions::id.eq(session_pk))
+        .filter(agent_sessions::user_id.eq(user_id))
+        .first::<AgentSession>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
+    touch_session_metadata(&session);
+
+    let turns = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session.id))
+        .order(agent_turns::turn_index.asc())
+        .load::<AgentTurn>(connection)?;
+    Ok((session, turns))
+}
+
+fn assemble_timeline<E>(
+    session: AgentSession,
+    turns: Vec<AgentTurn>,
+    mut events_by_turn: HashMap<Uuid, Vec<E>>,
+) -> SessionTimelineResponse<E> {
     let turn_timelines = turns
         .into_iter()
         .map(|turn| {
@@ -401,7 +522,7 @@ pub fn session_timeline(
         })
         .collect();
 
-    Ok(SessionTimelineResponse {
+    SessionTimelineResponse {
         session: SessionInfo {
             session_pk: session.id,
             user_id: session.user_id,
@@ -414,7 +535,7 @@ pub fn session_timeline(
             metadata: session.metadata,
         },
         turns: turn_timelines,
-    })
+    }
 }
 
 /// Returns one newest-first page of raw owner-scoped events.
@@ -472,6 +593,33 @@ pub fn raw_events(
             .collect(),
         next_page_token: has_next_page.then(|| offset.saturating_add(page_size).to_string()),
     })
+}
+
+/// Loads one owner-scoped event with the same shape used by timelines.
+pub fn usage_event(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+) -> Result<UsageEventResponse, AppError> {
+    // Event content can contain sensitive conversation context. Keep this
+    // endpoint scoped to the deployment owner.
+    let event = llm_usage_events::table
+        .filter(llm_usage_events::id.eq(event_pk))
+        .filter(llm_usage_events::user_id.eq(user_id))
+        .first::<UsageEvent>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("usage event not found: {event_pk}")))?;
+    let events = [event];
+    let device_contexts = load_device_contexts_for_events(connection, &events)?;
+    let mut attachments_by_event = load_attachments_for_events(connection, &events)?;
+    let [event] = events;
+    let event_pk = event.id;
+    let device_context_id = event.device_context_id;
+    Ok(event_response(
+        event,
+        device_contexts.get(&device_context_id),
+        attachments_by_event.remove(&event_pk).unwrap_or_default(),
+    ))
 }
 
 /// Loads authorized attachment bytes and verifies persisted size metadata.

@@ -44,6 +44,28 @@ impl TimelineEvent for crate::db::models::UsageEvent {
     }
 }
 
+impl TimelineEvent for super::UsageEventOutline {
+    fn turn_index(&self) -> i32 {
+        self.turn_index
+    }
+
+    fn metadata(&self) -> &serde_json::Value {
+        &self.ordering_metadata
+    }
+
+    fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    fn event_id(&self) -> &str {
+        &self.event_id
+    }
+}
+
 /// Applies the authoritative event order used by owned and shared timelines.
 pub struct UsageEventTimelineOrder;
 

@@ -17,7 +17,8 @@ use crate::{
     storage::{BoxedFuture, StorageBackend},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionTimelineResponse, SummaryQuery, SummaryResponse, attachments::StoredImageAttachment,
+        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
+        UsageEventResponse, attachments::StoredImageAttachment,
     },
 };
 
@@ -97,6 +98,17 @@ impl StorageBackend for SqliteFtsBackend {
         })
     }
 
+    fn usage_event(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| repository::usage_event(connection, user_id, event_pk))
+                .await
+        })
+    }
+
     fn usage_summary(
         &self,
         user_id: Uuid,
@@ -119,6 +131,19 @@ impl StorageBackend for SqliteFtsBackend {
         Box::pin(async move {
             self.run_db(move |connection| {
                 repository::session_timeline(connection, user_id, session_pk)
+            })
+            .await
+        })
+    }
+
+    fn session_outline(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::session_outline(connection, user_id, session_pk)
             })
             .await
         })

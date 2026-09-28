@@ -23,7 +23,9 @@ use crate::{
     storage::StorageBackend,
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionTimelineResponse, SummaryFields, SummaryQuery, TokenUsageSummaryResponse,
+        SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
+        TokenUsageSummaryResponse, UsageEventResponse,
+        trajectory::{self, SessionTrajectoryResponse},
     },
 };
 
@@ -61,6 +63,7 @@ pub fn router(state: AppState) -> Router {
                 .get(raw_events)
                 .layer(DefaultBodyLimit::max(MAX_INGEST_REQUEST_BODY_BYTES)),
         )
+        .route("/v1/agent-usage/events/{event_pk}", get(usage_event))
         .route(
             "/v1/agent-usage/attachments/{attachment_id}",
             get(image_attachment),
@@ -70,6 +73,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/agent-usage/sessions/{session_pk}",
             get(session_timeline),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/outline",
+            get(session_outline),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/trajectory",
+            get(session_trajectory),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -150,6 +161,36 @@ async fn session_timeline(
     let user_id = state.identity.authenticate(&headers)?;
     let response = state.storage.session_timeline(user_id, session_pk).await?;
     Ok(Json(response))
+}
+
+async fn session_outline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionOutlineResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state.storage.session_outline(user_id, session_pk).await?,
+    ))
+}
+
+async fn session_trajectory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionTrajectoryResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let timeline = state.storage.session_timeline(user_id, session_pk).await?;
+    Ok(Json(trajectory::build(timeline)))
+}
+
+async fn usage_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(event_pk): Path<Uuid>,
+) -> Result<Json<UsageEventResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(state.storage.usage_event(user_id, event_pk).await?))
 }
 
 async fn image_attachment(

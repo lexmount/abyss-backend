@@ -20,7 +20,8 @@ use crate::{
     search::{SessionSearchQuery, SessionSearchResponse},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionTimelineResponse, SummaryQuery, SummaryResponse, attachments::StoredImageAttachment,
+        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
+        UsageEventResponse, attachments::StoredImageAttachment,
     },
 };
 
@@ -48,6 +49,13 @@ pub trait StorageBackend: Send + Sync {
         default_page_size: i64,
     ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>>;
 
+    /// Loads one owner-scoped request or response event with its full content.
+    fn usage_event(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>>;
+
     /// Aggregates owner-scoped event and token usage.
     fn usage_summary(
         &self,
@@ -62,6 +70,13 @@ pub trait StorageBackend: Send + Sync {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>>;
+
+    /// Loads one owner-scoped session timeline without event content bodies.
+    fn session_outline(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>>;
 
     /// Loads authorized image bytes by attachment identifier.
     fn image_attachment(

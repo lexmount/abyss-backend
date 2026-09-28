@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -270,6 +271,82 @@ def run(base_url: str, token: str, run_id: str) -> None:
         == [request_event_id, response_event_id],
         "session timeline must preserve request-before-response ordering",
     )
+
+    outline = request(
+        base_url,
+        "GET",
+        f"/v1/agent-usage/sessions/{session_pk}/outline",
+        token=token,
+    )
+    require_status(outline, 200, "session outline")
+    outline_body = outline.json()
+    require(
+        outline_body["session"] == timeline.json()["session"],
+        "session outline must return the timeline session information",
+    )
+    outline_events = [
+        item for turn in outline_body["turns"] for item in turn["events"]
+    ]
+    require(
+        [item["id"] for item in outline_events]
+        == [item["id"] for item in timeline_events],
+        "session outline must preserve the timeline event order",
+    )
+    for outline_event, timeline_event in zip(outline_events, timeline_events):
+        require(
+            "text" not in outline_event and "metadata" not in outline_event,
+            "session outline events must omit content bodies",
+        )
+        for field in ("event_type", "llm_model", "total_tokens", "observed_at"):
+            require(
+                outline_event[field] == timeline_event[field],
+                f"session outline {field} must match the timeline event",
+            )
+        require(
+            outline_event["text_chars"] == len(timeline_event["text"] or ""),
+            "session outline text length must count characters",
+        )
+        require(
+            outline_event["attachment_count"] == len(timeline_event["attachments"]),
+            "session outline must count event attachments",
+        )
+    missing_outline = request(
+        base_url,
+        "GET",
+        f"/v1/agent-usage/sessions/{uuid.uuid4()}/outline",
+        token=token,
+    )
+    require_status(missing_outline, 404, "unknown session outline")
+
+    for timeline_event in timeline_events:
+        single = request(
+            base_url,
+            "GET",
+            f"/v1/agent-usage/events/{timeline_event['id']}",
+            token=token,
+        )
+        require_status(single, 200, "single event query")
+        require(
+            single.json() == timeline_event,
+            "single event query must match the timeline event exactly",
+        )
+        require(
+            IMAGE_BASE64.encode() not in single.body,
+            "single event responses must not expose attachment content",
+        )
+    missing_event = request(
+        base_url,
+        "GET",
+        f"/v1/agent-usage/events/{uuid.uuid4()}",
+        token=token,
+    )
+    require_status(missing_event, 404, "unknown single event query")
+    unauthenticated_event = request(
+        base_url,
+        "GET",
+        f"/v1/agent-usage/events/{timeline_events[0]['id']}",
+    )
+    require_status(unauthenticated_event, 401, "unauthenticated single event query")
 
     search_path = "/v1/agent-usage/search?" + urllib.parse.urlencode(
         {"q": "blackbox response", "agent_name": "codex"}
