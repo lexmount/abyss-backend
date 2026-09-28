@@ -67,11 +67,7 @@ pub fn validate_event(event: &IngestUsageEvent) -> Result<(), AppError> {
     if tokens.total == 0 {
         return Ok(());
     }
-    let visible_tokens = tokens
-        .input
-        .saturating_add(tokens.output)
-        .saturating_add(tokens.reasoning);
-    if tokens.total < visible_tokens {
+    if tokens.total < tokens.component_total() {
         tracing::debug!(
             event_id = %event.event_id,
             "provider total_tokens is lower than visible token components"
@@ -96,31 +92,41 @@ pub struct NormalizedTokens {
     pub total: i64,
 }
 
+impl NormalizedTokens {
+    /// Sum of the disjoint input, cache read, cache write, and output counters.
+    ///
+    /// Reasoning is a breakdown of output and is never added again.
+    pub const fn component_total(&self) -> i64 {
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.output)
+    }
+}
+
 pub fn normalized_tokens(event: &IngestUsageEvent) -> Result<NormalizedTokens, AppError> {
     let input = normalize_token(event.token_usage.input_tokens, "input_tokens")?;
     let output = normalize_token(event.token_usage.output_tokens, "output_tokens")?;
     let cache_read = normalize_token(event.token_usage.cache_read_tokens, "cache_read_tokens")?;
     let cache_write = normalize_token(event.token_usage.cache_write_tokens, "cache_write_tokens")?;
     let reasoning = normalize_token(event.token_usage.reasoning_tokens, "reasoning_tokens")?;
-    // Preserve an explicit provider total because provider accounting may not
-    // equal the visible component sum; derive only when the field is absent.
-    let total = match event.token_usage.total_tokens {
-        Some(value) => normalize_token(Some(value), "total_tokens")?,
-        None => input
-            .saturating_add(output)
-            .saturating_add(cache_read)
-            .saturating_add(cache_write)
-            .saturating_add(reasoning),
-    };
-
-    Ok(NormalizedTokens {
+    let explicit_total = event
+        .token_usage
+        .total_tokens
+        .map(|value| normalize_token(Some(value), "total_tokens"))
+        .transpose()?;
+    let mut tokens = NormalizedTokens {
         input,
         output,
         cache_read,
         cache_write,
         reasoning,
-        total,
-    })
+        total: 0,
+    };
+    // Preserve an explicit producer total; derive it from the disjoint
+    // counters only when the field is absent.
+    tokens.total = explicit_total.unwrap_or_else(|| tokens.component_total());
+    Ok(tokens)
 }
 
 fn normalize_token(value: Option<i64>, field: &str) -> Result<i64, AppError> {
