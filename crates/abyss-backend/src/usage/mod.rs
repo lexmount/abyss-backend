@@ -118,18 +118,22 @@ impl UsageEventType {
     clippy::struct_field_names,
     reason = "Public JSON token usage fields intentionally include the token suffix."
 )]
+/// Token counters reported by the event producer.
+///
+/// Input, cache read, cache write, and output counters are disjoint;
+/// reasoning is a breakdown of output.
 pub struct TokenUsagePayload {
-    /// Input tokens reported by the provider.
+    /// Input tokens neither read from nor written into a provider cache.
     pub input_tokens: Option<i64>,
-    /// Output tokens reported by the provider.
+    /// Output tokens, including reasoning.
     pub output_tokens: Option<i64>,
-    /// Tokens served from a provider cache.
+    /// Input tokens served from a provider cache.
     pub cache_read_tokens: Option<i64>,
-    /// Tokens written to a provider cache.
+    /// Input tokens written to a provider cache.
     pub cache_write_tokens: Option<i64>,
-    /// Provider-reported reasoning tokens.
+    /// Part of output tokens spent on reasoning.
     pub reasoning_tokens: Option<i64>,
-    /// Provider total, or a derived sum when omitted.
+    /// Sum of the four disjoint counters, derived when omitted.
     pub total_tokens: Option<i64>,
 }
 
@@ -183,7 +187,7 @@ pub struct SummaryQuery {
 pub enum SummaryFields {
     /// Return dimensions, event counts, and every token counter.
     Full,
-    /// Return only day, input-token, and total-token fields.
+    /// Return only the day and disjoint token counters used by charts.
     TokenUsage,
 }
 
@@ -298,9 +302,15 @@ pub struct TokenUsageSummaryRow {
     /// UTC calendar day when day grouping was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub day: Option<String>,
-    /// Summed input tokens.
+    /// Summed input tokens that were neither read from nor written to a cache.
     pub input_tokens: i64,
-    /// Summed provider or derived total tokens.
+    /// Summed output tokens, including reasoning.
+    pub output_tokens: i64,
+    /// Summed input tokens read from a provider cache.
+    pub cache_read_tokens: i64,
+    /// Summed input tokens written into a provider cache.
+    pub cache_write_tokens: i64,
+    /// Summed total of the four disjoint counters.
     pub total_tokens: i64,
 }
 
@@ -309,6 +319,9 @@ impl From<SummaryRow> for TokenUsageSummaryRow {
         Self {
             day: row.day,
             input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cache_read_tokens: row.cache_read_tokens,
+            cache_write_tokens: row.cache_write_tokens,
             total_tokens: row.total_tokens,
         }
     }
@@ -668,6 +681,9 @@ mod tests {
                     {
                         "day": "2026-07-01",
                         "input_tokens": 123_i64,
+                        "output_tokens": 456_i64,
+                        "cache_read_tokens": 11_i64,
+                        "cache_write_tokens": 12_i64,
                         "total_tokens": 615_i64
                     }
                 ],
