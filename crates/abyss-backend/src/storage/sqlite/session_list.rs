@@ -19,7 +19,8 @@ use super::{
 /// Per-session activity with the filters that apply before paging.
 ///
 /// Bind order: `?1` owner, `?2`/`?3` agent filter flag and JSON name list,
-/// `?4`/`?5` lower activity bound, `?6`/`?7` upper start bound.
+/// `?4`/`?5` lower activity bound, `?6`/`?7` upper start bound, `?8`/`?9`
+/// provider and `?10`/`?11` model a session must have used.
 const ACTIVITY_CTE: &str = "\
     WITH activity AS ( \
         SELECT \
@@ -40,6 +41,12 @@ const ACTIVITY_CTE: &str = "\
         LEFT JOIN llm_usage_events e ON e.session_pk = s.id \
         WHERE s.user_id = ?1 \
             AND (?2 = 0 OR s.agent_name IN (SELECT value FROM json_each(?3))) \
+            AND (?8 = 0 OR EXISTS ( \
+                SELECT 1 FROM llm_usage_events p \
+                WHERE p.session_pk = s.id AND p.llm_provider = ?9)) \
+            AND (?10 = 0 OR EXISTS ( \
+                SELECT 1 FROM llm_usage_events m \
+                WHERE m.session_pk = s.id AND m.llm_model = ?11)) \
         GROUP BY s.id \
     ), \
     filtered AS ( \
@@ -92,6 +99,8 @@ pub(super) fn list_sessions(
     let has_agents = !query.agent_names.is_empty();
     let from = query.from.map_or(0, timestamp_to_micros);
     let to = query.to.map_or(0, timestamp_to_micros);
+    let provider = query.llm_provider.as_deref().unwrap_or_default();
+    let model = query.llm_model.as_deref().unwrap_or_default();
 
     let total = sql_query(format!(
         "{ACTIVITY_CTE} SELECT COUNT(*) AS total FROM filtered"
@@ -103,12 +112,16 @@ pub(super) fn list_sessions(
     .bind::<BigInt, _>(from)
     .bind::<Bool, _>(query.to.is_some())
     .bind::<BigInt, _>(to)
+    .bind::<Bool, _>(query.llm_provider.is_some())
+    .bind::<Text, _>(provider)
+    .bind::<Bool, _>(query.llm_model.is_some())
+    .bind::<Text, _>(model)
     .get_result::<CountRow>(connection)?
     .total;
 
     let rows = sql_query(format!(
         "{ACTIVITY_CTE} SELECT * FROM filtered \
-         ORDER BY last_activity_at DESC, session_pk DESC LIMIT ?8 OFFSET ?9"
+         ORDER BY last_activity_at DESC, session_pk DESC LIMIT ?12 OFFSET ?13"
     ))
     .bind::<Text, _>(user_id.to_string())
     .bind::<Bool, _>(has_agents)
@@ -117,6 +130,10 @@ pub(super) fn list_sessions(
     .bind::<BigInt, _>(from)
     .bind::<Bool, _>(query.to.is_some())
     .bind::<BigInt, _>(to)
+    .bind::<Bool, _>(query.llm_provider.is_some())
+    .bind::<Text, _>(provider)
+    .bind::<Bool, _>(query.llm_model.is_some())
+    .bind::<Text, _>(model)
     .bind::<BigInt, _>(i64::from(query.page_size))
     .bind::<BigInt, _>(query.offset)
     .load::<SessionListRow>(connection)?;
@@ -163,6 +180,17 @@ mod tests {
     }
 
     fn event(id: &str, session: &str, agent: &str, observed_at: &str, turn: i32) -> Value {
+        event_with_model(id, session, agent, observed_at, turn, "gpt-5")
+    }
+
+    fn event_with_model(
+        id: &str,
+        session: &str,
+        agent: &str,
+        observed_at: &str,
+        turn: i32,
+        model: &str,
+    ) -> Value {
         json!({
             "event_id": id,
             "observed_at": observed_at,
@@ -170,7 +198,7 @@ mod tests {
             "agent": {"name": agent},
             "session_id": session,
             "turn_index": turn,
-            "llm": {"provider": "OpenAI", "model": "gpt-5"},
+            "llm": {"provider": "OpenAI", "model": model},
             "event_type": "response",
             "text": "reply",
             "token_usage": {"output_tokens": 10},
@@ -183,7 +211,7 @@ mod tests {
         let request: IngestEventsRequest = serde_json::from_value(json!({
             "events": [
                 event("a1", "alpha", "Codex", "2026-09-01T00:00:00Z", 1),
-                event("a2", "alpha", "Codex", "2026-09-03T00:00:00Z", 2),
+                event_with_model("a2", "alpha", "Codex", "2026-09-03T00:00:00Z", 2, "gpt-5-mini"),
                 event("b1", "beta", "claude-desktop", "2026-09-02T00:00:00Z", 1),
                 event("c1", "gamma", "Codex", "2026-08-01T00:00:00Z", 1),
             ]
@@ -247,6 +275,32 @@ mod tests {
             .map(|row| row.0)
             .collect();
         assert_eq!(ids, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn filters_by_a_model_or_provider_the_session_used() {
+        let mut database = seeded();
+        let mini = SessionListQuery {
+            llm_model: Some("gpt-5-mini".to_owned()),
+            ..SessionListQuery::default()
+        };
+        let ids: Vec<_> = list(&mut database, mini)
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(ids, ["alpha"]);
+
+        let openai = SessionListQuery {
+            llm_provider: Some("OpenAI".to_owned()),
+            ..SessionListQuery::default()
+        };
+        assert_eq!(list(&mut database, openai).len(), 3);
+
+        let other = SessionListQuery {
+            llm_provider: Some("anthropic".to_owned()),
+            ..SessionListQuery::default()
+        };
+        assert!(list(&mut database, other).is_empty());
     }
 
     #[test]

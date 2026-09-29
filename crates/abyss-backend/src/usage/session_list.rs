@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    usage::persistence::{agent_name_filter_values, normalized_optional},
+    usage::persistence::{agent_name_filter_values, normalize_slug, normalized_optional},
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
@@ -21,6 +21,10 @@ pub struct SessionListQuery {
     pub to: Option<DateTime<Utc>>,
     /// Agent-name filter; Claude aliases match together.
     pub agent_name: Option<String>,
+    /// Keeps sessions with at least one event from this LLM provider.
+    pub llm_provider: Option<String>,
+    /// Keeps sessions with at least one event from this LLM model.
+    pub llm_model: Option<String>,
     /// 1-based page number.
     pub page: Option<u32>,
     /// Sessions per page, at most 100.
@@ -34,6 +38,10 @@ pub struct ValidatedSessionListQuery {
     pub to: Option<DateTime<Utc>>,
     /// Stored agent names to match, or empty for every Agent.
     pub agent_names: Vec<String>,
+    /// Normalized provider slug a session must have used.
+    pub llm_provider: Option<String>,
+    /// Exact model a session must have used.
+    pub llm_model: Option<String>,
     pub page: u32,
     pub page_size: u32,
     pub offset: i64,
@@ -65,6 +73,9 @@ impl SessionListQuery {
             agent_names: normalized_optional(self.agent_name.as_deref())
                 .map(|value| agent_name_filter_values(&value))
                 .unwrap_or_default(),
+            llm_provider: normalized_optional(self.llm_provider.as_deref())
+                .map(|value| normalize_slug(&value)),
+            llm_model: normalized_optional(self.llm_model.as_deref()),
             page,
             page_size,
             offset,
@@ -148,6 +159,26 @@ mod tests {
             query.agent_names,
             ["claude-code", "claude", "claude-desktop"]
         );
+    }
+
+    #[test]
+    fn normalizes_provider_and_keeps_the_model_verbatim() {
+        let query = SessionListQuery {
+            llm_provider: Some(" OpenAI ".to_owned()),
+            llm_model: Some(" gpt-5 ".to_owned()),
+            ..SessionListQuery::default()
+        }
+        .validate()
+        .expect("valid");
+        assert_eq!(query.llm_provider.as_deref(), Some("openai"));
+        assert_eq!(query.llm_model.as_deref(), Some("gpt-5"));
+        let blank = SessionListQuery {
+            llm_model: Some("  ".to_owned()),
+            ..SessionListQuery::default()
+        }
+        .validate()
+        .expect("valid");
+        assert!(blank.llm_model.is_none());
     }
 
     #[test]
