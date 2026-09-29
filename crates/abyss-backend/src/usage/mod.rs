@@ -11,6 +11,8 @@ pub mod attachments;
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
+/// Owner-scoped session index contracts.
+pub mod session_list;
 pub mod trajectory;
 
 use chrono::{DateTime, Utc};

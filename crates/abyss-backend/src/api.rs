@@ -25,6 +25,7 @@ use crate::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
         TokenUsageSummaryResponse, UsageEventResponse,
+        session_list::{SessionListQuery, SessionListResponse},
         trajectory::{self, SessionTrajectoryResponse},
     },
 };
@@ -70,6 +71,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/agent-usage/summary", get(usage_summary))
         .route("/v1/agent-usage/search", get(session_search))
+        .route("/v1/agent-usage/sessions", get(list_sessions))
         .route(
             "/v1/agent-usage/sessions/{session_pk}",
             get(session_timeline),
@@ -151,6 +153,16 @@ async fn session_search(
 ) -> Result<Json<SessionSearchResponse>, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
     Ok(Json(state.storage.session_search(user_id, query).await?))
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionListQuery>,
+) -> Result<Json<SessionListResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let query = query.validate()?;
+    Ok(Json(state.storage.list_sessions(user_id, query).await?))
 }
 
 async fn session_timeline(

@@ -6,6 +6,7 @@ mod models;
 mod repository;
 mod schema;
 mod search;
+mod session_list;
 
 use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
 use uuid::Uuid;
@@ -18,7 +19,9 @@ use crate::{
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        UsageEventResponse, attachments::StoredImageAttachment,
+        UsageEventResponse,
+        attachments::StoredImageAttachment,
+        session_list::{SessionListResponse, ValidatedSessionListQuery},
     },
 };
 
@@ -146,6 +149,17 @@ impl StorageBackend for SqliteFtsBackend {
                 repository::session_outline(connection, user_id, session_pk)
             })
             .await
+        })
+    }
+
+    fn list_sessions(
+        &self,
+        user_id: Uuid,
+        query: ValidatedSessionListQuery,
+    ) -> BoxedFuture<'_, Result<SessionListResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| session_list::list_sessions(connection, user_id, &query))
+                .await
         })
     }
 

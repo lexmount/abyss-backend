@@ -21,7 +21,9 @@ use crate::{
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        UsageEventResponse, attachments::StoredImageAttachment,
+        UsageEventResponse,
+        attachments::StoredImageAttachment,
+        session_list::{SessionListResponse, ValidatedSessionListQuery},
     },
 };
 
@@ -77,6 +79,13 @@ pub trait StorageBackend: Send + Sync {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>>;
+
+    /// Lists one page of owner-scoped sessions, most recently active first.
+    fn list_sessions(
+        &self,
+        user_id: Uuid,
+        query: ValidatedSessionListQuery,
+    ) -> BoxedFuture<'_, Result<SessionListResponse, AppError>>;
 
     /// Loads authorized image bytes by attachment identifier.
     fn image_attachment(
