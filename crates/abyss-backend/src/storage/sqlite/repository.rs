@@ -1442,6 +1442,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn raw_body_archive_survives_ingest_retries_and_trajectory_projection() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use sha2::Digest as _;
+        let original =
+            b" {\"input\":[{\"role\":\"user\",\"content\":\"hello\"}],\"unknown\": [1,1]} \r\n";
+        let mut database = database();
+        let mut request = request_with_text("hello");
+        request.events[0].event_type = crate::usage::UsageEventType::Request;
+        request.events[0].metadata["raw_body"] = json!({"transport":"http", "parts":[{
+            "content_base64": STANDARD.encode(original), "byte_size": original.len(), "truncated": false,
+            "sha256": hex::encode(sha2::Sha256::digest(original))
+        }]});
+        let expected = request.events[0].metadata.clone();
+        ingest_events(&mut database, &request, OWNER_ID, 100).unwrap();
+        ingest_events(&mut database, &request, OWNER_ID, 100).unwrap();
+        let session_pk = llm_usage_events::table
+            .select(llm_usage_events::session_pk)
+            .first::<String>(&mut database)
+            .unwrap();
+        let session_pk = Uuid::parse_str(&session_pk).unwrap();
+        let timeline = super::session_timeline(&mut database, OWNER_ID, session_pk).unwrap();
+        let stored = &timeline.turns[0].events[0].metadata;
+        assert_eq!(*stored, expected);
+        assert_eq!(
+            STANDARD
+                .decode(
+                    stored["raw_body"]["parts"][0]["content_base64"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            original
+        );
+        let trajectory = crate::usage::trajectory::build(timeline);
+        assert_eq!(trajectory.items[0].text.as_deref(), Some("hello"));
+        let after = super::session_timeline(&mut database, OWNER_ID, session_pk).unwrap();
+        assert_eq!(after.turns[0].events.len(), 1);
+        assert_eq!(after.turns[0].events[0].metadata, expected);
+    }
+
     fn request_with_text(text: &str) -> IngestEventsRequest {
         serde_json::from_value(json!({
             "events": [{

@@ -5,6 +5,10 @@
 //! new request paragraphs, first-seen tool results, and response text and tool
 //! calls, with each tool call paired to its result by call identifier.
 
+mod raw_body;
+
+use raw_body::RawProjection;
+
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -157,6 +161,7 @@ pub fn build(timeline: SessionTimelineResponse) -> SessionTrajectoryResponse {
 
 #[derive(Default)]
 struct Merger {
+    raw: RawProjection,
     items: Vec<TrajectoryItem>,
     seen_paragraphs: HashSet<u64>,
     seen_results: HashSet<String>,
@@ -176,6 +181,21 @@ impl Merger {
     fn request(&mut self, event: &UsageEventResponse) {
         self.pending_compaction = None;
         let first_new = self.items.len();
+        if let Some(context) = RawProjection::context(event) {
+            let key = paragraph_key(0, &context);
+            let next = self.streams.len();
+            self.current_stream = *self.streams.entry(key).or_insert(next);
+        }
+        if let Some(items) = self.raw.project(event, self.current_stream) {
+            self.items.extend(items);
+        } else {
+            self.legacy_request_text(event);
+        }
+        self.mark_compaction(first_new);
+        self.request_tools(event);
+    }
+
+    fn legacy_request_text(&mut self, event: &UsageEventResponse) {
         let text = event.text.as_deref().unwrap_or_default();
         let paragraphs = text.split(PARAGRAPH_SEPARATOR).collect::<Vec<_>>();
         let first = paragraphs.first().copied().unwrap_or_default();
@@ -224,8 +244,10 @@ impl Merger {
         }
         self.last_paragraphs
             .insert(stream, paragraphs.into_iter().map(str::to_owned).collect());
+    }
 
-        self.mark_compaction(first_new);
+    fn request_tools(&mut self, event: &UsageEventResponse) {
+        let stream = self.current_stream;
 
         for segment in content_segments(&event.metadata) {
             if segment_str(segment, "type") != Some("tool_result") {
@@ -317,6 +339,7 @@ impl Merger {
 
     fn response(&mut self, event: &UsageEventResponse) {
         let stream = self.current_stream;
+        let projected = self.raw.project(event, stream);
         if let Some(index) = self.pending_compaction.take() {
             // The response to the compaction prompt is the handoff summary.
             if let Some(summary) = event.text.as_deref().map(str::trim)
@@ -327,6 +350,8 @@ impl Merger {
                 item.output_event_pk = Some(event.id);
                 self.summaries.push(summary.to_owned());
             }
+        } else if let Some(items) = projected {
+            self.items.extend(items);
         } else if let Some(text) = event.text.as_deref().filter(|text| !text.trim().is_empty()) {
             let mut item = TrajectoryItem::new(TrajectoryItemKind::Assistant, stream, event);
             item.text = Some(text.to_owned());
@@ -481,6 +506,143 @@ mod tests {
     #[test]
     fn common_prefix_stops_on_character_boundaries() {
         assert_eq!(common_prefix_len("中文a", "中字b"), 3);
+    }
+
+    fn raw_event(side: &str, body: &str) -> UsageEventResponse {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        event(
+            side,
+            "legacy fallback",
+            json!({"raw_body": {"transport": "http", "parts": [{
+                "content_base64": STANDARD.encode(body.as_bytes()), "truncated": false,
+                "byte_size": body.len(), "content_type": "application/json"
+            }]}}),
+        )
+    }
+
+    #[test]
+    fn raw_archive_projection_keeps_roles_and_repeated_user_occurrences() {
+        let first = r#" {"instructions":"system instructions","input":[{"role":"user","content":"继续"}],"unknown":[1,1]} "#;
+        let response = r#"{"output":[{"id":"a1","role":"assistant","content":[{"type":"output_text","text":"working"}]}]}"#;
+        let replay = r#"{"instructions":"system instructions","input":[{"role":"user","content":"继续"},{"id":"a1","role":"assistant","content":[{"type":"output_text","text":"working"}]},{"role":"user","content":"继续"}]}"#;
+        let events = vec![
+            raw_event("request", first),
+            raw_event("response", response),
+            raw_event("request", replay),
+            raw_event("request", replay),
+        ];
+        let metadata_before = events
+            .iter()
+            .map(|e| e.metadata.clone())
+            .collect::<Vec<_>>();
+        let mut merger = Merger::default();
+        for e in &events {
+            if e.event_type == "request" {
+                merger.request(e);
+            } else {
+                merger.response(e);
+            }
+        }
+        assert_eq!(
+            merger.items.iter().map(|i| i.kind).collect::<Vec<_>>(),
+            [
+                TrajectoryItemKind::Context,
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Assistant,
+                TrajectoryItemKind::User
+            ]
+        );
+        assert_eq!(merger.items[1].text.as_deref(), Some("继续"));
+        assert_eq!(merger.items[3].text.as_deref(), Some("继续"));
+        assert_eq!(
+            metadata_before,
+            events
+                .iter()
+                .map(|e| e.metadata.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn streamed_anthropic_response_is_not_replayed_as_user_input() {
+        let response = "event: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\r\n\r\n";
+        let items = build(timeline(vec![
+            raw_event("request", r#"{"system":"instructions","messages":[{"role":"user","content":"hello"}]}"#),
+            raw_event("response", response),
+            raw_event("request", r#"{"system":"instructions","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"hello"}]}"#),
+        ])).items;
+        assert_eq!(
+            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
+            [
+                TrajectoryItemKind::Context,
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Assistant,
+                TrajectoryItemKind::User
+            ]
+        );
+        assert_eq!(items[2].text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn incremental_requests_keep_identical_new_user_messages() {
+        let items = build(timeline(vec![
+            raw_event(
+                "request",
+                r#"{"instructions":"instructions","input":[{"role":"user","content":"continue"}]}"#,
+            ),
+            raw_event("response", r#"{"output_text":"working"}"#),
+            raw_event(
+                "request",
+                r#"{"previous_response_id":"r1","input":[{"role":"user","content":"continue"}]}"#,
+            ),
+        ]))
+        .items;
+        assert_eq!(
+            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
+            [
+                TrajectoryItemKind::Context,
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Assistant,
+                TrajectoryItemKind::User
+            ]
+        );
+        assert!(items.iter().all(|i| i.stream == 0));
+    }
+
+    #[test]
+    fn raw_anthropic_request_retains_system_and_assistant_roles() {
+        let body = r#"{"system":[{"type":"text","text":"instructions"}],"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":[{"type":"text","text":"hi"}]},{"role":"user","content":"hello"}]}"#;
+        let items = build(timeline(vec![
+            raw_event("request", body),
+            raw_event("request", body),
+        ]))
+        .items;
+        assert_eq!(
+            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
+            [
+                TrajectoryItemKind::Context,
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Assistant,
+                TrajectoryItemKind::User
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_compaction_keeps_existing_summary_presentation() {
+        let request = json!({"input": [{"role": "user", "content": "write report"}, {"role": "user", "content": PROMPT}]}).to_string();
+        let replay = json!({"input": [{"role": "user", "content": "write report"}, {"role": "user", "content": handoff()}]}).to_string();
+        let items = build(timeline(vec![
+            raw_event("request", &request),
+            event("response", SUMMARY, json!({})),
+            raw_event("request", &replay),
+        ]))
+        .items;
+        assert_eq!(
+            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
+            [TrajectoryItemKind::User, TrajectoryItemKind::Compaction]
+        );
+        assert_eq!(items[1].output.as_deref(), Some(SUMMARY));
     }
 
     const PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a \

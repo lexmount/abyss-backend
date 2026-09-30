@@ -30,7 +30,7 @@ use crate::{
     },
 };
 
-const MAX_INGEST_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INGEST_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 /// Cloneable dependencies and request limits shared by all Axum handlers.

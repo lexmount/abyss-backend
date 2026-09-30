@@ -1,0 +1,351 @@
+//! Read-only projection of archived provider bodies; the archive is never edited.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde_json::Value;
+
+use super::{TrajectoryItem, TrajectoryItemKind, UsageEventResponse};
+
+#[derive(Clone)]
+struct Message {
+    id: Option<String>,
+    role: String,
+    text: String,
+}
+
+impl Message {
+    fn matches(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.text == other.text
+            && match (&self.id, &other.id) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
+    }
+
+    fn kind(&self) -> TrajectoryItemKind {
+        match self.role.as_str() {
+            "system" | "developer" => TrajectoryItemKind::Context,
+            "user" => TrajectoryItemKind::User,
+            _ => TrajectoryItemKind::Assistant,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RawProjection {
+    streams: HashMap<usize, StreamHistory>,
+}
+
+#[derive(Default)]
+struct StreamHistory {
+    history: Vec<Message>,
+    contexts: HashSet<(String, String)>,
+}
+
+impl RawProjection {
+    pub(super) fn context(event: &UsageEventResponse) -> Option<String> {
+        let values = bodies(event)?;
+        let payload = request_payload(&values)?;
+        if payload
+            .get("previous_response_id")
+            .is_some_and(Value::is_string)
+            && payload.get("instructions").is_none()
+            && payload.get("system").is_none()
+        {
+            return None;
+        }
+        Some(
+            request_messages(payload)
+                .into_iter()
+                .filter(|m| m.kind() == TrajectoryItemKind::Context)
+                .map(|m| format!("{}: {}", m.role, m.text))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    }
+
+    pub(super) fn project(
+        &mut self,
+        event: &UsageEventResponse,
+        stream: usize,
+    ) -> Option<Vec<TrajectoryItem>> {
+        let values = bodies(event)?;
+        let request = event.event_type == "request";
+        let (messages, incremental) = if request {
+            let payload = request_payload(&values)?;
+            (
+                request_messages(payload),
+                payload
+                    .get("previous_response_id")
+                    .is_some_and(Value::is_string),
+            )
+        } else {
+            let mut messages = response_messages(&values);
+            if messages.is_empty()
+                && let Some(text) = event.text.as_ref().filter(|v| !v.is_empty())
+            {
+                messages.push(Message {
+                    id: None,
+                    role: "assistant".to_owned(),
+                    text: text.clone(),
+                });
+            }
+            (messages, false)
+        };
+        // Incomplete/unrecognized response formats still have the older parsed
+        // text projection. Archival success must not depend on this parser.
+        if !request && messages.is_empty() {
+            return None;
+        }
+        let state = self.streams.entry(stream).or_default();
+        let mut cursor = 0;
+        let mut next = Vec::new();
+        let mut added = Vec::new();
+        for message in messages {
+            let context = message.kind() == TrajectoryItemKind::Context;
+            let known = if context {
+                !state
+                    .contexts
+                    .insert((message.role.clone(), message.text.clone()))
+            } else if request && !incremental {
+                let found = state.history[cursor..]
+                    .iter()
+                    .position(|old| old.matches(&message));
+                if let Some(offset) = found {
+                    cursor = cursor.saturating_add(offset).saturating_add(1);
+                }
+                found.is_some()
+            } else if request {
+                state.history.iter().any(|old| {
+                    old.matches(&message) && (message.id.is_some() || message.role != "user")
+                })
+            } else {
+                false
+            };
+            if !context {
+                if request && !incremental {
+                    next.push(message.clone());
+                } else if !known {
+                    state.history.push(message.clone());
+                }
+            }
+            if !known && !message.text.is_empty() {
+                let mut item = TrajectoryItem::new(message.kind(), stream, event);
+                item.text = Some(message.text);
+                added.push(item);
+            }
+        }
+        if request && !incremental {
+            state.history = next;
+        }
+        Some(added)
+    }
+}
+
+fn request_payload(values: &[Value]) -> Option<&Value> {
+    values
+        .iter()
+        .map(|v| v.get("response").unwrap_or(v))
+        .find(|v| v.get("input").is_some() || v.get("messages").is_some())
+}
+
+/// Decode bytes only for projection. The original base64, whitespace, unknown
+/// fields, and SSE events remain untouched in event metadata.
+fn bodies(event: &UsageEventResponse) -> Option<Vec<Value>> {
+    let parts = event.metadata.get("raw_body")?.get("parts")?.as_array()?;
+    let mut values = Vec::new();
+    for part in parts {
+        if part.get("truncated").and_then(Value::as_bool) != Some(false)
+            || part
+                .get("content_encoding")
+                .and_then(Value::as_str)
+                .is_some_and(|v| v != "identity")
+        {
+            return None;
+        }
+        let bytes = STANDARD
+            .decode(part.get("content_base64")?.as_str()?)
+            .ok()?;
+        if let Ok(value) = serde_json::from_slice(&bytes) {
+            values.push(value);
+        } else {
+            let text = std::str::from_utf8(&bytes).ok()?;
+            let mut data = String::new();
+            for line in text.lines().chain(std::iter::once("")) {
+                if line.is_empty() {
+                    if let Ok(value) = serde_json::from_str(&data) {
+                        values.push(value);
+                    }
+                    data.clear();
+                } else if let Some(line) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(line.strip_prefix(' ').unwrap_or(line));
+                }
+            }
+        }
+    }
+    Some(values)
+}
+
+fn request_messages(payload: &Value) -> Vec<Message> {
+    let mut result = Vec::new();
+    for (key, role) in [("instructions", "developer"), ("system", "system")] {
+        if let Some(value) = payload.get(key) {
+            result.push(Message {
+                id: None,
+                role: role.to_owned(),
+                text: text(value),
+            });
+        }
+    }
+    if let Some(input) = payload.get("input").or_else(|| payload.get("messages")) {
+        if let Some(items) = input.as_array() {
+            result.extend(items.iter().filter_map(|v| message(v, "user")));
+        } else {
+            result.extend(message(input, "user"));
+        }
+    }
+    result
+}
+
+fn message(value: &Value, default_role: &str) -> Option<Message> {
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or(default_role);
+    if role == "tool" || tool(kind) {
+        return None;
+    }
+    let (role, content) = if kind == "reasoning" {
+        ("reasoning", value.get("summary")?)
+    } else {
+        (role, value.get("content").unwrap_or(value))
+    };
+    Some(Message {
+        id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+        role: role.to_owned(),
+        text: text(content),
+    })
+}
+
+fn text(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(text)
+            .filter(|v| !v.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(obj) => {
+            let kind = obj.get("type").and_then(Value::as_str).unwrap_or_default();
+            if tool(kind) {
+                return String::new();
+            }
+            obj.get("text")
+                .or_else(|| obj.get("content"))
+                .or_else(|| obj.get("thinking"))
+                .or_else(|| obj.get("output_text"))
+                .map(text)
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+fn tool(kind: &str) -> bool {
+    matches!(kind, "tool_use" | "tool_result" | "tool_call")
+        || kind.ends_with("_call")
+        || kind.ends_with("_call_output")
+}
+
+fn response_messages(values: &[Value]) -> Vec<Message> {
+    let mut items = BTreeMap::new();
+    let mut anthropic_blocks = BTreeMap::<u64, String>::new();
+    let mut chat_text = String::new();
+    for value in values {
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+        if kind == "content_block_start" {
+            if let Some(block) = value.get("content_block") {
+                anthropic_blocks.insert(index, text(block));
+            }
+        } else if kind == "content_block_delta"
+            && let Some(delta) = value.get("delta")
+        {
+            anthropic_blocks
+                .entry(index)
+                .or_default()
+                .push_str(&text(delta));
+        }
+        if let Some(delta) = value
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
+            chat_text.push_str(delta);
+        }
+        let response = value.get("response").unwrap_or(value);
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            for (index, value) in output.iter().enumerate() {
+                if let Some(message) = message(value, "assistant") {
+                    items.insert(u64::try_from(index).unwrap_or(u64::MAX), message);
+                }
+            }
+        } else if value.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
+            if let Some(message) = value.get("item").and_then(|v| message(v, "assistant")) {
+                items.insert(
+                    value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    message,
+                );
+            }
+        } else if let Some(message) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|v| v.first())
+            .and_then(|v| v.get("message"))
+            .and_then(|v| message(v, "assistant"))
+        {
+            items.insert(0, message);
+        } else if (value.get("content").is_some() || value.get("output_text").is_some())
+            && let Some(message) = message(value, "assistant")
+        {
+            items.insert(0, message);
+        }
+    }
+    if items.is_empty() {
+        let text = if anthropic_blocks.is_empty() {
+            chat_text
+        } else {
+            anthropic_blocks
+                .into_values()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if !text.is_empty() {
+            items.insert(
+                0,
+                Message {
+                    id: None,
+                    role: "assistant".to_owned(),
+                    text,
+                },
+            );
+        }
+    }
+    items.into_values().collect()
+}
