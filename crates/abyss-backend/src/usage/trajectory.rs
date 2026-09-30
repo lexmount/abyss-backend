@@ -2,7 +2,7 @@
 //!
 //! Collectors record each provider request verbatim, so every request repeats
 //! the conversation so far. The trajectory keeps only what each event adds:
-//! new request paragraphs, first-seen tool results, and response text and tool
+//! role-aware messages, first-seen tool results, and response text and tool
 //! calls, with each tool call paired to its result by call identifier.
 
 mod raw_body;
@@ -23,10 +23,6 @@ use super::{SessionInfo, SessionTimelineResponse, UsageEventResponse};
 
 /// Collectors join request fragments with this separator.
 const PARAGRAPH_SEPARATOR: &str = "\n\n";
-/// Collectors prefix the system prompt fragment with this marker.
-const SYSTEM_PREFIX: &str = "system: ";
-/// Shared prefix length above which a changed paragraph counts as grown.
-const GROWN_PARAGRAPH_MIN_PREFIX_BYTES: usize = 200;
 /// Codex opens the request that asks the model for a context handoff summary
 /// with this prompt when it compacts its context.
 const COMPACTION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION.";
@@ -48,9 +44,11 @@ pub struct SessionTrajectoryResponse {
 #[serde(rename_all = "snake_case")]
 /// Kind of one trajectory item.
 pub enum TrajectoryItemKind {
-    /// First request content of a stream, starting with its system prompt.
+    /// Request content whose message role is unavailable.
+    Request,
+    /// Explicit system or developer message.
     Context,
-    /// Request paragraphs not seen earlier in the session.
+    /// Explicit user message not seen earlier in the session.
     User,
     /// Response text.
     Assistant,
@@ -163,10 +161,8 @@ pub fn build(timeline: SessionTimelineResponse) -> SessionTrajectoryResponse {
 struct Merger {
     raw: RawProjection,
     items: Vec<TrajectoryItem>,
-    seen_paragraphs: HashSet<u64>,
     seen_results: HashSet<String>,
     streams: HashMap<u64, usize>,
-    last_paragraphs: HashMap<usize, Vec<String>>,
     /// Tool call item index by call identifier.
     calls: HashMap<String, usize>,
     /// Stream of the most recent request; responses belong to it.
@@ -182,68 +178,26 @@ impl Merger {
         self.pending_compaction = None;
         let first_new = self.items.len();
         if let Some(context) = RawProjection::context(event) {
-            let key = paragraph_key(0, &context);
+            let key = hash_str(&context);
             let next = self.streams.len();
             self.current_stream = *self.streams.entry(key).or_insert(next);
         }
         if let Some(items) = self.raw.project(event, self.current_stream) {
             self.items.extend(items);
         } else {
-            self.legacy_request_text(event);
+            self.unclassified_request(event);
         }
         self.mark_compaction(first_new);
         self.request_tools(event);
     }
 
-    fn legacy_request_text(&mut self, event: &UsageEventResponse) {
-        let text = event.text.as_deref().unwrap_or_default();
-        let paragraphs = text.split(PARAGRAPH_SEPARATOR).collect::<Vec<_>>();
-        let first = paragraphs.first().copied().unwrap_or_default();
-        let stream_key = if first.starts_with(SYSTEM_PREFIX) {
-            paragraph_key(0, first)
-        } else {
-            0
-        };
-        let next_stream = self.streams.len();
-        let stream = *self.streams.entry(stream_key).or_insert(next_stream);
-        self.current_stream = stream;
-
-        let previous = self.last_paragraphs.remove(&stream).unwrap_or_default();
-        let mut added = Vec::new();
-        let mut continued = false;
-        for (index, paragraph) in paragraphs.iter().enumerate() {
-            if paragraph.trim().is_empty()
-                || !self.seen_paragraphs.insert(paragraph_key(index, paragraph))
-            {
-                continue;
-            }
-            // A paragraph that grew since the stream's previous request, such
-            // as an embedded transcript, contributes only its new tail.
-            let shared = previous
-                .iter()
-                .map(|earlier| common_prefix_len(paragraph, earlier))
-                .max()
-                .unwrap_or(0);
-            if shared >= GROWN_PARAGRAPH_MIN_PREFIX_BYTES {
-                added.push(&paragraph[shared..]);
-                continued = true;
-            } else {
-                added.push(paragraph);
-            }
-        }
-        if !added.is_empty() {
-            let kind = if added[0].starts_with(SYSTEM_PREFIX) {
-                TrajectoryItemKind::Context
-            } else {
-                TrajectoryItemKind::User
-            };
-            let mut item = TrajectoryItem::new(kind, stream, event);
-            item.text = Some(added.join(PARAGRAPH_SEPARATOR));
-            item.continued = continued;
+    fn unclassified_request(&mut self, event: &UsageEventResponse) {
+        if let Some(text) = event.text.as_ref().filter(|text| !text.is_empty()) {
+            let mut item =
+                TrajectoryItem::new(TrajectoryItemKind::Request, self.current_stream, event);
+            item.text = Some(text.clone());
             self.items.push(item);
         }
-        self.last_paragraphs
-            .insert(stream, paragraphs.into_iter().map(str::to_owned).collect());
     }
 
     fn request_tools(&mut self, event: &UsageEventResponse) {
@@ -385,32 +339,10 @@ fn paragraph_start(text: &str, marker: &str) -> Option<usize> {
     )
 }
 
-/// Identity of a request paragraph. The system fragment's first line carries
-/// per-request noise, such as a billing header, so it is excluded.
-fn paragraph_key(index: usize, paragraph: &str) -> u64 {
-    if index == 0 && paragraph.starts_with(SYSTEM_PREFIX) {
-        return hash_str(paragraph.split_once('\n').map_or("", |(_, rest)| rest));
-    }
-    hash_str(paragraph)
-}
-
 fn hash_str(value: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
-}
-
-/// Length in bytes of the shared prefix, ending on a character boundary.
-fn common_prefix_len(left: &str, right: &str) -> usize {
-    let mut len = left
-        .bytes()
-        .zip(right.bytes())
-        .take_while(|(a, b)| a == b)
-        .count();
-    while !left.is_char_boundary(len) {
-        len = len.saturating_sub(1);
-    }
-    len
 }
 
 fn content_segments(metadata: &Value) -> &[Value] {
@@ -432,7 +364,7 @@ mod tests {
     use crate::usage::TurnTimeline;
 
     #[test]
-    fn keeps_only_new_content_and_pairs_tool_results() {
+    fn unclassified_requests_keep_every_observation_and_pair_tool_results() {
         let system = "system: header cch=1\nYou are an agent.";
         let events = vec![
             event("request", &format!("{system}\n\nfirst prompt"), json!({})),
@@ -466,19 +398,23 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                TrajectoryItemKind::Context,
+                TrajectoryItemKind::Request,
                 TrajectoryItemKind::ToolCall,
+                TrajectoryItemKind::Request,
                 TrajectoryItemKind::Assistant,
-                TrajectoryItemKind::User,
+                TrajectoryItemKind::Request,
             ]
         );
         assert_eq!(items[1].output.as_deref(), Some("README.md"));
-        assert_eq!(items[3].text.as_deref(), Some("second prompt"));
+        assert_eq!(
+            items[4].text.as_deref(),
+            Some("system: header cch=3\nYou are an agent.\n\nfirst prompt\n\nsecond prompt")
+        );
         assert!(items.iter().all(|item| item.stream == 0));
     }
 
     #[test]
-    fn grown_paragraphs_keep_their_tail_and_side_requests_form_streams() {
+    fn unclassified_requests_are_not_split_trimmed_or_grouped_by_text() {
         let transcript = "x".repeat(300);
         let events = vec![
             event("request", "system: main\nMain agent.\n\nhello", json!({})),
@@ -497,15 +433,46 @@ mod tests {
         let items = build(timeline(events)).items;
 
         assert_eq!(items.len(), 3);
-        assert_eq!(items[1].stream, 1);
-        assert_eq!(items[2].stream, 1);
-        assert_eq!(items[2].text.as_deref(), Some(" more"));
-        assert!(items[2].continued);
+        assert!(
+            items
+                .iter()
+                .all(|i| i.kind == TrajectoryItemKind::Request && !i.continued)
+        );
+        assert_eq!(
+            items[2].text,
+            Some(format!(
+                "system: classifier\nJudge.\n\n<transcript>{transcript} more"
+            ))
+        );
+    }
+
+    fn user_request(texts: &[&str]) -> UsageEventResponse {
+        raw_event("request", &json!({"input": texts.iter().map(|text| json!({"role":"user", "content":text})).collect::<Vec<_>>()}).to_string())
     }
 
     #[test]
-    fn common_prefix_stops_on_character_boundaries() {
-        assert_eq!(common_prefix_len("中文a", "中字b"), 3);
+    fn unavailable_roles_never_become_system_or_user_by_text_guessing() {
+        let text = "system: instructions\n\n用户内容\n\n用户内容";
+        for metadata in [
+            json!({}),
+            json!({"raw_body":{"parts":[{"truncated":true}]}}),
+            json!({"raw_body":{"parts":[{"truncated":false,"content_base64":"invalid"}]}}),
+        ] {
+            let items = build(timeline(vec![event("request", text, metadata)])).items;
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].kind, TrajectoryItemKind::Request);
+            assert_eq!(items[0].text.as_deref(), Some(text));
+            assert!(!items[0].continued);
+        }
+        let items = build(timeline(vec![raw_event("request", r#"{"input":[{"content":"system: unknown"},{"role":"unrecognized","content":"hello"},{"role":"user","content":"system: quoted text"}]}"#)])).items;
+        assert_eq!(
+            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
+            [
+                TrajectoryItemKind::Request,
+                TrajectoryItemKind::Request,
+                TrajectoryItemKind::User
+            ]
+        );
     }
 
     fn raw_event(side: &str, body: &str) -> UsageEventResponse {
@@ -661,24 +628,15 @@ mod tests {
     #[test]
     fn compaction_prompt_and_summary_form_one_item_and_the_replay_is_hidden() {
         let events = vec![
-            event("request", "write the report", json!({})),
+            user_request(&["write the report"]),
             event("response", "working", json!({})),
-            event(
-                "request",
-                &format!(
-                    "write the report\n\n<environment_context>date</environment_context>\n\n{PROMPT}"
-                ),
-                json!({}),
-            ),
+            user_request(&[
+                "write the report",
+                "<environment_context>date</environment_context>",
+                PROMPT,
+            ]),
             event("response", SUMMARY, json!({})),
-            event(
-                "request",
-                &format!(
-                    "<environment_context>cwd</environment_context>\n\n{}",
-                    handoff()
-                ),
-                json!({}),
-            ),
+            user_request(&["<environment_context>cwd</environment_context>", &handoff()]),
             event("response", "continuing", json!({})),
         ];
 
@@ -715,7 +673,7 @@ mod tests {
     #[test]
     fn unobserved_compaction_is_recovered_from_its_handoff() {
         let events = vec![
-            event("request", &format!("resume\n\n{}", handoff()), json!({})),
+            user_request(&[&format!("resume\n\n{}", handoff())]),
             event("response", "continuing", json!({})),
         ];
 

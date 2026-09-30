@@ -28,7 +28,8 @@ impl Message {
         match self.role.as_str() {
             "system" | "developer" => TrajectoryItemKind::Context,
             "user" => TrajectoryItemKind::User,
-            _ => TrajectoryItemKind::Assistant,
+            "assistant" | "reasoning" => TrajectoryItemKind::Assistant,
+            _ => TrajectoryItemKind::Request,
         }
     }
 }
@@ -204,9 +205,9 @@ fn request_messages(payload: &Value) -> Vec<Message> {
     }
     if let Some(input) = payload.get("input").or_else(|| payload.get("messages")) {
         if let Some(items) = input.as_array() {
-            result.extend(items.iter().filter_map(|v| message(v, "user")));
+            result.extend(items.iter().filter_map(|v| message(v, "request")));
         } else {
-            result.extend(message(input, "user"));
+            result.extend(message(input, "request"));
         }
     }
     result
