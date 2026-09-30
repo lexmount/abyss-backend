@@ -13,6 +13,7 @@ pub mod event_order;
 pub mod persistence;
 /// Owner-scoped session index contracts.
 pub mod session_list;
+pub mod session_title;
 pub mod trajectory;
 
 use chrono::{DateTime, Utc};
@@ -529,6 +530,11 @@ pub struct SessionInfo {
     pub ended_at: Option<DateTime<Utc>>,
     /// Stable, allowlisted session metadata.
     pub metadata: Value,
+    /// Name the Agent generated for the session, when one was captured.
+    pub title: Option<String>,
+    /// Why the session exists when it only serves the Agent, such as
+    /// `title_generation`; `None` for ordinary sessions.
+    pub purpose: Option<String>,
 }
 
 /// Extracts the endpoint working directory retained in session metadata.

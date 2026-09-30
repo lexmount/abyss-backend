@@ -378,6 +378,8 @@ mod tests {
                 started_at: now,
                 ended_at: None,
                 metadata: json!({}),
+                title: None,
+                purpose: None,
             },
             turns: vec![TurnTimeline {
                 turn_pk: Uuid::nil(),

@@ -35,9 +35,12 @@ const ACTIVITY_CTE: &str = "\
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
             (SELECT COUNT(*) FROM agent_turns t WHERE t.session_pk = s.id) AS turns, \
             COUNT(e.id) AS events, \
-            COALESCE(SUM(e.total_tokens), 0) AS total_tokens \
+            COALESCE(SUM(e.total_tokens), 0) AS total_tokens, \
+            st.title AS title, \
+            st.purpose AS purpose \
         FROM agent_sessions s \
         JOIN devices d ON d.id = s.device_context_id \
+        LEFT JOIN session_titles st ON st.session_pk = s.id \
         LEFT JOIN llm_usage_events e ON e.session_pk = s.id \
         WHERE s.user_id = ?1 \
             AND (?2 = 0 OR s.agent_name IN (SELECT value FROM json_each(?3))) \
@@ -81,6 +84,10 @@ struct SessionListRow {
     events: i64,
     #[diesel(sql_type = BigInt)]
     total_tokens: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    title: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    purpose: Option<String>,
 }
 
 #[derive(QueryableByName)]
@@ -154,6 +161,8 @@ pub(super) fn list_sessions(
                 turns: row.turns,
                 events: row.events,
                 total_tokens: row.total_tokens,
+                title: row.title,
+                purpose: row.purpose,
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;

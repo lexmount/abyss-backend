@@ -7,6 +7,7 @@ mod repository;
 mod schema;
 mod search;
 mod session_list;
+mod session_titles;
 
 use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
 use uuid::Uuid;
@@ -40,6 +41,7 @@ impl SqliteFtsBackend {
             connection::configure_database(&mut database)?;
             if config.run_migrations {
                 migrations::run(&mut database)?;
+                session_titles::backfill(&mut database)?;
             }
         }
         Ok(Self { pool })

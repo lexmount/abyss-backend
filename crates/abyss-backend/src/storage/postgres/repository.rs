@@ -55,6 +55,8 @@ use crate::{
     },
 };
 
+use super::session_titles;
+
 #[cfg(test)]
 use crate::usage::persistence::{turn_identity_from_metadata, validate_event};
 
@@ -374,7 +376,10 @@ pub fn session_timeline(
                 attachments_by_event.remove(&event_pk).unwrap_or_default(),
             ));
     }
-    Ok(assemble_timeline(session, turns, events_by_turn))
+    let mut timeline = assemble_timeline(session, turns, events_by_turn);
+    (timeline.session.title, timeline.session.purpose) =
+        session_titles::load(connection, timeline.session.session_pk)?;
+    Ok(timeline)
 }
 
 type OutlineRow = (
@@ -478,7 +483,10 @@ pub fn session_outline(
     for event in events {
         events_by_turn.entry(event.turn_pk).or_default().push(event);
     }
-    Ok(assemble_timeline(session, turns, events_by_turn))
+    let mut timeline = assemble_timeline(session, turns, events_by_turn);
+    (timeline.session.title, timeline.session.purpose) =
+        session_titles::load(connection, timeline.session.session_pk)?;
+    Ok(timeline)
 }
 
 fn load_session_turns(
@@ -533,6 +541,8 @@ fn assemble_timeline<E>(
             started_at: session.started_at,
             ended_at: session.ended_at,
             metadata: session.metadata,
+            title: None,
+            purpose: None,
         },
         turns: turn_timelines,
     }
@@ -699,6 +709,10 @@ fn ingest_one_event(
     )?;
     let tokens = normalized_tokens(event)?;
     let text = normalized_optional(event.text.as_deref());
+    let naming_text = text
+        .as_deref()
+        .filter(|text| session_titles::is_candidate(event.event_type.as_str(), text))
+        .map(str::to_owned);
 
     // `event_id` is the idempotency key supplied by the collector. Duplicate
     // observations are accepted as no-ops instead of failing the whole batch.
@@ -737,23 +751,7 @@ fn ingest_one_event(
     // Child rows are written only for a newly inserted event. A replay must not
     // replace the attachments associated with the original idempotency key.
     if inserted == 1 && !attachments.is_empty() {
-        let attachment_rows = attachments
-            .into_iter()
-            .map(|attachment| NewUsageEventAttachment {
-                id: Uuid::now_v7(),
-                user_id,
-                event_pk: usage_event_id,
-                position: attachment.position,
-                media_type: attachment.media_type.as_str().to_owned(),
-                byte_size: attachment.byte_size,
-                sha256: attachment.sha256,
-                content: attachment.content,
-                created_at: now,
-            })
-            .collect::<Vec<_>>();
-        diesel::insert_into(llm_usage_event_attachments::table)
-            .values(&attachment_rows)
-            .execute(connection)?;
+        insert_attachments(connection, user_id, usage_event_id, attachments, now)?;
     }
 
     // The enclosing transaction commits the event and its projection task
@@ -766,9 +764,48 @@ fn ingest_one_event(
                 created_at: now,
             })
             .execute(connection)?;
+        session_titles::capture(
+            connection,
+            &session_titles::CapturedEvent {
+                user_id,
+                session_pk: session.id,
+                event_pk: usage_event_id,
+                turn_index,
+                event_type: event.event_type.as_str(),
+                text: naming_text.as_deref(),
+                observed_at,
+            },
+        )?;
     }
 
     Ok(inserted == 1)
+}
+
+fn insert_attachments(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+    attachments: Vec<ValidatedImageAttachment>,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let attachment_rows = attachments
+        .into_iter()
+        .map(|attachment| NewUsageEventAttachment {
+            id: Uuid::now_v7(),
+            user_id,
+            event_pk,
+            position: attachment.position,
+            media_type: attachment.media_type.as_str().to_owned(),
+            byte_size: attachment.byte_size,
+            sha256: attachment.sha256,
+            content: attachment.content,
+            created_at: now,
+        })
+        .collect::<Vec<_>>();
+    diesel::insert_into(llm_usage_event_attachments::table)
+        .values(&attachment_rows)
+        .execute(connection)?;
+    Ok(())
 }
 
 fn upsert_device(

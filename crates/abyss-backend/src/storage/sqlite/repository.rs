@@ -46,6 +46,7 @@ use super::{
         agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
         app_users, devices, llm_usage_event_attachments, llm_usage_events,
     },
+    session_titles,
 };
 
 pub(super) fn ingest_events(
@@ -172,6 +173,30 @@ fn ingest_one_event(
         return Ok(false);
     }
 
+    insert_attachments(connection, user_id, event_pk, attachments, now)?;
+    insert_search_projection(connection, event_pk, user_id, session_pk, event)?;
+    session_titles::capture(
+        connection,
+        &session_titles::CapturedEvent {
+            user_id,
+            session_pk,
+            event_pk,
+            turn_index,
+            event_type: event.event_type.as_str(),
+            text: text.as_deref(),
+            observed_at,
+        },
+    )?;
+    Ok(true)
+}
+
+fn insert_attachments(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+    attachments: Vec<ValidatedImageAttachment>,
+    now: i64,
+) -> Result<(), AppError> {
     let attachment_rows = attachments
         .into_iter()
         .map(|attachment| NewAttachment {
@@ -192,8 +217,7 @@ fn ingest_one_event(
             .execute(connection)?;
     }
 
-    insert_search_projection(connection, event_pk, user_id, session_pk, event)?;
-    Ok(true)
+    Ok(())
 }
 
 fn upsert_device(
@@ -649,7 +673,10 @@ pub(super) fn session_timeline(
                 attachments.remove(&event_pk).unwrap_or_default(),
             ));
     }
-    Ok(assemble_timeline(session, turns, events_by_turn))
+    let mut timeline = assemble_timeline(session, turns, events_by_turn);
+    (timeline.session.title, timeline.session.purpose) =
+        session_titles::load(connection, timeline.session.session_pk)?;
+    Ok(timeline)
 }
 
 type OutlineRow = (
@@ -778,7 +805,10 @@ pub(super) fn session_outline(
     for event in events {
         events_by_turn.entry(event.turn_pk).or_default().push(event);
     }
-    Ok(assemble_timeline(session, turns, events_by_turn))
+    let mut timeline = assemble_timeline(session, turns, events_by_turn);
+    (timeline.session.title, timeline.session.purpose) =
+        session_titles::load(connection, timeline.session.session_pk)?;
+    Ok(timeline)
 }
 
 /// Computes the outline length and preview in Rust for text SQLite cannot measure.
@@ -848,6 +878,8 @@ fn assemble_timeline<E>(
             started_at: session.started_at,
             ended_at: session.ended_at,
             metadata: session.metadata,
+            title: None,
+            purpose: None,
         },
         turns: turn_timelines,
     }

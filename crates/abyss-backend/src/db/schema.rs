@@ -152,6 +152,29 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::{Nullable, Text, Timestamptz, Uuid};
+
+    session_titles (session_pk) {
+        session_pk -> Uuid,
+        user_id -> Uuid,
+        title -> Nullable<Text>,
+        title_event_pk -> Nullable<Uuid>,
+        title_observed_at -> Nullable<Timestamptz>,
+        purpose -> Nullable<Text>,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::{Text, Timestamptz};
+
+    schema_backfills (name) {
+        name -> Text,
+        completed_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(agent_sessions -> app_users (user_id));
 diesel::joinable!(agent_sessions -> devices (device_context_id));
 diesel::joinable!(agent_turns -> agent_sessions (session_pk));
@@ -168,6 +191,7 @@ diesel::joinable!(agent_diagnostic_capture_events -> llm_usage_events (event_pk)
 diesel::joinable!(agent_diagnostic_captures -> agent_sessions (session_pk));
 diesel::joinable!(agent_diagnostic_captures -> app_users (user_id));
 diesel::joinable!(agent_diagnostic_captures -> devices (device_context_id));
+diesel::joinable!(session_titles -> agent_sessions (session_pk));
 
 diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_capture_events,
@@ -178,5 +202,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     devices,
     llm_usage_events,
     llm_usage_event_attachments,
+    schema_backfills,
     search_outbox,
+    session_titles,
 );

@@ -110,6 +110,11 @@ pub struct SessionListItem {
     pub turns: i64,
     pub events: i64,
     pub total_tokens: i64,
+    /// Name the Agent generated for the session, when one was captured.
+    pub title: Option<String>,
+    /// Why the session exists when it only serves the Agent, such as
+    /// `title_generation`; `None` for ordinary sessions.
+    pub purpose: Option<String>,
 }
 
 impl SessionListResponse {
