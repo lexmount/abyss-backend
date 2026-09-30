@@ -27,6 +27,13 @@ const PARAGRAPH_SEPARATOR: &str = "\n\n";
 const SYSTEM_PREFIX: &str = "system: ";
 /// Shared prefix length above which a changed paragraph counts as grown.
 const GROWN_PARAGRAPH_MIN_PREFIX_BYTES: usize = 200;
+/// Codex opens the request that asks the model for a context handoff summary
+/// with this prompt when it compacts its context.
+const COMPACTION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION.";
+/// Codex opens the compacted history it sends afterwards with this sentence,
+/// followed by the handoff summary.
+const COMPACTION_HANDOFF: &str = "Another language model started to solve this problem and \
+                                  produced a summary of its thinking process.";
 
 #[derive(Debug, Serialize)]
 /// Session information and its merged, de-duplicated trajectory items.
@@ -51,6 +58,9 @@ pub enum TrajectoryItemKind {
     ToolCall,
     /// Request tool result whose call was not observed.
     ToolResult,
+    /// Context compaction: the summary prompt as `input` and the handoff
+    /// summary that replaced the earlier history as `output`.
+    Compaction,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +120,25 @@ impl TrajectoryItem {
             output_event_pk: None,
         }
     }
+
+    /// An empty item of another kind contributed by the same event.
+    fn sibling(&self, kind: TrajectoryItemKind) -> Self {
+        Self {
+            kind,
+            stream: self.stream,
+            turn_index: self.turn_index,
+            event_pk: self.event_pk,
+            observed_at: self.observed_at,
+            llm_model: self.llm_model.clone(),
+            text: None,
+            continued: false,
+            name: None,
+            call_id: None,
+            input: None,
+            output: None,
+            output_event_pk: None,
+        }
+    }
 }
 
 /// Merges an ordered session timeline into its trajectory.
@@ -142,15 +171,22 @@ struct Merger {
     calls: HashMap<String, usize>,
     /// Stream of the most recent request; responses belong to it.
     current_stream: usize,
+    /// Compaction item whose summary the next response carries.
+    pending_compaction: Option<usize>,
+    /// Handoff summaries already shown, so their replay is not shown again.
+    summaries: Vec<String>,
 }
 
 impl Merger {
     fn request(&mut self, event: &UsageEventResponse) {
+        self.pending_compaction = None;
+        let first_new = self.items.len();
         if let Some(items) = self.conversation.project(event, self.current_stream) {
             self.items.extend(items);
         } else {
             self.legacy_request_text(event);
         }
+        self.mark_compaction(first_new);
         let stream = self.current_stream;
         for segment in content_segments(&event.metadata) {
             if segment_str(segment, "type") == Some("tool_call") {
@@ -241,9 +277,79 @@ impl Merger {
         }
     }
 
+    /// Turns the compaction prompt into a compaction item and hides the
+    /// handoff summary when the compacted history replays it.
+    fn mark_compaction(&mut self, first_new: usize) {
+        for mut item in self.items.split_off(first_new) {
+            let Some(text) = item
+                .text
+                .clone()
+                .filter(|_| item.kind == TrajectoryItemKind::User)
+            else {
+                self.items.push(item);
+                continue;
+            };
+            // Legacy projections join all new paragraphs of a request, so the
+            // prompt may follow other new input in the same item.
+            if let Some(start) = paragraph_start(&text, COMPACTION_PROMPT) {
+                let (before, prompt) = text.split_at(start);
+                let mut compaction = item.sibling(TrajectoryItemKind::Compaction);
+                compaction.input = Some(prompt.trim().to_owned());
+                let before = before.trim_end();
+                if !before.is_empty() {
+                    item.text = Some(before.to_owned());
+                    self.items.push(item);
+                }
+                self.pending_compaction = Some(self.items.len());
+                self.items.push(compaction);
+                continue;
+            }
+            let Some(start) = paragraph_start(&text, COMPACTION_HANDOFF) else {
+                self.items.push(item);
+                continue;
+            };
+            let (before, handoff) = text.split_at(start);
+            let before = before.trim_end();
+            let replayed = self
+                .summaries
+                .iter()
+                .any(|summary| handoff.trim_end().ends_with(summary.as_str()));
+            // Without the summary request, the handoff is the only record of
+            // the compaction.
+            let recovered = (!replayed).then(|| {
+                let summary = handoff
+                    .split_once('\n')
+                    .map_or(handoff, |(_, rest)| rest)
+                    .trim()
+                    .to_owned();
+                let mut compaction = item.sibling(TrajectoryItemKind::Compaction);
+                compaction.output = Some(summary.clone());
+                compaction.output_event_pk = Some(item.event_pk);
+                self.summaries.push(summary);
+                compaction
+            });
+            if !before.is_empty() {
+                item.text = Some(before.to_owned());
+                self.items.push(item);
+            }
+            self.items.extend(recovered);
+        }
+    }
+
     fn response(&mut self, event: &UsageEventResponse) {
         let stream = self.current_stream;
-        if let Some(items) = self.conversation.project(event, stream) {
+        let projected = self.conversation.project(event, stream);
+        if let Some(index) = self.pending_compaction.take() {
+            // The response to the compaction prompt is the handoff summary.
+            if let Some(summary) = event.text.as_deref().map(str::trim)
+                && !summary.is_empty()
+                && let Some(item) = self.items.get_mut(index)
+            {
+                item.output = Some(summary.to_owned());
+                item.output_event_pk = Some(event.id);
+                self.summaries.push(summary.to_owned());
+            }
+        } else if let Some(items) = projected {
             self.items.extend(items);
         } else if let Some(text) = event.text.as_deref().filter(|text| !text.trim().is_empty()) {
             let mut item = TrajectoryItem::new(TrajectoryItemKind::Assistant, stream, event);
@@ -271,6 +377,18 @@ impl Merger {
         }
         self.items.push(item);
     }
+}
+
+/// Byte offset of the paragraph that contains `marker`.
+fn paragraph_start(text: &str, marker: &str) -> Option<usize> {
+    let position = text.find(marker)?;
+    Some(
+        text[..position]
+            .rfind(PARAGRAPH_SEPARATOR)
+            .map_or(0, |separator| {
+                separator.saturating_add(PARAGRAPH_SEPARATOR.len())
+            }),
+    )
 }
 
 /// Identity of a request paragraph. The system fragment's first line carries
@@ -530,6 +648,117 @@ mod tests {
     #[test]
     fn common_prefix_stops_on_character_boundaries() {
         assert_eq!(common_prefix_len("中文a", "中字b"), 3);
+    }
+
+    const PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a \
+                          handoff summary for another LLM that will resume the task.";
+    const SUMMARY: &str = "## Goal\n\nFinish the report.";
+
+    fn handoff() -> String {
+        format!(
+            "Another language model started to solve this problem and produced a summary \
+             of its thinking process. Here is the summary produced by the other language \
+             model, use the information in this summary to assist with your own \
+             analysis:\n{SUMMARY}"
+        )
+    }
+
+    #[test]
+    fn compaction_prompt_and_summary_form_one_item_and_the_replay_is_hidden() {
+        let events = vec![
+            event("request", "write the report", json!({})),
+            event("response", "working", json!({})),
+            event(
+                "request",
+                &format!(
+                    "write the report\n\n<environment_context>date</environment_context>\n\n{PROMPT}"
+                ),
+                json!({}),
+            ),
+            event("response", SUMMARY, json!({})),
+            event(
+                "request",
+                &format!(
+                    "<environment_context>cwd</environment_context>\n\n{}",
+                    handoff()
+                ),
+                json!({}),
+            ),
+            event("response", "continuing", json!({})),
+        ];
+
+        let items = build(timeline(events)).items;
+
+        let kinds = items.iter().map(|item| item.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Assistant,
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Compaction,
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Assistant,
+            ]
+        );
+        // New input sent along with the prompt stays user input.
+        assert_eq!(
+            items[2].text.as_deref(),
+            Some("<environment_context>date</environment_context>")
+        );
+        assert_eq!(items[3].input.as_deref(), Some(PROMPT));
+        assert_eq!(items[3].output.as_deref(), Some(SUMMARY));
+        // The summary comes from the response, not from the prompt's request.
+        assert!(items[3].output_event_pk.is_some());
+        assert_ne!(items[3].output_event_pk, Some(items[3].event_pk));
+        assert_eq!(
+            items[4].text.as_deref(),
+            Some("<environment_context>cwd</environment_context>")
+        );
+    }
+
+    #[test]
+    fn unobserved_compaction_is_recovered_from_its_handoff() {
+        let events = vec![
+            event("request", &format!("resume\n\n{}", handoff()), json!({})),
+            event("response", "continuing", json!({})),
+        ];
+
+        let items = build(timeline(events)).items;
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].kind, TrajectoryItemKind::User);
+        assert_eq!(items[0].text.as_deref(), Some("resume"));
+        assert_eq!(items[1].kind, TrajectoryItemKind::Compaction);
+        assert_eq!(items[1].input, None);
+        assert_eq!(items[1].output.as_deref(), Some(SUMMARY));
+        assert_eq!(items[2].kind, TrajectoryItemKind::Assistant);
+    }
+
+    #[test]
+    fn snapshot_compaction_is_recognized_by_message() {
+        let user = json!({"role": "user", "text": "write the report"});
+        let prompt = json!({"role": "user", "text": PROMPT});
+        let replay = json!({"role": "user", "text": handoff()});
+        let conversation = |messages: Vec<Value>| json!({"conversation": {"messages": messages}});
+        let events = vec![
+            event("request", "", conversation(vec![user.clone(), prompt])),
+            event(
+                "response",
+                SUMMARY,
+                conversation(vec![json!({"role": "assistant", "text": SUMMARY})]),
+            ),
+            event("request", "", conversation(vec![user, replay])),
+        ];
+
+        let items = build(timeline(events)).items;
+
+        let kinds = items.iter().map(|item| item.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [TrajectoryItemKind::User, TrajectoryItemKind::Compaction]
+        );
+        assert_eq!(items[1].output.as_deref(), Some(SUMMARY));
     }
 
     fn timeline(events: Vec<UsageEventResponse>) -> SessionTimelineResponse {
