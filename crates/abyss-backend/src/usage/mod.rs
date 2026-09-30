@@ -535,6 +535,8 @@ pub struct SessionInfo {
     /// Why the session exists when it only serves the Agent, such as
     /// `title_generation`; `None` for ordinary sessions.
     pub purpose: Option<String>,
+    /// For a naming thread, the task session its title was matched to.
+    pub parent_session_pk: Option<Uuid>,
 }
 
 /// Extracts the endpoint working directory retained in session metadata.

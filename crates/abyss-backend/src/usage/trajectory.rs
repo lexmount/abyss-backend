@@ -703,6 +703,7 @@ mod tests {
                 metadata: json!({}),
                 title: None,
                 purpose: None,
+                parent_session_pk: None,
             },
             turns: vec![TurnTimeline {
                 turn_pk: Uuid::nil(),
