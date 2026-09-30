@@ -5,6 +5,10 @@
 //! new request paragraphs, first-seen tool results, and response text and tool
 //! calls, with each tool call paired to its result by call identifier.
 
+mod conversation;
+
+use conversation::ConversationMerger;
+
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -128,6 +132,7 @@ pub fn build(timeline: SessionTimelineResponse) -> SessionTrajectoryResponse {
 
 #[derive(Default)]
 struct Merger {
+    conversation: ConversationMerger,
     items: Vec<TrajectoryItem>,
     seen_paragraphs: HashSet<u64>,
     seen_results: HashSet<String>,
@@ -141,6 +146,21 @@ struct Merger {
 
 impl Merger {
     fn request(&mut self, event: &UsageEventResponse) {
+        if let Some(items) = self.conversation.project(event, self.current_stream) {
+            self.items.extend(items);
+        } else {
+            self.legacy_request_text(event);
+        }
+        let stream = self.current_stream;
+        for segment in content_segments(&event.metadata) {
+            if segment_str(segment, "type") == Some("tool_call") {
+                self.tool_call(event, segment, stream);
+            }
+        }
+        self.request_tools(event, stream);
+    }
+
+    fn legacy_request_text(&mut self, event: &UsageEventResponse) {
         let text = event.text.as_deref().unwrap_or_default();
         let paragraphs = text.split(PARAGRAPH_SEPARATOR).collect::<Vec<_>>();
         let first = paragraphs.first().copied().unwrap_or_default();
@@ -189,7 +209,9 @@ impl Merger {
         }
         self.last_paragraphs
             .insert(stream, paragraphs.into_iter().map(str::to_owned).collect());
+    }
 
+    fn request_tools(&mut self, event: &UsageEventResponse, stream: usize) {
         for segment in content_segments(&event.metadata) {
             if segment_str(segment, "type") != Some("tool_result") {
                 continue;
@@ -221,7 +243,9 @@ impl Merger {
 
     fn response(&mut self, event: &UsageEventResponse) {
         let stream = self.current_stream;
-        if let Some(text) = event.text.as_deref().filter(|text| !text.trim().is_empty()) {
+        if let Some(items) = self.conversation.project(event, stream) {
+            self.items.extend(items);
+        } else if let Some(text) = event.text.as_deref().filter(|text| !text.trim().is_empty()) {
             let mut item = TrajectoryItem::new(TrajectoryItemKind::Assistant, stream, event);
             item.text = Some(text.to_owned());
             self.items.push(item);
@@ -230,15 +254,22 @@ impl Merger {
             if segment_str(segment, "type") != Some("tool_call") {
                 continue;
             }
-            let mut item = TrajectoryItem::new(TrajectoryItemKind::ToolCall, stream, event);
-            item.name = segment_str(segment, "name").map(str::to_owned);
-            item.call_id = segment_str(segment, "call_id").map(str::to_owned);
-            item.input = segment_str(segment, "input").map(str::to_owned);
-            if let Some(call_id) = &item.call_id {
-                self.calls.insert(call_id.clone(), self.items.len());
-            }
-            self.items.push(item);
+            self.tool_call(event, segment, stream);
         }
+    }
+
+    fn tool_call(&mut self, event: &UsageEventResponse, segment: &Value, stream: usize) {
+        if segment_str(segment, "call_id").is_some_and(|id| self.calls.contains_key(id)) {
+            return;
+        }
+        let mut item = TrajectoryItem::new(TrajectoryItemKind::ToolCall, stream, event);
+        item.name = segment_str(segment, "name").map(str::to_owned);
+        item.call_id = segment_str(segment, "call_id").map(str::to_owned);
+        item.input = segment_str(segment, "input").map(str::to_owned);
+        if let Some(call_id) = &item.call_id {
+            self.calls.insert(call_id.clone(), self.items.len());
+        }
+        self.items.push(item);
     }
 }
 
@@ -358,6 +389,142 @@ mod tests {
         assert_eq!(items[2].stream, 1);
         assert_eq!(items[2].text.as_deref(), Some(" more"));
         assert!(items[2].continued);
+    }
+
+    #[test]
+    fn snapshots_project_replay_once_and_keep_repeated_user_occurrences() {
+        let system = json!({"role": "system", "text": "system instructions"});
+        let developer = json!({"role": "developer", "text": "developer instructions"});
+        let user = json!({"role": "user", "text": "继续"});
+        let assistant = json!({"id": "a1", "role": "assistant", "text": "working"});
+        let final_reply = json!({"id": "a2", "role": "assistant", "text": "done"});
+        let first = vec![system, developer, user.clone()];
+        let mut replay = first.clone();
+        replay.push(assistant.clone());
+        let call = json!({"type": "tool_call", "call_id": "c1", "name": "exec", "input": "run"});
+        let mut response = snapshot_event("response", &[assistant], "r1", None);
+        response.metadata["content_segments"] = json!([call]);
+        let mut continuation = snapshot_event("request", &replay, "r2", None);
+        continuation.metadata["content_segments"] = json!([
+            call, {"type": "tool_result", "call_id": "c1", "output": "success"}
+        ]);
+        replay.extend([final_reply.clone(), user]);
+        let items = build(timeline(vec![
+            snapshot_event("request", &first, "r1", None),
+            response,
+            continuation,
+            snapshot_event("response", &[final_reply], "r2", None),
+            snapshot_event("request", &replay, "r3", None),
+        ]))
+        .items;
+
+        assert_eq!(
+            items.iter().map(|item| item.kind).collect::<Vec<_>>(),
+            [
+                TrajectoryItemKind::Context,
+                TrajectoryItemKind::Context,
+                TrajectoryItemKind::User,
+                TrajectoryItemKind::Assistant,
+                TrajectoryItemKind::ToolCall,
+                TrajectoryItemKind::Assistant,
+                TrajectoryItemKind::User,
+            ]
+        );
+        assert_eq!(items[2].text.as_deref(), Some("继续"));
+        assert_eq!(items[6].text.as_deref(), Some("继续"));
+        assert_eq!(items[4].output.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn incremental_requests_append_identical_input_and_ignore_retries() {
+        let user = json!({"role": "user", "text": "继续"});
+        let assistant = json!({"id": "a1", "role": "assistant", "text": "done"});
+        let items = build(timeline(vec![
+            snapshot_event("request", std::slice::from_ref(&user), "r1", None),
+            snapshot_event("response", std::slice::from_ref(&assistant), "r1", None),
+            snapshot_event("request", &[assistant, user.clone()], "r2", Some("r1")),
+            snapshot_event("request", &[user], "r2", Some("r1")),
+        ]))
+        .items;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].kind, TrajectoryItemKind::User);
+        assert_eq!(items[1].kind, TrajectoryItemKind::Assistant);
+        assert_eq!(items[2].kind, TrajectoryItemKind::User);
+    }
+
+    #[test]
+    fn snapshots_use_roles_and_occurrences_instead_of_paragraphs_or_tags() {
+        let text = "system: quoted\n\n<developer>quoted</developer>";
+        let user = json!({"role": "user", "text": text});
+        let items = build(timeline(vec![
+            snapshot_event("request", &[user.clone(), user.clone()], "r1", None),
+            snapshot_event("request", &[user.clone(), user], "r2", None),
+        ]))
+        .items;
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.kind == TrajectoryItemKind::User)
+        );
+        assert!(items.iter().all(|item| item.text.as_deref() == Some(text)));
+    }
+
+    #[test]
+    fn new_context_does_not_replay_existing_dialogue() {
+        let user = json!({"role": "user", "text": "hello"});
+        let assistant = json!({"id": "a1", "role": "assistant", "text": "hi"});
+        let items = build(timeline(vec![
+            snapshot_event("request", std::slice::from_ref(&user), "r1", None),
+            snapshot_event("response", std::slice::from_ref(&assistant), "r1", None),
+            snapshot_event(
+                "request",
+                &[
+                    json!({"role": "developer", "text": "updated instructions"}),
+                    user,
+                    assistant,
+                ],
+                "r2",
+                None,
+            ),
+        ]))
+        .items;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].kind, TrajectoryItemKind::Context);
+        assert_eq!(items[2].text.as_deref(), Some("updated instructions"));
+    }
+
+    #[test]
+    fn observed_item_ids_survive_compaction_and_distinguish_new_messages() {
+        let first = json!({"id": "u1", "role": "user", "text": "continue"});
+        let second = json!({"id": "u2", "role": "user", "text": "continue"});
+        let items = build(timeline(vec![
+            snapshot_event("request", std::slice::from_ref(&first), "r1", None),
+            snapshot_event("request", &[second], "r2", None),
+            snapshot_event("request", &[first], "r3", None),
+        ]))
+        .items;
+        assert_eq!(items.len(), 2);
+    }
+
+    fn snapshot_event(
+        side: &str,
+        messages: &[Value],
+        response: &str,
+        previous: Option<&str>,
+    ) -> UsageEventResponse {
+        let text = messages
+            .iter()
+            .filter_map(|message| message["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        event(
+            side,
+            &text,
+            json!({"conversation": {
+                "messages": messages, "response_id": response, "previous_response_id": previous,
+            }}),
+        )
     }
 
     #[test]
