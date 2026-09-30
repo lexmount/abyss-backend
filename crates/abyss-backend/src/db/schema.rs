@@ -163,6 +163,9 @@ diesel::table! {
         title_observed_at -> Nullable<Timestamptz>,
         purpose -> Nullable<Text>,
         updated_at -> Timestamptz,
+        naming_turn_id -> Nullable<Text>,
+        naming_prompt -> Nullable<Text>,
+        parent_session_pk -> Nullable<Uuid>,
     }
 }
 

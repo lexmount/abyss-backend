@@ -144,6 +144,9 @@ diesel::table! {
         title_observed_at -> Nullable<BigInt>,
         purpose -> Nullable<Text>,
         updated_at -> BigInt,
+        naming_turn_id -> Nullable<Text>,
+        naming_prompt -> Nullable<Text>,
+        parent_session_pk -> Nullable<Text>,
     }
 }
 

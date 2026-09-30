@@ -147,7 +147,7 @@ fn ingest_one_event(
             session_pk: session_pk.to_string(),
             turn_pk: turn_pk.to_string(),
             event_id,
-            agent_name,
+            agent_name: agent_name.clone(),
             agent_version,
             session_id: normalize_text(&event.session_id),
             turn_index,
@@ -182,8 +182,10 @@ fn ingest_one_event(
             session_pk,
             event_pk,
             turn_index,
+            agent_name: &agent_name,
             event_type: event.event_type.as_str(),
             text: text.as_deref(),
+            metadata: &event.metadata,
             observed_at,
         },
     )?;
@@ -674,8 +676,7 @@ pub(super) fn session_timeline(
             ));
     }
     let mut timeline = assemble_timeline(session, turns, events_by_turn);
-    (timeline.session.title, timeline.session.purpose) =
-        session_titles::load(connection, timeline.session.session_pk)?;
+    session_titles::fill(connection, &mut timeline.session)?;
     Ok(timeline)
 }
 
@@ -806,8 +807,7 @@ pub(super) fn session_outline(
         events_by_turn.entry(event.turn_pk).or_default().push(event);
     }
     let mut timeline = assemble_timeline(session, turns, events_by_turn);
-    (timeline.session.title, timeline.session.purpose) =
-        session_titles::load(connection, timeline.session.session_pk)?;
+    session_titles::fill(connection, &mut timeline.session)?;
     Ok(timeline)
 }
 
@@ -880,6 +880,7 @@ fn assemble_timeline<E>(
             metadata: session.metadata,
             title: None,
             purpose: None,
+            parent_session_pk: None,
         },
         turns: turn_timelines,
     }
