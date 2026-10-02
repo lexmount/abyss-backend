@@ -171,14 +171,18 @@ pub struct SummaryQuery {
     pub fields: Option<SummaryFields>,
     /// User UUID, name, or email filter retained for the summary contract.
     pub user_filter: Option<String>,
-    /// Agent-name filter.
-    pub agent_name: Option<String>,
-    /// Agent-native session identifier filter.
-    pub session_id: Option<String>,
-    /// LLM provider filter.
-    pub llm_provider: Option<String>,
-    /// LLM model filter.
-    pub llm_model: Option<String>,
+    /// Agent-name filter; repeat the key to match any of several Agents.
+    #[serde(default)]
+    pub agent_name: Vec<String>,
+    /// Agent-native session identifier filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub session_id: Vec<String>,
+    /// LLM provider filter; repeat the key to match any of several providers.
+    #[serde(default)]
+    pub llm_provider: Vec<String>,
+    /// LLM model filter; repeat the key to match any of several models.
+    #[serde(default)]
+    pub llm_model: Vec<String>,
     /// Event-side filter.
     pub event_type: Option<String>,
     /// Requested aggregate row limit.
@@ -338,18 +342,22 @@ pub struct RawEventsQuery {
     pub from: Option<DateTime<Utc>>,
     /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
-    /// Agent-name filter.
-    pub agent_name: Option<String>,
-    /// Agent-native session identifier filter.
-    pub session_id: Option<String>,
+    /// Agent-name filter; repeat the key to match any of several Agents.
+    #[serde(default)]
+    pub agent_name: Vec<String>,
+    /// Agent-native session identifier filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub session_id: Vec<String>,
     /// Backend session primary-key filter.
     pub session_pk: Option<Uuid>,
     /// Normalized turn-number filter.
     pub turn_index: Option<i32>,
-    /// LLM provider filter.
-    pub llm_provider: Option<String>,
-    /// LLM model filter.
-    pub llm_model: Option<String>,
+    /// LLM provider filter; repeat the key to match any of several providers.
+    #[serde(default)]
+    pub llm_provider: Vec<String>,
+    /// LLM model filter; repeat the key to match any of several models.
+    #[serde(default)]
+    pub llm_model: Vec<String>,
     /// Request or response filter.
     pub event_type: Option<String>,
     /// Requested page size.

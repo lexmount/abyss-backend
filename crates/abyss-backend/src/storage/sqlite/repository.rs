@@ -27,10 +27,10 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            TurnIdentity, agent_name_filter_values, canonical_agent_name, choose_turn_index,
-            non_empty, normalize_limit, normalize_slug, normalize_text, normalized_optional,
-            normalized_tokens, parse_group_by, sha256_bytes, turn_identity, validate_batch,
-            validate_event_type,
+            TurnIdentity, agent_names_filter, canonical_agent_name, choose_turn_index,
+            exact_values_filter, non_empty, normalize_limit, normalize_slug, normalize_text,
+            normalized_optional, normalized_tokens, parse_group_by, providers_filter, sha256_bytes,
+            turn_identity, validate_batch, validate_event_type,
         },
         session_metadata_from_event,
     },
@@ -542,12 +542,12 @@ pub(super) fn raw_events(
             user_id,
             from: query.from,
             to: query.to,
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
+            agent_names: &query.agent_name,
+            session_ids: &query.session_id,
             session_pk: query.session_pk,
             turn_index: query.turn_index,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
+            llm_providers: &query.llm_provider,
+            llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
             limit: page_size.saturating_add(1),
             offset,
@@ -581,12 +581,13 @@ struct EventFilters<'a> {
     user_id: Uuid,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
-    agent_name: Option<&'a str>,
-    session_id: Option<&'a str>,
+    /// Each list matches any of its values; an empty list matches everything.
+    agent_names: &'a [String],
+    session_ids: &'a [String],
     session_pk: Option<Uuid>,
     turn_index: Option<i32>,
-    llm_provider: Option<&'a str>,
-    llm_model: Option<&'a str>,
+    llm_providers: &'a [String],
+    llm_models: &'a [String],
     event_type: Option<&'a str>,
     limit: i64,
     offset: i64,
@@ -605,12 +606,13 @@ fn load_filtered_events(
     if let Some(to) = filters.to {
         query = query.filter(llm_usage_events::observed_at.lt(timestamp_to_micros(to)));
     }
-    if let Some(agent_name) = filters.agent_name.and_then(non_empty) {
-        query =
-            query.filter(llm_usage_events::agent_name.eq_any(agent_name_filter_values(agent_name)));
+    let agent_names = agent_names_filter(filters.agent_names);
+    if !agent_names.is_empty() {
+        query = query.filter(llm_usage_events::agent_name.eq_any(agent_names));
     }
-    if let Some(session_id) = filters.session_id.and_then(non_empty) {
-        query = query.filter(llm_usage_events::session_id.eq(session_id.trim()));
+    let session_ids = exact_values_filter(filters.session_ids);
+    if !session_ids.is_empty() {
+        query = query.filter(llm_usage_events::session_id.eq_any(session_ids));
     }
     if let Some(session_pk) = filters.session_pk {
         query = query.filter(llm_usage_events::session_pk.eq(session_pk.to_string()));
@@ -618,11 +620,13 @@ fn load_filtered_events(
     if let Some(turn_index) = filters.turn_index {
         query = query.filter(llm_usage_events::turn_index.eq(turn_index));
     }
-    if let Some(provider) = filters.llm_provider.and_then(non_empty) {
-        query = query.filter(llm_usage_events::llm_provider.eq(normalize_slug(provider)));
+    let providers = providers_filter(filters.llm_providers);
+    if !providers.is_empty() {
+        query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
     }
-    if let Some(model) = filters.llm_model.and_then(non_empty) {
-        query = query.filter(llm_usage_events::llm_model.eq(model.trim()));
+    let models = exact_values_filter(filters.llm_models);
+    if !models.is_empty() {
+        query = query.filter(llm_usage_events::llm_model.eq_any(models));
     }
     if let Some(event_type) = filters.event_type.and_then(non_empty) {
         query = query.filter(llm_usage_events::event_type.eq(validate_event_type(event_type)?));
@@ -960,12 +964,12 @@ pub(super) fn usage_summary(
             user_id,
             from: query.from,
             to: query.to,
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
+            agent_names: &query.agent_name,
+            session_ids: &query.session_id,
             session_pk: None,
             turn_index: None,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
+            llm_providers: &query.llm_provider,
+            llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
             limit: scan_limit,
             offset: 0,
@@ -1377,9 +1381,9 @@ mod tests {
                 q: "searchable response".to_owned(),
                 from: None,
                 to: None,
-                agent_name: Some("codex".to_owned()),
-                llm_provider: None,
-                llm_model: None,
+                agent_name: vec!["claude-code".to_owned(), "codex".to_owned()],
+                llm_provider: Vec::new(),
+                llm_model: Vec::new(),
                 event_type: None,
                 page: None,
                 page_size: None,

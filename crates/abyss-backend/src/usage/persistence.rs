@@ -212,6 +212,44 @@ pub fn agent_name_filter_values(value: &str) -> Vec<String> {
     }
 }
 
+/// Stored Agent names matching any requested Agent; empty matches every Agent.
+pub fn agent_names_filter(values: &[String]) -> Vec<String> {
+    distinct(
+        values
+            .iter()
+            .filter_map(|value| non_empty(value))
+            .flat_map(agent_name_filter_values),
+    )
+}
+
+/// Provider slugs matching any requested provider; empty matches every provider.
+pub fn providers_filter(values: &[String]) -> Vec<String> {
+    distinct(
+        values
+            .iter()
+            .filter_map(|value| non_empty(value))
+            .map(normalize_slug),
+    )
+}
+
+/// Trimmed values compared exactly, such as models or session identifiers;
+/// empty matches every value.
+pub fn exact_values_filter(values: &[String]) -> Vec<String> {
+    distinct(
+        values
+            .iter()
+            .filter_map(|value| non_empty(value))
+            .map(normalize_text),
+    )
+}
+
+fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
+    let mut values: Vec<String> = values.collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
 pub fn normalize_text(value: &str) -> String {
     value.trim().to_owned()
 }

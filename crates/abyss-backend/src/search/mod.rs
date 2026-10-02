@@ -32,12 +32,15 @@ pub struct SessionSearchQuery {
     pub from: Option<DateTime<Utc>>,
     /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
-    /// Optional canonical Agent filter.
-    pub agent_name: Option<String>,
-    /// Optional canonical LLM provider filter.
-    pub llm_provider: Option<String>,
-    /// Optional model filter.
-    pub llm_model: Option<String>,
+    /// Optional canonical Agent filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub agent_name: Vec<String>,
+    /// Optional canonical LLM provider filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub llm_provider: Vec<String>,
+    /// Optional model filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub llm_model: Vec<String>,
     /// Optional request or response filter.
     pub event_type: Option<String>,
     /// One-based result page.
@@ -93,11 +96,9 @@ impl SessionSearchQuery {
             text,
             from: self.from,
             to: self.to,
-            agent_name: normalized_optional(self.agent_name.as_deref(), "agent_name")?
-                .map(|value| canonical_agent_name(&value)),
-            llm_provider: normalized_optional(self.llm_provider.as_deref(), "llm_provider")?
-                .map(|value| normalize_slug(&value)),
-            llm_model: normalized_optional(self.llm_model.as_deref(), "llm_model")?,
+            agent_names: normalized_list(&self.agent_name, "agent_name", canonical_agent_name)?,
+            llm_providers: normalized_list(&self.llm_provider, "llm_provider", normalize_slug)?,
+            llm_models: normalized_list(&self.llm_model, "llm_model", str::to_owned)?,
             event_type,
             page,
             page_size,
@@ -114,12 +115,12 @@ pub struct ValidatedSearchQuery {
     pub from: Option<DateTime<Utc>>,
     /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
-    /// Canonical Agent-name filter.
-    pub agent_name: Option<String>,
-    /// Canonical provider slug filter.
-    pub llm_provider: Option<String>,
-    /// Trimmed model filter.
-    pub llm_model: Option<String>,
+    /// Canonical Agent names to match any of, or empty for every Agent.
+    pub agent_names: Vec<String>,
+    /// Canonical provider slugs to match any of, or empty for every provider.
+    pub llm_providers: Vec<String>,
+    /// Trimmed models to match any of, or empty for every model.
+    pub llm_models: Vec<String>,
     /// Canonical request or response filter.
     pub event_type: Option<String>,
     /// One-based result page.
@@ -270,6 +271,23 @@ fn normalized_optional(value: Option<&str>, field: &str) -> Result<Option<String
         .transpose()
 }
 
+/// Validates every value, then normalizes and de-duplicates them.
+fn normalized_list(
+    values: &[String],
+    field: &str,
+    normalize: impl Fn(&str) -> String,
+) -> Result<Vec<String>, AppError> {
+    let mut normalized = values
+        .iter()
+        .map(|value| {
+            normalized_required(value, field, MAX_FILTER_CHARACTERS).map(|value| normalize(&value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 fn normalize_slug(value: &str) -> String {
     value
         .trim()
@@ -338,9 +356,9 @@ mod tests {
             q: q.to_owned(),
             from: None,
             to: None,
-            agent_name: None,
-            llm_provider: None,
-            llm_model: None,
+            agent_name: Vec::new(),
+            llm_provider: Vec::new(),
+            llm_model: Vec::new(),
             event_type: None,
             page: None,
             page_size: None,

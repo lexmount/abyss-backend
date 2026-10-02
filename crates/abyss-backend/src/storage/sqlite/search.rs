@@ -121,24 +121,9 @@ impl MatchSource {
             sql.push_str(" AND e.observed_at < ?");
             binds.push(FtsBind::BigInt(timestamp_to_micros(to)));
         }
-        push_exact_filter(
-            &mut sql,
-            &mut binds,
-            "e.agent_name",
-            query.agent_name.as_deref(),
-        );
-        push_exact_filter(
-            &mut sql,
-            &mut binds,
-            "e.llm_provider",
-            query.llm_provider.as_deref(),
-        );
-        push_exact_filter(
-            &mut sql,
-            &mut binds,
-            "e.llm_model",
-            query.llm_model.as_deref(),
-        );
+        push_any_filter(&mut sql, &mut binds, "e.agent_name", &query.agent_names);
+        push_any_filter(&mut sql, &mut binds, "e.llm_provider", &query.llm_providers);
+        push_any_filter(&mut sql, &mut binds, "e.llm_model", &query.llm_models);
         push_exact_filter(
             &mut sql,
             &mut binds,
@@ -161,6 +146,19 @@ fn push_exact_filter(
         sql.push_str(" = ?");
         binds.push(FtsBind::Text(value.to_owned()));
     }
+}
+
+/// Matches any of `values`; an empty list adds no filter.
+fn push_any_filter(sql: &mut String, binds: &mut Vec<FtsBind>, column: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(" IN (");
+    sql.push_str(&vec!["?"; values.len()].join(", "));
+    sql.push(')');
+    binds.extend(values.iter().cloned().map(FtsBind::Text));
 }
 
 fn bound_query(sql: String, binds: Vec<FtsBind>) -> BoxedSqlQuery<'static, Sqlite, SqlQuery> {
