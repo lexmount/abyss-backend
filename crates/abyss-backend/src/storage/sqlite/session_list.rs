@@ -34,7 +34,7 @@ const ACTIVITY_CTE: &str = "\
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
             (SELECT COUNT(*) FROM agent_turns t WHERE t.session_pk = s.id) AS turns, \
-            COUNT(e.id) AS events, \
+            COUNT(e.session_pk) AS events, \
             COALESCE(SUM(e.total_tokens), 0) AS total_tokens, \
             st.title AS title, \
             st.purpose AS purpose \
