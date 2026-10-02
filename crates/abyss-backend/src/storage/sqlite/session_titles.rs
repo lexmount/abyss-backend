@@ -21,8 +21,8 @@ use crate::{
     usage::{
         SessionInfo,
         session_title::{
-            CodexRequest, NamingRequest, TITLE_GENERATION_PURPOSE, TitleTask, codex_turn_id,
-            codex_turn_id_range, may_carry_title, title_from_response,
+            NamingRequest, TITLE_GENERATION_PURPOSE, TitleTask, codex_turn_id, codex_turn_id_range,
+            may_carry_title, opens_with_prompt, title_from_response,
         },
     },
 };
@@ -262,13 +262,10 @@ fn match_pending_naming_threads(
     if nearby.is_empty() {
         return Ok(());
     }
-    let Some(request) = CodexRequest::parse(event.metadata) else {
-        return Ok(());
-    };
     for (naming_session, prompt) in nearby {
-        if prompt.is_some_and(|prompt| request.opens_with_prompt(&prompt)) {
+        if prompt.is_some_and(|prompt| opens_with_prompt(event.metadata, &prompt)) {
             // Recompute the complete candidate set before adding or withdrawing
-            // a link. A different device or installation is not a conflict.
+            // a link. A request from a different device is not a conflict.
             match_naming_thread(connection, &naming_session)?;
         }
     }
@@ -341,9 +338,6 @@ fn match_naming_thread(
     let Some((low, high)) = turn_id.as_deref().and_then(codex_turn_id_range) else {
         return Ok(());
     };
-    let Some(naming) = naming_context(connection, naming_session, turn_id.as_deref())? else {
-        return Ok(());
-    };
     let device = agent_sessions::table
         .find(naming_session)
         .select(agent_sessions::device_context_id)
@@ -368,9 +362,7 @@ fn match_naming_thread(
         .into_iter()
         .filter(|(_, metadata)| {
             serde_json::from_str::<Value>(metadata)
-                .ok()
-                .and_then(|value| CodexRequest::parse(&value))
-                .is_some_and(|request| request.matches(&naming, &prompt))
+                .is_ok_and(|metadata| opens_with_prompt(&metadata, &prompt))
         })
         .map(|(session, _)| session)
         .collect::<BTreeSet<_>>();
@@ -404,30 +396,6 @@ fn match_naming_thread(
             purpose: None,
         },
     )
-}
-
-/// Reads the naming request's protocol evidence without changing its archive.
-fn naming_context(
-    connection: &mut SqliteConnection,
-    naming_session: &str,
-    turn_id: Option<&str>,
-) -> Result<Option<CodexRequest>, AppError> {
-    let metadata = llm_usage_events::table
-        .filter(llm_usage_events::session_pk.eq(naming_session))
-        .filter(llm_usage_events::event_type.eq("request"))
-        .filter(
-            sql::<Nullable<Text>>("json_extract(llm_usage_events.metadata, '$.codex_turn_id')")
-                .eq(turn_id),
-        )
-        .order_by(llm_usage_events::observed_at.desc())
-        .select(llm_usage_events::metadata)
-        .first::<String>(connection)
-        .optional()?;
-    let Some(metadata) = metadata else {
-        return Ok(None);
-    };
-    let metadata = serde_json::from_str::<Value>(&metadata).unwrap_or(Value::Null);
-    Ok(CodexRequest::parse(&metadata))
 }
 
 /// Runs the one-time scans that bring events stored before capture existed up
@@ -945,7 +913,7 @@ mod tests {
         assert_eq!(parent_of(&mut database, "title-thread"), None);
         assert_eq!(session_title(&mut database, "second"), (None, None));
     }
-    fn archive(event: &mut Value, source: &str, installation: &str) {
+    fn archive(event: &mut Value, source: &str) {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let turn = event["metadata"]["codex_turn_id"].clone();
         let payload = json!({
@@ -954,7 +922,7 @@ mod tests {
                 {"role": "user", "content": [{"type": "input_text", "text": event["text"]}]}
             ],
             "client_metadata": {"x-codex-turn-metadata": json!({
-                "thread_source": source, "installation_id": installation
+                "thread_source": source
             }).to_string()}
         });
         event["metadata"] = json!({"codex_turn_id": turn, "raw_body": {"parts": [{
@@ -968,14 +936,14 @@ mod tests {
             for response_first in [false, true] {
                 let mut database = database();
                 let mut naming = codex_naming_thread("title-thread");
-                archive(&mut naming[0], "thread_title", "installation");
+                archive(&mut naming[0], "thread_title");
                 // Raw-only requests also work when the flattened text is absent.
                 naming[0]["text"] = Value::Null;
                 if response_first {
                     naming.reverse();
                 }
                 let mut task = codex_task("task", TASK_TURN, TASK);
-                archive(&mut task, "user", "installation");
+                archive(&mut task, "user");
                 if naming_first {
                     ingest(&mut database, &naming);
                     ingest(&mut database, &[task]);
@@ -994,24 +962,23 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_devices_installations_and_auxiliary_threads_do_not_withdraw_links() {
+    fn other_devices_and_auxiliary_threads_do_not_withdraw_links() {
         let mut database = database();
         let mut naming = codex_naming_thread("title-thread");
-        archive(&mut naming[0], "thread_title", "one");
+        archive(&mut naming[0], "thread_title");
         let mut task = codex_task("task", TASK_TURN, TASK);
-        archive(&mut task, "user", "one");
+        archive(&mut task, "user");
         ingest(&mut database, &[task]);
         ingest(&mut database, &naming);
         let task_pk = session_pk(&mut database, "task");
-        for (session, host, source, installation) in [
-            ("other-device", "another-host", "user", "one"),
-            ("other-install", "local", "user", "two"),
-            ("guardian", "local", "guardian_review", "one"),
-            ("subagent", "local", "subagent", "one"),
+        for (session, host, source) in [
+            ("other-device", "another-host", "user"),
+            ("guardian", "local", "guardian_review"),
+            ("subagent", "local", "subagent"),
         ] {
             let mut request = codex_task(session, TASK_TURN, TASK);
             request["device"]["host_name"] = json!(host);
-            archive(&mut request, source, installation);
+            archive(&mut request, source);
             ingest(&mut database, &[request]);
             assert_eq!(
                 parent_of(&mut database, "title-thread"),
@@ -1024,7 +991,7 @@ mod tests {
             );
         }
         let mut conflict = codex_task("second-task", TASK_TURN, TASK);
-        archive(&mut conflict, "user", "one");
+        archive(&mut conflict, "user");
         ingest(&mut database, &[conflict]);
         assert_eq!(parent_of(&mut database, "title-thread"), None);
         assert_eq!(session_title(&mut database, "task").0, None);
@@ -1034,9 +1001,9 @@ mod tests {
     fn repairs_existing_unlinked_raw_titles_once() {
         let mut database = database();
         let mut naming = codex_naming_thread("title-thread");
-        archive(&mut naming[0], "thread_title", "one");
+        archive(&mut naming[0], "thread_title");
         let mut task = codex_task("task", TASK_TURN, TASK);
-        archive(&mut task, "user", "one");
+        archive(&mut task, "user");
         ingest(&mut database, &[task]);
         ingest(&mut database, &naming);
         let task_pk = session_pk(&mut database, "task");

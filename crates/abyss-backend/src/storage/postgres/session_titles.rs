@@ -18,8 +18,8 @@ use crate::{
     usage::{
         SessionInfo,
         session_title::{
-            CodexRequest, NamingRequest, TITLE_GENERATION_PURPOSE, TitleTask, codex_turn_id,
-            codex_turn_id_range, may_carry_title, title_from_response,
+            NamingRequest, TITLE_GENERATION_PURPOSE, TitleTask, codex_turn_id, codex_turn_id_range,
+            may_carry_title, opens_with_prompt, title_from_response,
         },
     },
 };
@@ -258,13 +258,10 @@ fn match_pending_naming_threads(
     if nearby.is_empty() {
         return Ok(());
     }
-    let Some(request) = CodexRequest::parse(event.metadata) else {
-        return Ok(());
-    };
     for (naming_session, prompt) in nearby {
-        if prompt.is_some_and(|prompt| request.opens_with_prompt(&prompt)) {
+        if prompt.is_some_and(|prompt| opens_with_prompt(event.metadata, &prompt)) {
             // Recompute the complete candidate set before adding or withdrawing
-            // a link. A different device or installation is not a conflict.
+            // a link. A request from a different device is not a conflict.
             match_naming_thread(connection, naming_session)?;
         }
     }
@@ -344,9 +341,6 @@ fn match_naming_thread(
     ) else {
         return Ok(());
     };
-    let Some(naming) = naming_context(connection, naming_session, turn_id.as_deref())? else {
-        return Ok(());
-    };
     let device = agent_sessions::table
         .find(naming_session)
         .select(agent_sessions::device_context_id)
@@ -366,9 +360,7 @@ fn match_naming_thread(
         .load::<(Uuid, Value)>(connection)?;
     let sessions = candidates
         .into_iter()
-        .filter(|(_, metadata)| {
-            CodexRequest::parse(metadata).is_some_and(|request| request.matches(&naming, &prompt))
-        })
+        .filter(|(_, metadata)| opens_with_prompt(metadata, &prompt))
         .map(|(session, _)| session)
         .collect::<BTreeSet<_>>();
     let mut sessions = sessions.into_iter();
@@ -396,26 +388,6 @@ fn match_naming_thread(
             purpose: None,
         },
     )
-}
-
-/// Reads the naming request's protocol evidence without changing its archive.
-fn naming_context(
-    connection: &mut PgConnection,
-    naming_session: Uuid,
-    turn_id: Option<&str>,
-) -> Result<Option<CodexRequest>, AppError> {
-    let metadata = llm_usage_events::table
-        .filter(llm_usage_events::session_pk.eq(naming_session))
-        .filter(llm_usage_events::event_type.eq("request"))
-        .filter(sql::<Nullable<Text>>("llm_usage_events.metadata ->> 'codex_turn_id'").eq(turn_id))
-        .order_by(llm_usage_events::observed_at.desc())
-        .select(llm_usage_events::metadata)
-        .first::<Value>(connection)
-        .optional()?;
-    let Some(metadata) = metadata else {
-        return Ok(None);
-    };
-    Ok(CodexRequest::parse(&metadata))
 }
 
 /// Runs the one-time scans that bring events stored before capture existed up

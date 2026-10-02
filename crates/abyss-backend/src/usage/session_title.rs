@@ -95,114 +95,54 @@ impl NamingRequest {
                 prompt: None,
             });
         }
-        let raw = metadata.get("raw_body").is_some();
-        let request = if raw {
-            Some(CodexRequest::parse(metadata)?)
+        let text = if metadata.get("raw_body").is_some() {
+            codex_user_message(metadata, "thread_title")?
         } else {
-            None
+            text?.to_owned()
         };
-        if request.as_ref().is_some_and(|r| {
-            r.thread_source
-                .as_deref()
-                .is_some_and(|source| source != "thread_title")
-        }) {
+        Some(Self {
+            task: TitleTask::from_request(agent_name, &text)?,
+            prompt: codex_naming_prompt(&text).map(str::to_owned),
+        })
+    }
+}
+
+/// Reads the last user message from a Codex request. The protocol source, when
+/// present, distinguishes title tasks from ordinary work and auxiliary calls.
+fn codex_user_message(metadata: &Value, source: &str) -> Option<String> {
+    if metadata.get("raw_body").is_some() {
+        let values = bodies(metadata)?;
+        let payload = request_payload(&values)?;
+        let client = &payload["client_metadata"];
+        let context = match client.get("x-codex-turn-metadata") {
+            Some(encoded) => serde_json::from_str::<Value>(encoded.as_str()?).ok()?,
+            None => client.clone(),
+        };
+        if context["thread_source"]
+            .as_str()
+            .is_some_and(|value| value != source)
+        {
             return None;
         }
-        let text = match &request {
-            Some(request) => request.user_message.as_deref()?,
-            None => text?,
-        };
-        let task = TitleTask::from_request(agent_name, text)?;
-        Some(Self {
-            task,
-            prompt: (task == TitleTask::AuxiliarySession)
-                .then(|| codex_naming_prompt(text).map(str::to_owned))
-                .flatten(),
-        })
+        return request_messages(payload)
+            .into_iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.text);
     }
+    metadata
+        .pointer("/conversation/messages")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")?["text"]
+        .as_str()
+        .map(str::to_owned)
 }
 
-/// Evidence used only by the Codex adapter. Protocol identity is never inferred
-/// from quoted user text, tool output, or model names.
-pub struct CodexRequest {
-    user_message: Option<String>,
-    installation_id: Option<String>,
-    thread_source: Option<String>,
-    started_ms: Option<u64>,
-}
-
-impl CodexRequest {
-    /// Decodes an archived request or the older structured conversation format.
-    /// An incomplete archive cannot establish or contradict a title link.
-    pub fn parse(metadata: &Value) -> Option<Self> {
-        let (user_message, context, installation_id) = if metadata.get("raw_body").is_some() {
-            let values = bodies(metadata)?;
-            let payload = request_payload(&values)?;
-            let user_message = request_messages(payload)
-                .into_iter()
-                .rev()
-                .find(|message| message.role == "user")
-                .map(|message| message.text);
-            let client = &payload["client_metadata"];
-            let context = match client.get("x-codex-turn-metadata") {
-                Some(encoded) => serde_json::from_str::<Value>(encoded.as_str()?).ok()?,
-                None => client.clone(),
-            };
-            let installation_id = client
-                .get("x-codex-installation-id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            (user_message, context, installation_id)
-        } else {
-            let user_message = metadata
-                .pointer("/conversation/messages")
-                .and_then(Value::as_array)
-                .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "user"))
-                .and_then(|message| message["text"].as_str())
-                .map(str::to_owned);
-            (user_message, metadata.clone(), None)
-        };
-        Some(Self {
-            user_message,
-            installation_id: context
-                .get("installation_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or(installation_id),
-            thread_source: context
-                .get("thread_source")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            started_ms: context
-                .get("turn_started_at_unix_ms")
-                .and_then(Value::as_u64)
-                .or_else(|| codex_turn_id(metadata).and_then(turn_started_ms)),
-        })
-    }
-
-    /// Only ordinary user threads can receive a Codex-generated task title.
-    pub fn opens_with_prompt(&self, prompt: &str) -> bool {
-        self.thread_source
-            .as_deref()
-            .is_none_or(|source| source == "user")
-            && self
-                .user_message
-                .as_deref()
-                .is_some_and(|text| text.trim_start().starts_with(prompt))
-    }
-
-    /// Requires compatible installation identity, turn time and quoted content.
-    pub fn matches(&self, naming: &Self, prompt: &str) -> bool {
-        self.opens_with_prompt(prompt)
-            && match (&self.installation_id, &naming.installation_id) {
-                (Some(task), Some(title)) => task == title,
-                _ => true,
-            }
-            && match (self.started_ms, naming.started_ms) {
-                (Some(task), Some(title)) => task.abs_diff(title) <= CODEX_LINK_WINDOW_MS,
-                _ => false,
-            }
-    }
+/// A naming prompt may be a truncated prefix of the task's user message.
+pub fn opens_with_prompt(metadata: &Value, prompt: &str) -> bool {
+    codex_user_message(metadata, "user").is_some_and(|text| text.trim_start().starts_with(prompt))
 }
 
 #[derive(Deserialize)]
@@ -255,7 +195,11 @@ pub fn codex_turn_id(metadata: &Value) -> Option<&str> {
 /// time held in the top 48 bits.
 pub fn codex_turn_id_range(turn_id: &str) -> Option<(String, String)> {
     const TIME_SHIFT: u32 = 80;
-    let started_ms = turn_started_ms(turn_id)?;
+    let uuid = Uuid::parse_str(turn_id).ok()?;
+    if uuid.get_version_num() != 7 {
+        return None;
+    }
+    let started_ms = u64::try_from(uuid.as_u128().checked_shr(TIME_SHIFT)?).ok()?;
     let low =
         u128::from(started_ms.saturating_sub(CODEX_LINK_WINDOW_MS)).checked_shl(TIME_SHIFT)?;
     let high = u128::from(started_ms.saturating_add(CODEX_LINK_WINDOW_MS))
@@ -265,13 +209,6 @@ pub fn codex_turn_id_range(turn_id: &str) -> Option<(String, String)> {
         Uuid::from_u128(low).to_string(),
         Uuid::from_u128(high).to_string(),
     ))
-}
-
-fn turn_started_ms(turn_id: &str) -> Option<u64> {
-    let uuid = Uuid::parse_str(turn_id).ok()?;
-    (uuid.get_version_num() == 7)
-        .then(|| u64::try_from(uuid.as_u128() >> 80_u32).ok())
-        .flatten()
 }
 
 #[cfg(test)]
@@ -362,14 +299,9 @@ mod tests {
             {"role": "user", "text": "画一只鹈鹕骑自行车，不要联网"},
             {"role": "assistant", "text": "好的"},
         ]}});
-        let request = CodexRequest::parse(&metadata).expect("legacy request");
-        assert!(request.opens_with_prompt("画一只鹈鹕"));
-        assert!(!request.opens_with_prompt("<environment_context>"));
-        assert!(
-            !CodexRequest::parse(&serde_json::json!({}))
-                .expect("legacy")
-                .opens_with_prompt("画")
-        );
+        assert!(opens_with_prompt(&metadata, "画一只鹈鹕"));
+        assert!(!opens_with_prompt(&metadata, "<environment_context>"));
+        assert!(!opens_with_prompt(&serde_json::json!({}), "画"));
     }
 
     #[test]
@@ -458,49 +390,10 @@ mod tests {
         ] {
             let metadata = serde_json::json!({"raw_body": {"parts": [part]},
                 "conversation": {"messages": [{"role": "user", "text": "hello"}]}});
-            assert!(CodexRequest::parse(&metadata).is_none());
+            assert!(!opens_with_prompt(&metadata, "hello"));
             assert!(
                 NamingRequest::parse("codex", Some(CODEX_NAMING_INSTRUCTION), &metadata).is_none()
             );
         }
-    }
-
-    #[test]
-    fn codex_matches_installation_source_and_explicit_turn_time() {
-        let naming = CodexRequest::parse(&serde_json::json!({
-            "installation_id": "one", "thread_source": "thread_title", "turn_started_at_unix_ms": 100_000_u64
-        })).expect("title");
-        let mut metadata = serde_json::json!({
-            "codex_turn_id": "01a0f320-1350-71c2-9c93-5fc5fd7a6bfb",
-            "installation_id": "one", "thread_source": "user", "turn_started_at_unix_ms": 99_950_u64,
-            "conversation": {"messages": [{"role": "user", "text": "hello there"}]}
-        });
-        assert!(
-            CodexRequest::parse(&metadata)
-                .expect("task")
-                .matches(&naming, "hello")
-        );
-        metadata["installation_id"] = serde_json::json!("two");
-        assert!(
-            !CodexRequest::parse(&metadata)
-                .expect("task")
-                .matches(&naming, "hello")
-        );
-        metadata["installation_id"] = serde_json::json!("one");
-        for source in ["guardian_review", "subagent", "thread_title"] {
-            metadata["thread_source"] = serde_json::json!(source);
-            assert!(
-                !CodexRequest::parse(&metadata)
-                    .expect("task")
-                    .matches(&naming, "hello")
-            );
-        }
-        metadata["thread_source"] = serde_json::json!("user");
-        metadata["turn_started_at_unix_ms"] = serde_json::json!(160_001_u64);
-        assert!(
-            !CodexRequest::parse(&metadata)
-                .expect("task")
-                .matches(&naming, "hello")
-        );
     }
 }

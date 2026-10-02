@@ -16,7 +16,7 @@ CLAUDE_NAMING = "You are naming a coding session"
 
 
 def run_title_contract(base_url: str, token: str, run_id: str) -> None:
-    def make(session, kind, text, *, source="user", installation="one", agent="codex"):
+    def make(session, kind, text, *, source="user", agent="codex"):
         value = event(str(uuid.uuid4()), f"{run_id}-{session}", kind, text, {}, run_id)
         value.pop("attachments", None)
         value["agent"]["name"] = agent
@@ -27,7 +27,7 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
             payload = {
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
                 "client_metadata": {"x-codex-turn-metadata": json.dumps({
-                    "thread_source": source, "installation_id": installation,
+                    "thread_source": source,
                 })},
             }
             value["metadata"]["raw_body"] = {"parts": [{
@@ -61,8 +61,7 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
 
     other_device = make("other-device", "request", PROMPT)
     other_device["device"]["host_name"] += "-other"
-    ingest(other_device, make("other-installation", "request", PROMPT, installation="two"),
-           make("guardian", "request", PROMPT, source="guardian_review"))
+    ingest(other_device, make("guardian", "request", PROMPT, source="guardian_review"))
     require(session("naming")["parent_session_pk"] == task["session_pk"], "unrelated requests do not withdraw the link")
 
     ingest(make("conflict", "request", PROMPT))

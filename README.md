@@ -18,7 +18,7 @@ and optional full-text search.
 
 Session titles have dedicated adapters for Codex and Claude Code. Claude Code
 names its own session; Codex names a separate task thread, matched by quoted
-user content, turn start time, device, and available installation identity.
+user content, turn start time, and device.
 Only a unique task candidate receives the generated title. Other Agents keep
 the default session identity and are not classified using these Agents' naming
 templates. Both adapters read archived protocol messages and support older
