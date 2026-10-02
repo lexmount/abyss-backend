@@ -266,6 +266,32 @@ def run(base_url: str, token: str, run_id: str) -> None:
         for turn in timeline.json()["turns"]
         for item in turn["events"]
     ]
+    trajectory = request(
+        base_url,
+        "GET",
+        f"/v1/agent-usage/sessions/{session_pk}/trajectory",
+        token=token,
+    )
+    require_status(trajectory, 200, "session trajectory")
+    usage_events = trajectory.json()["events"]
+    require(
+        [item["event_pk"] for item in usage_events]
+        == [item["id"] for item in timeline_events],
+        "trajectory usage must preserve every event in authoritative order",
+    )
+    for usage_event, timeline_event in zip(usage_events, timeline_events):
+        for field in (
+            "turn_index", "event_type", "observed_at", "llm_model",
+            "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_write_tokens", "reasoning_tokens", "total_tokens",
+        ):
+            require(
+                usage_event[field] == timeline_event[field],
+                f"trajectory usage {field} must match the authoritative event",
+            )
+        require(usage_event["token_usage_available"], "nonzero usage must be available")
+        require("text" not in usage_event and "metadata" not in usage_event,
+                "trajectory usage summaries must omit content bodies")
     require(
         [item["event_id"] for item in timeline_events]
         == [request_event_id, response_event_id],

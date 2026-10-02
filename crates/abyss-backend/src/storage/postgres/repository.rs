@@ -1755,8 +1755,8 @@ mod tests {
 
         let tokens = normalized_tokens(&event).expect("token usage should normalize");
         assert_eq!(
-            tokens.total, 34_i64,
-            "missing total_tokens should be derived from all token components"
+            tokens.total, 29_i64,
+            "missing total_tokens should sum disjoint counters without adding reasoning twice"
         );
     }
 

@@ -38,6 +38,74 @@ pub struct SessionTrajectoryResponse {
     pub session: SessionInfo,
     /// Items in authoritative event order.
     pub items: Vec<TrajectoryItem>,
+    /// Every observed request and response, including events with no new content.
+    pub events: Vec<TrajectoryEvent>,
+}
+
+#[derive(Debug, Serialize)]
+/// Lightweight usage summary independent of content de-duplication.
+pub struct TrajectoryEvent {
+    /// Event that owns these counters.
+    pub event_pk: Uuid,
+    /// Backend-normalized turn number.
+    pub turn_index: i32,
+    /// Canonical request or response value.
+    pub event_type: String,
+    /// Observation time of the event.
+    pub observed_at: DateTime<Utc>,
+    /// Model requested or returned by the provider.
+    pub llm_model: String,
+    /// Uncached input tokens; cache counters are separate.
+    pub input_tokens: i64,
+    /// Output tokens, including reasoning.
+    pub output_tokens: i64,
+    /// Input tokens read from a provider cache.
+    pub cache_read_tokens: i64,
+    /// Input tokens written into a provider cache.
+    pub cache_write_tokens: i64,
+    /// Reasoning breakdown of output tokens.
+    pub reasoning_tokens: i64,
+    /// Authoritative total for this event, counted once.
+    pub total_tokens: i64,
+    /// Whether counters were reported or estimated rather than absent or hidden.
+    pub token_usage_available: bool,
+    /// Whether the collector estimated token usage.
+    pub token_usage_estimated: bool,
+}
+
+impl From<&UsageEventResponse> for TrajectoryEvent {
+    fn from(event: &UsageEventResponse) -> Self {
+        let source = event
+            .metadata
+            .get("token_usage_source")
+            .and_then(Value::as_str);
+        let hidden =
+            event.metadata.pointer("/content_policy/token_usage") == Some(&Value::Bool(false));
+        let has_usage = event.input_tokens != 0
+            || event.output_tokens != 0
+            || event.cache_read_tokens != 0
+            || event.cache_write_tokens != 0
+            || event.reasoning_tokens != 0
+            || event.total_tokens != 0;
+        Self {
+            event_pk: event.id,
+            turn_index: event.turn_index,
+            event_type: event.event_type.clone(),
+            observed_at: event.observed_at,
+            llm_model: event.llm_model.clone(),
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_write_tokens,
+            reasoning_tokens: event.reasoning_tokens,
+            total_tokens: event.total_tokens,
+            token_usage_available: !hidden
+                && source != Some("absent")
+                && (has_usage || source.is_some()),
+            token_usage_estimated: event.metadata.get("token_usage_estimated")
+                == Some(&Value::Bool(true)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -142,8 +210,10 @@ impl TrajectoryItem {
 /// Merges an ordered session timeline into its trajectory.
 pub fn build(timeline: SessionTimelineResponse) -> SessionTrajectoryResponse {
     let mut merger = Merger::default();
+    let mut events = Vec::new();
     for turn in &timeline.turns {
         for event in &turn.events {
+            events.push(TrajectoryEvent::from(event));
             if event.event_type == "request" {
                 merger.request(event);
             } else {
@@ -154,6 +224,7 @@ pub fn build(timeline: SessionTimelineResponse) -> SessionTrajectoryResponse {
     SessionTrajectoryResponse {
         session: timeline.session,
         items: merger.items,
+        events,
     }
 }
 
@@ -358,6 +429,68 @@ fn segment_str<'a>(segment: &'a Value, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_retains_events_without_new_content_and_counts_each_event_once() {
+        let body = r#"{"input":[{"role":"user","content":"hello"}]}"#;
+        let mut request = raw_event("request", body);
+        request.input_tokens = 2;
+        request.cache_read_tokens = 77_000;
+        request.cache_write_tokens = 400;
+        request.total_tokens = 77_402;
+        let repeated = raw_event("request", body);
+        let mut response = event("response", "", json!({"token_usage_estimated": true}));
+        response.llm_model = "other-model".to_owned();
+        response.output_tokens = 150;
+        response.reasoning_tokens = 40;
+        response.total_tokens = 150;
+        let expected_ids = vec![request.id, repeated.id, response.id];
+
+        let trajectory = build(timeline(vec![request, repeated, response]));
+        assert_eq!(trajectory.items.len(), 1);
+        assert_eq!(
+            trajectory
+                .events
+                .iter()
+                .map(|event| event.event_pk)
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(trajectory.events[0].total_tokens, 77_402);
+        assert_eq!(trajectory.events[0].cache_read_tokens, 77_000);
+        assert_eq!(trajectory.events[0].cache_write_tokens, 400);
+        assert!(trajectory.events[0].token_usage_available);
+        assert!(!trajectory.events[1].token_usage_available);
+        assert_eq!(trajectory.events[2].llm_model, "other-model");
+        assert_eq!(trajectory.events[2].output_tokens, 150);
+        assert_eq!(trajectory.events[2].reasoning_tokens, 40);
+        assert!(trajectory.events[2].token_usage_estimated);
+        let serialized = serde_json::to_value(&trajectory.events).unwrap();
+        assert!(serialized[0].get("text").is_none());
+        assert!(serialized[0].get("metadata").is_none());
+    }
+
+    #[test]
+    fn usage_distinguishes_reported_zero_from_absent_and_hidden_counts() {
+        let reported = event(
+            "response",
+            "",
+            json!({"token_usage_source": "provider_reported"}),
+        );
+        let absent = event("request", "", json!({"token_usage_source": "absent"}));
+        let mut hidden = event(
+            "request",
+            "",
+            json!({"content_policy": {"token_usage": false}}),
+        );
+        hidden.input_tokens = 10;
+        hidden.total_tokens = 10;
+        let trajectory = build(timeline(vec![reported, absent, hidden]));
+        assert_eq!(trajectory.events.len(), 3);
+        assert!(trajectory.events[0].token_usage_available);
+        assert!(!trajectory.events[1].token_usage_available);
+        assert!(!trajectory.events[2].token_usage_available);
+    }
+
     use serde_json::json;
 
     use super::*;
