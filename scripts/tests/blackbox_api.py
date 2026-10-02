@@ -374,6 +374,9 @@ def run(base_url: str, token: str, run_id: str) -> None:
         "search must return structured highlights",
     )
 
+    from session_titles_api import run_title_contract
+
+    run_title_contract(base_url, token, run_id)
     print(f"blackbox API contract passed for {session_id}")
 
 

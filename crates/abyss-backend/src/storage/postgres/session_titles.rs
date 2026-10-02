@@ -18,8 +18,8 @@ use crate::{
     usage::{
         SessionInfo,
         session_title::{
-            TITLE_GENERATION_PURPOSE, TitleTask, codex_naming_prompt, codex_turn_id,
-            codex_turn_id_range, may_carry_title, opens_with_prompt, title_from_response,
+            CodexRequest, NamingRequest, TITLE_GENERATION_PURPOSE, TitleTask, codex_turn_id,
+            codex_turn_id_range, may_carry_title, title_from_response,
         },
     },
 };
@@ -29,6 +29,8 @@ const BACKFILL_NAME: &str = "session_titles_v1";
 /// Marks the one-time matching of Codex naming threads captured before
 /// matching existed.
 const LINK_BACKFILL_NAME: &str = "codex_title_links_v1";
+/// Rebuild links after switching to archived request bodies and scoped adapters.
+const LINK_REPAIR_NAME: &str = "codex_title_links_v2";
 /// Widest delivery delay tolerated between a naming thread and its task when
 /// looking for candidates, in hours.
 const LINK_DELIVERY_WINDOW_HOURS: i64 = 24;
@@ -66,16 +68,6 @@ struct TitleUpdate<'a> {
     purpose: Option<&'a str>,
 }
 
-/// Returns `true` when an event's text could belong to a naming call, so
-/// ingestion copies text only for candidates.
-pub(super) fn is_candidate(event_type: &str, text: &str) -> bool {
-    match event_type {
-        "request" => TitleTask::from_request(text).is_some(),
-        "response" => may_carry_title(text),
-        _ => false,
-    }
-}
-
 /// Records the session title when the event completes a naming call, and
 /// matches Codex naming threads with the task sessions they name.
 ///
@@ -97,13 +89,11 @@ fn naming_call(
     connection: &mut PgConnection,
     event: &CapturedEvent<'_>,
 ) -> Result<Option<NamingCall>, AppError> {
-    let Some(text) = event.text else {
-        return Ok(None);
-    };
     let session = event.session_pk;
     match event.event_type {
         "request" => {
-            let Some(task) = TitleTask::from_request(text) else {
+            let Some(naming) = NamingRequest::parse(event.agent_name, event.text, event.metadata)
+            else {
                 return Ok(None);
             };
             let response = llm_usage_events::table
@@ -124,32 +114,32 @@ fn naming_call(
                     .and_then(title_from_response)
                     .map(|title| (title, id, observed_at))
             });
-            let prompt = codex_naming_prompt(text).map(str::to_owned);
             Ok(Some(NamingCall {
-                task,
+                task: naming.task,
                 title,
-                prompt,
+                prompt: naming.prompt,
             }))
         }
-        "response" if may_carry_title(text) => {
-            let Some(title) = title_from_response(text) else {
+        "response" if event.text.is_some_and(may_carry_title) => {
+            let Some(title) = event.text.and_then(title_from_response) else {
                 return Ok(None);
             };
-            let request_text = llm_usage_events::table
+            let request = llm_usage_events::table
                 .filter(llm_usage_events::session_pk.eq(session))
                 .filter(llm_usage_events::turn_index.eq(event.turn_index))
                 .filter(llm_usage_events::event_type.eq("request"))
                 .filter(llm_usage_events::observed_at.le(event.observed_at))
                 .order_by(llm_usage_events::observed_at.desc())
-                .select(llm_usage_events::text)
-                .first::<Option<String>>(connection)
-                .optional()?
-                .flatten();
-            Ok(request_text.as_deref().and_then(|request_text| {
-                TitleTask::from_request(request_text).map(|task| NamingCall {
-                    task,
-                    title: Some((title, event.event_pk, event.observed_at)),
-                    prompt: codex_naming_prompt(request_text).map(str::to_owned),
+                .select((llm_usage_events::text, llm_usage_events::metadata))
+                .first::<(Option<String>, Value)>(connection)
+                .optional()?;
+            Ok(request.and_then(|(text, metadata)| {
+                NamingRequest::parse(event.agent_name, text.as_deref(), &metadata).map(|naming| {
+                    NamingCall {
+                        task: naming.task,
+                        title: Some((title, event.event_pk, event.observed_at)),
+                        prompt: naming.prompt,
+                    }
                 })
             }))
         }
@@ -253,28 +243,29 @@ fn match_pending_naming_threads(
     let Some((low, high)) = codex_turn_id(event.metadata).and_then(codex_turn_id_range) else {
         return Ok(());
     };
-    let session = event.session_pk;
     let nearby = session_titles::table
         .filter(session_titles::user_id.eq(event.user_id))
+        .filter(session_titles::purpose.eq(TITLE_GENERATION_PURPOSE))
         .filter(session_titles::title.is_not_null())
+        .filter(
+            session_titles::parent_session_pk
+                .is_null()
+                .or(session_titles::parent_session_pk.ne(event.session_pk)),
+        )
         .filter(session_titles::naming_turn_id.between(low, high))
-        .select((
-            session_titles::session_pk,
-            session_titles::naming_prompt,
-            session_titles::parent_session_pk,
-            session_titles::title_event_pk,
-        ))
-        .load::<(Uuid, Option<String>, Option<Uuid>, Option<Uuid>)>(connection)?;
-    for (naming_session, prompt, parent, title_event_pk) in nearby {
-        if !prompt.is_some_and(|prompt| opens_with_prompt(event.metadata, &prompt)) {
-            continue;
-        }
-        match parent {
-            None => match_naming_thread(connection, naming_session)?,
-            Some(parent) if parent != session => {
-                unmatch(connection, naming_session, parent, title_event_pk)?;
-            }
-            Some(_) => {}
+        .select((session_titles::session_pk, session_titles::naming_prompt))
+        .load::<(Uuid, Option<String>)>(connection)?;
+    if nearby.is_empty() {
+        return Ok(());
+    }
+    let Some(request) = CodexRequest::parse(event.metadata) else {
+        return Ok(());
+    };
+    for (naming_session, prompt) in nearby {
+        if prompt.is_some_and(|prompt| request.opens_with_prompt(&prompt)) {
+            // Recompute the complete candidate set before adding or withdrawing
+            // a link. A different device or installation is not a conflict.
+            match_naming_thread(connection, naming_session)?;
         }
     }
     Ok(())
@@ -313,10 +304,9 @@ fn match_naming_thread(
     connection: &mut PgConnection,
     naming_session: Uuid,
 ) -> Result<(), AppError> {
-    let Some((user_id, title, title_event_pk, title_observed_at, turn_id, prompt)) =
+    let Some((user_id, title, title_event_pk, title_observed_at, turn_id, prompt, old_parent)) =
         session_titles::table
             .find(naming_session)
-            .filter(session_titles::parent_session_pk.is_null())
             .select((
                 session_titles::user_id,
                 session_titles::title,
@@ -324,6 +314,7 @@ fn match_naming_thread(
                 session_titles::title_observed_at,
                 session_titles::naming_turn_id,
                 session_titles::naming_prompt,
+                session_titles::parent_session_pk,
             ))
             .first::<(
                 Uuid,
@@ -332,6 +323,7 @@ fn match_naming_thread(
                 Option<DateTime<Utc>>,
                 Option<String>,
                 Option<String>,
+                Option<Uuid>,
             )>(connection)
             .optional()?
     else {
@@ -350,6 +342,9 @@ fn match_naming_thread(
         title_observed_at.checked_sub_signed(window),
         title_observed_at.checked_add_signed(window),
     ) else {
+        return Ok(());
+    };
+    let Some(naming) = naming_context(connection, naming_session, turn_id.as_deref())? else {
         return Ok(());
     };
     let device = agent_sessions::table
@@ -371,11 +366,22 @@ fn match_naming_thread(
         .load::<(Uuid, Value)>(connection)?;
     let sessions = candidates
         .into_iter()
-        .filter(|(_, metadata)| opens_with_prompt(metadata, &prompt))
+        .filter(|(_, metadata)| {
+            CodexRequest::parse(metadata).is_some_and(|request| request.matches(&naming, &prompt))
+        })
         .map(|(session, _)| session)
         .collect::<BTreeSet<_>>();
     let mut sessions = sessions.into_iter();
-    let (Some(task_session), None) = (sessions.next(), sessions.next()) else {
+    let task_session = match (sessions.next(), sessions.next()) {
+        (Some(session), None) => Some(session),
+        _ => None,
+    };
+    if let Some(parent) = old_parent
+        && Some(parent) != task_session
+    {
+        unmatch(connection, naming_session, parent, Some(title_event_pk))?;
+    }
+    let Some(task_session) = task_session else {
         return Ok(());
     };
     diesel::update(session_titles::table.find(naming_session))
@@ -392,11 +398,32 @@ fn match_naming_thread(
     )
 }
 
+/// Reads the naming request's protocol evidence without changing its archive.
+fn naming_context(
+    connection: &mut PgConnection,
+    naming_session: Uuid,
+    turn_id: Option<&str>,
+) -> Result<Option<CodexRequest>, AppError> {
+    let metadata = llm_usage_events::table
+        .filter(llm_usage_events::session_pk.eq(naming_session))
+        .filter(llm_usage_events::event_type.eq("request"))
+        .filter(sql::<Nullable<Text>>("llm_usage_events.metadata ->> 'codex_turn_id'").eq(turn_id))
+        .order_by(llm_usage_events::observed_at.desc())
+        .select(llm_usage_events::metadata)
+        .first::<Value>(connection)
+        .optional()?;
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    Ok(CodexRequest::parse(&metadata))
+}
+
 /// Runs the one-time scans that bring events stored before capture existed up
 /// to date.
 pub(super) fn backfill(connection: &mut PgConnection) -> Result<(), AppError> {
     run_once(connection, BACKFILL_NAME, backfill_titles)?;
-    run_once(connection, LINK_BACKFILL_NAME, backfill_links)
+    run_once(connection, LINK_BACKFILL_NAME, backfill_links)?;
+    run_once(connection, LINK_REPAIR_NAME, backfill_links)
 }
 
 fn run_once(
@@ -429,6 +456,7 @@ fn run_once(
 fn backfill_titles(connection: &mut PgConnection) -> Result<(), AppError> {
     let requests = llm_usage_events::table
         .filter(llm_usage_events::event_type.eq("request"))
+        .filter(llm_usage_events::agent_name.eq_any(["codex", "claude-code"]))
         .filter(
             llm_usage_events::text
                 .like("%You are naming a coding session%")
@@ -440,12 +468,24 @@ fn backfill_titles(connection: &mut PgConnection) -> Result<(), AppError> {
             llm_usage_events::user_id,
             llm_usage_events::session_pk,
             llm_usage_events::turn_index,
+            llm_usage_events::agent_name,
             llm_usage_events::text,
             llm_usage_events::metadata,
             llm_usage_events::observed_at,
         ))
-        .load::<(Uuid, Uuid, Uuid, i32, Option<String>, Value, DateTime<Utc>)>(connection)?;
-    for (event_pk, user_id, session_pk, turn_index, text, metadata, observed_at) in requests {
+        .load::<(
+            Uuid,
+            Uuid,
+            Uuid,
+            i32,
+            String,
+            Option<String>,
+            Value,
+            DateTime<Utc>,
+        )>(connection)?;
+    for (event_pk, user_id, session_pk, turn_index, agent_name, text, metadata, observed_at) in
+        requests
+    {
         capture(
             connection,
             &CapturedEvent {
@@ -453,7 +493,7 @@ fn backfill_titles(connection: &mut PgConnection) -> Result<(), AppError> {
                 session_pk,
                 event_pk,
                 turn_index,
-                agent_name: "",
+                agent_name: &agent_name,
                 event_type: "request",
                 text: text.as_deref(),
                 metadata: &metadata,
@@ -468,14 +508,13 @@ fn backfill_titles(connection: &mut PgConnection) -> Result<(), AppError> {
 fn backfill_links(connection: &mut PgConnection) -> Result<(), AppError> {
     let naming_sessions = session_titles::table
         .filter(session_titles::purpose.eq(TITLE_GENERATION_PURPOSE))
-        .filter(session_titles::naming_turn_id.is_null())
         .select(session_titles::session_pk)
         .load::<Uuid>(connection)?;
     for naming_session in naming_sessions {
         let request = llm_usage_events::table
             .filter(llm_usage_events::session_pk.eq(naming_session))
             .filter(llm_usage_events::event_type.eq("request"))
-            .filter(llm_usage_events::text.like("%Generate a concise, single-line task title%"))
+            .filter(llm_usage_events::agent_name.eq("codex"))
             .order_by(llm_usage_events::observed_at.desc())
             .select((llm_usage_events::text, llm_usage_events::metadata))
             .first::<(Option<String>, Value)>(connection)
@@ -483,10 +522,13 @@ fn backfill_links(connection: &mut PgConnection) -> Result<(), AppError> {
         let Some((text, metadata)) = request else {
             continue;
         };
+        let Some(naming) = NamingRequest::parse("codex", text.as_deref(), &metadata) else {
+            continue;
+        };
         diesel::update(session_titles::table.find(naming_session))
             .set((
                 session_titles::naming_turn_id.eq(codex_turn_id(&metadata)),
-                session_titles::naming_prompt.eq(text.as_deref().and_then(codex_naming_prompt)),
+                session_titles::naming_prompt.eq(naming.prompt),
             ))
             .execute(connection)?;
         match_naming_thread(connection, naming_session)?;

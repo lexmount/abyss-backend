@@ -708,10 +708,6 @@ fn ingest_one_event(
     )?;
     let tokens = normalized_tokens(event)?;
     let text = normalized_optional(event.text.as_deref());
-    let naming_text = text
-        .as_deref()
-        .filter(|text| session_titles::is_candidate(event.event_type.as_str(), text))
-        .map(str::to_owned);
 
     // `event_id` is the idempotency key supplied by the collector. Duplicate
     // observations are accepted as no-ops instead of failing the whole batch.
@@ -772,7 +768,7 @@ fn ingest_one_event(
                 turn_index,
                 agent_name: &agent_name,
                 event_type: event.event_type.as_str(),
-                text: naming_text.as_deref(),
+                text: event.text.as_deref(),
                 metadata: &event.metadata,
                 observed_at,
             },

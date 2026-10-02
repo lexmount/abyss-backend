@@ -11,6 +11,7 @@ pub mod attachments;
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
+mod provider_body;
 /// Owner-scoped session index contracts.
 pub mod session_list;
 pub mod session_title;
