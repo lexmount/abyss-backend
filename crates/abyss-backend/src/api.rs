@@ -25,7 +25,7 @@ use crate::{
     search::{SessionSearchQuery, SessionSearchResponse},
     storage::StorageBackend,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
+        IngestEventsRequest, IngestEventsResponse, RawEventListResponse, RawEventsQuery,
         SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
         TokenUsageSummaryResponse, UsageEventResponse,
         session_list::{SessionListQuery, SessionListResponse},
@@ -261,14 +261,18 @@ async fn raw_events(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<RawEventsQuery>,
-) -> Result<Json<RawEventsResponse>, AppError> {
+) -> Result<Response, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
     let default_page_size = state.default_page_size;
+    let includes_content = query.includes_content();
     let response = state
         .storage
         .raw_events(user_id, query, default_page_size)
         .await?;
-    Ok(Json(response))
+    if !includes_content {
+        return Ok(Json(RawEventListResponse::from_events(response)).into_response());
+    }
+    Ok(Json(response).into_response())
 }
 
 #[derive(Serialize)]

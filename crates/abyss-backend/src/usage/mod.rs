@@ -365,6 +365,27 @@ pub struct RawEventsQuery {
     pub limit: Option<i64>,
     /// Number of newest matching events to skip.
     pub offset: Option<i64>,
+    /// Selects complete events or the content-free list projection.
+    pub fields: Option<RawEventFields>,
+}
+
+impl RawEventsQuery {
+    /// Whether events carry their text, metadata, and attachments.
+    pub fn includes_content(&self) -> bool {
+        self.fields.unwrap_or_default() == RawEventFields::Full
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Response projection requested from the raw-event endpoint.
+pub enum RawEventFields {
+    /// Return every event field, including text, metadata, and attachments.
+    #[default]
+    Full,
+    /// Return what an event list shows. Text and metadata hold whole request
+    /// bodies, so storage does not read them and attachments are not loaded.
+    List,
 }
 
 #[derive(Debug, Serialize)]
@@ -374,6 +395,110 @@ pub struct RawEventsResponse {
     pub events: Vec<UsageEventResponse>,
     /// Decimal offset for the next page, or `None` at the end.
     pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+/// One page of usage events without their content, for event lists.
+pub struct RawEventListResponse {
+    /// Events ordered from newest to oldest observation time.
+    pub events: Vec<UsageEventListItem>,
+    /// Decimal offset for the next page, or `None` at the end.
+    pub next_page_token: Option<String>,
+}
+
+impl RawEventListResponse {
+    /// Drops the content fields from a page loaded without them.
+    pub fn from_events(response: RawEventsResponse) -> Self {
+        Self {
+            events: response
+                .events
+                .into_iter()
+                .map(UsageEventListItem::from)
+                .collect(),
+            next_page_token: response.next_page_token,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// One usage event as an event list shows it: identity, model, Agent, device,
+/// and token counts, without text, metadata, or attachments.
+pub struct UsageEventListItem {
+    /// Backend-generated event primary key.
+    pub id: Uuid,
+    /// Collector-generated idempotency key.
+    pub event_id: String,
+    /// Authenticated owner identifier.
+    pub user_id: Uuid,
+    /// Backend device-context primary key.
+    pub device_context_id: Uuid,
+    /// Device host name, when the referenced device still exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    /// Device platform, when the referenced device still exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// Backend session primary key.
+    pub session_pk: Uuid,
+    /// Backend turn primary key.
+    pub turn_pk: Uuid,
+    /// Canonical Agent name.
+    pub agent_name: String,
+    /// Agent version observed on this event.
+    pub agent_version: Option<String>,
+    /// Agent-native session identifier.
+    pub session_id: String,
+    /// Backend-normalized turn number.
+    pub turn_index: i32,
+    /// Canonical LLM provider slug.
+    pub llm_provider: String,
+    /// Provider-specific model identifier.
+    pub llm_model: String,
+    /// Canonical request or response value.
+    pub event_type: String,
+    /// Normalized input-token count.
+    pub input_tokens: i64,
+    /// Normalized output-token count.
+    pub output_tokens: i64,
+    /// Normalized cache-read-token count.
+    pub cache_read_tokens: i64,
+    /// Normalized cache-write-token count.
+    pub cache_write_tokens: i64,
+    /// Normalized reasoning-token count.
+    pub reasoning_tokens: i64,
+    /// Provider-reported or derived total-token count.
+    pub total_tokens: i64,
+    /// Collector observation timestamp.
+    pub observed_at: DateTime<Utc>,
+}
+
+impl From<UsageEventResponse> for UsageEventListItem {
+    fn from(event: UsageEventResponse) -> Self {
+        Self {
+            id: event.id,
+            event_id: event.event_id,
+            user_id: event.user_id,
+            device_context_id: event.device_context_id,
+            host_name: event.host_name,
+            platform: event.platform,
+            session_pk: event.session_pk,
+            turn_pk: event.turn_pk,
+            agent_name: event.agent_name,
+            agent_version: event.agent_version,
+            session_id: event.session_id,
+            turn_index: event.turn_index,
+            llm_provider: event.llm_provider,
+            llm_model: event.llm_model,
+            event_type: event.event_type,
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_write_tokens,
+            reasoning_tokens: event.reasoning_tokens,
+            total_tokens: event.total_tokens,
+            observed_at: event.observed_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -590,9 +715,9 @@ pub fn empty_metadata() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        IngestEventsRequest, SummaryFields, SummaryQuery, SummaryResponse, SummaryRow,
-        TokenUsageSummaryResponse, UsageEventType, session_metadata_from_event,
-        session_working_directory,
+        IngestEventsRequest, RawEventFields, RawEventsQuery, SummaryFields, SummaryQuery,
+        SummaryResponse, SummaryRow, TokenUsageSummaryResponse, UsageEventType,
+        session_metadata_from_event, session_working_directory,
     };
     use serde_json::json;
 
@@ -729,6 +854,18 @@ mod tests {
         .expect("summary query should deserialize token usage field mode");
 
         assert_eq!(query.fields, Some(SummaryFields::TokenUsage));
+    }
+
+    #[test]
+    fn raw_events_query_selects_the_list_projection() {
+        let list = serde_json::from_value::<RawEventsQuery>(json!({"fields": "list"}))
+            .expect("list query should deserialize");
+        let full = serde_json::from_value::<RawEventsQuery>(json!({}))
+            .expect("default query should deserialize");
+
+        assert_eq!(list.fields, Some(RawEventFields::List));
+        assert!(!list.includes_content());
+        assert!(full.includes_content());
     }
 
     #[test]

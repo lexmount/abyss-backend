@@ -15,7 +15,7 @@ use diesel::{
     result::OptionalExtension,
     sql_query,
     sql_types::{
-        Array, BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+        Array, BigInt, Bool, Bytea, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
     },
 };
 use uuid::Uuid;
@@ -578,6 +578,7 @@ pub fn raw_events(
             limit: page_size.saturating_add(1_i64),
             offset,
         },
+        query.includes_content(),
     )?;
     // Fetch one sentinel row beyond the requested page so no count query is
     // needed merely to determine whether a next offset exists.
@@ -586,7 +587,11 @@ pub fn raw_events(
         events.truncate(page_size_usize);
     }
     let device_contexts = load_device_contexts_for_events(connection, &events)?;
-    let mut attachments_by_event = load_attachments_for_events(connection, &events)?;
+    let mut attachments_by_event = if query.includes_content() {
+        load_attachments_for_events(connection, &events)?
+    } else {
+        HashMap::new()
+    };
 
     Ok(RawEventsResponse {
         events: events
@@ -1019,9 +1024,12 @@ fn upsert_turn(
         .map_err(AppError::from)
 }
 
+/// Loads matching events newest first. Without content, text and metadata are
+/// not read: they hold whole request bodies, and an event list never shows them.
 fn load_filtered_events(
     connection: &mut PgConnection,
     filters: &EventFilters<'_>,
+    include_content: bool,
 ) -> Result<Vec<UsageEvent>, AppError> {
     let event_type = filters
         .event_type
@@ -1065,10 +1073,40 @@ fn load_filtered_events(
         query = query.filter(llm_usage_events::event_type.eq(event_type));
     }
 
-    query
+    let query = query
         .order(llm_usage_events::observed_at.desc())
         .limit(filters.limit)
-        .offset(filters.offset)
+        .offset(filters.offset);
+    if include_content {
+        return query.load::<UsageEvent>(connection).map_err(AppError::from);
+    }
+    query
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::user_id,
+            llm_usage_events::device_context_id,
+            llm_usage_events::session_pk,
+            llm_usage_events::turn_pk,
+            llm_usage_events::event_id,
+            llm_usage_events::agent_name,
+            llm_usage_events::agent_version,
+            llm_usage_events::session_id,
+            llm_usage_events::turn_index,
+            llm_usage_events::llm_provider,
+            llm_usage_events::llm_model,
+            llm_usage_events::event_type,
+            sql::<Nullable<Text>>("NULL"),
+            sql::<Nullable<Bytea>>("NULL"),
+            llm_usage_events::input_tokens,
+            llm_usage_events::output_tokens,
+            llm_usage_events::cache_read_tokens,
+            llm_usage_events::cache_write_tokens,
+            llm_usage_events::reasoning_tokens,
+            llm_usage_events::total_tokens,
+            llm_usage_events::observed_at,
+            sql::<Jsonb>("'{}'::jsonb"),
+            llm_usage_events::created_at,
+        ))
         .load::<UsageEvent>(connection)
         .map_err(AppError::from)
 }

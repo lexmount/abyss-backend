@@ -216,6 +216,31 @@ def run(base_url: str, token: str, run_id: str) -> None:
         "raw event responses must not expose attachment content",
     )
 
+    # The list projection carries what an event list shows and no content.
+    list_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
+        {"session_id": session_id, "limit": 10, "fields": "list"}
+    )
+    list_response = request(base_url, "GET", list_path, token=token)
+    require_status(list_response, 200, "event list query")
+    listed_events = list_response.json()["events"]
+    require(
+        [item["id"] for item in listed_events] == [item["id"] for item in raw_events],
+        "event list must return the same events in the same order",
+    )
+    content_fields = {"text", "text_sha256", "metadata", "attachments"}
+    require(
+        all(content_fields.isdisjoint(item) for item in listed_events),
+        "event list items must leave out text, metadata, and attachments",
+    )
+    require(
+        all(
+            item["total_tokens"] == by_event_id[item["event_id"]]["total_tokens"]
+            and item["host_name"] == by_event_id[item["event_id"]]["host_name"]
+            for item in listed_events
+        ),
+        "event list items must keep token counts and device labels",
+    )
+
     attachments = by_event_id[request_event_id]["attachments"]
     require(len(attachments) == 1, "request event must expose one attachment record")
     require(attachments[0]["content_available"], "attachment bytes must be persisted")

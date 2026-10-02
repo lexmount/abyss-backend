@@ -8,7 +8,7 @@ use diesel::{
     dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
-    sql_types::{BigInt, Bool, Nullable, Text},
+    sql_types::{BigInt, Binary, Bool, Nullable, Text},
 };
 use uuid::Uuid;
 
@@ -552,13 +552,18 @@ pub(super) fn raw_events(
             limit: page_size.saturating_add(1),
             offset,
         },
+        query.includes_content(),
     )?;
     let has_next_page = events.len() > page_size_usize;
     if has_next_page {
         events.truncate(page_size_usize);
     }
     let devices = load_device_contexts(connection, &events)?;
-    let mut attachments = load_attachments(connection, &events)?;
+    let mut attachments = if query.includes_content() {
+        load_attachments(connection, &events)?
+    } else {
+        HashMap::new()
+    };
     let responses = events
         .into_iter()
         .map(|event| {
@@ -593,9 +598,12 @@ struct EventFilters<'a> {
     offset: i64,
 }
 
+/// Loads matching events newest first. Without content, text and metadata are
+/// not read: they hold whole request bodies, and an event list never shows them.
 fn load_filtered_events(
     connection: &mut SqliteConnection,
     filters: &EventFilters<'_>,
+    include_content: bool,
 ) -> Result<Vec<EventRecord>, AppError> {
     let mut query = llm_usage_events::table
         .filter(llm_usage_events::user_id.eq(filters.user_id.to_string()))
@@ -631,18 +639,48 @@ fn load_filtered_events(
     if let Some(event_type) = filters.event_type.and_then(non_empty) {
         query = query.filter(llm_usage_events::event_type.eq(validate_event_type(event_type)?));
     }
-    query
+    let query = query
         .order_by((
             llm_usage_events::observed_at.desc(),
             llm_usage_events::id.desc(),
         ))
         .limit(filters.limit)
-        .offset(filters.offset)
-        .select(EventRow::as_select())
-        .load::<EventRow>(connection)?
-        .into_iter()
-        .map(EventRow::into_record)
-        .collect()
+        .offset(filters.offset);
+    let rows = if include_content {
+        query
+            .select(EventRow::as_select())
+            .load::<EventRow>(connection)?
+    } else {
+        query
+            .select((
+                llm_usage_events::id,
+                llm_usage_events::user_id,
+                llm_usage_events::device_context_id,
+                llm_usage_events::session_pk,
+                llm_usage_events::turn_pk,
+                llm_usage_events::event_id,
+                llm_usage_events::agent_name,
+                llm_usage_events::agent_version,
+                llm_usage_events::session_id,
+                llm_usage_events::turn_index,
+                llm_usage_events::llm_provider,
+                llm_usage_events::llm_model,
+                llm_usage_events::event_type,
+                sql::<Nullable<Text>>("NULL"),
+                sql::<Nullable<Binary>>("NULL"),
+                llm_usage_events::input_tokens,
+                llm_usage_events::output_tokens,
+                llm_usage_events::cache_read_tokens,
+                llm_usage_events::cache_write_tokens,
+                llm_usage_events::reasoning_tokens,
+                llm_usage_events::total_tokens,
+                llm_usage_events::observed_at,
+                sql::<Text>("'{}'"),
+                llm_usage_events::created_at,
+            ))
+            .load::<EventRow>(connection)?
+    };
+    rows.into_iter().map(EventRow::into_record).collect()
 }
 
 pub(super) fn session_timeline(
@@ -1346,12 +1384,12 @@ mod tests {
 
     use crate::{
         search::SessionSearchQuery,
-        usage::{IngestEventsRequest, SummaryQuery},
+        usage::{IngestEventsRequest, RawEventsQuery, SummaryQuery},
     };
 
     use super::{
         super::{migrations, schema::llm_usage_events, search},
-        ingest_events, session_outline, usage_summary,
+        ingest_events, raw_events, session_outline, usage_summary,
     };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -1499,6 +1537,32 @@ mod tests {
         let after = super::session_timeline(&mut database, OWNER_ID, session_pk).unwrap();
         assert_eq!(after.turns[0].events.len(), 1);
         assert_eq!(after.turns[0].events[0].metadata, expected);
+    }
+
+    #[test]
+    fn event_list_leaves_out_content_but_keeps_what_a_list_shows() {
+        let mut database = summary_seeded();
+        let page = |database: &mut SqliteConnection, query: serde_json::Value| {
+            let query: RawEventsQuery =
+                serde_json::from_value(query).expect("query should deserialize");
+            raw_events(database, &query, OWNER_ID, 50).expect("events should load")
+        };
+
+        let list = page(&mut database, json!({"fields": "list", "limit": 2_i64}));
+        let full = page(&mut database, json!({"limit": 2_i64}));
+
+        assert_eq!(list.next_page_token.as_deref(), Some("2"));
+        assert_eq!(list.events.len(), 2);
+        for (listed, complete) in list.events.iter().zip(&full.events) {
+            assert_eq!(listed.id, complete.id);
+            assert_eq!(listed.total_tokens, complete.total_tokens);
+            assert_eq!(listed.host_name.as_deref(), Some("alice-mbp"));
+            assert_eq!(listed.text, None);
+            assert_eq!(listed.metadata, json!({}));
+            assert!(listed.attachments.is_empty());
+            assert_eq!(complete.text.as_deref(), Some("body"));
+            assert_eq!(complete.metadata["raw_body"], json!("large"));
+        }
     }
 
     fn summary_seeded() -> SqliteConnection {
