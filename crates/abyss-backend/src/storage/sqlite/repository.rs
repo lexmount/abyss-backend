@@ -27,10 +27,10 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            TurnIdentity, agent_name_filter_values, canonical_agent_name, choose_turn_index,
-            non_empty, normalize_limit, normalize_slug, normalize_text, normalized_optional,
-            normalized_tokens, parse_group_by, sha256_bytes, turn_identity, validate_batch,
-            validate_event_type,
+            TurnIdentity, agent_names_filter, canonical_agent_name, choose_turn_index,
+            exact_values_filter, non_empty, normalize_limit, normalize_slug, normalize_text,
+            normalized_optional, normalized_tokens, parse_group_by, providers_filter, sha256_bytes,
+            turn_identity, validate_batch, validate_event_type,
         },
         session_metadata_from_event,
     },
@@ -542,12 +542,12 @@ pub(super) fn raw_events(
             user_id,
             from: query.from,
             to: query.to,
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
+            agent_names: &query.agent_name,
+            session_ids: &query.session_id,
             session_pk: query.session_pk,
             turn_index: query.turn_index,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
+            llm_providers: &query.llm_provider,
+            llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
             limit: page_size.saturating_add(1),
             offset,
@@ -581,12 +581,13 @@ struct EventFilters<'a> {
     user_id: Uuid,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
-    agent_name: Option<&'a str>,
-    session_id: Option<&'a str>,
+    /// Each list matches any of its values; an empty list matches everything.
+    agent_names: &'a [String],
+    session_ids: &'a [String],
     session_pk: Option<Uuid>,
     turn_index: Option<i32>,
-    llm_provider: Option<&'a str>,
-    llm_model: Option<&'a str>,
+    llm_providers: &'a [String],
+    llm_models: &'a [String],
     event_type: Option<&'a str>,
     limit: i64,
     offset: i64,
@@ -605,12 +606,13 @@ fn load_filtered_events(
     if let Some(to) = filters.to {
         query = query.filter(llm_usage_events::observed_at.lt(timestamp_to_micros(to)));
     }
-    if let Some(agent_name) = filters.agent_name.and_then(non_empty) {
-        query =
-            query.filter(llm_usage_events::agent_name.eq_any(agent_name_filter_values(agent_name)));
+    let agent_names = agent_names_filter(filters.agent_names);
+    if !agent_names.is_empty() {
+        query = query.filter(llm_usage_events::agent_name.eq_any(agent_names));
     }
-    if let Some(session_id) = filters.session_id.and_then(non_empty) {
-        query = query.filter(llm_usage_events::session_id.eq(session_id.trim()));
+    let session_ids = exact_values_filter(filters.session_ids);
+    if !session_ids.is_empty() {
+        query = query.filter(llm_usage_events::session_id.eq_any(session_ids));
     }
     if let Some(session_pk) = filters.session_pk {
         query = query.filter(llm_usage_events::session_pk.eq(session_pk.to_string()));
@@ -618,11 +620,13 @@ fn load_filtered_events(
     if let Some(turn_index) = filters.turn_index {
         query = query.filter(llm_usage_events::turn_index.eq(turn_index));
     }
-    if let Some(provider) = filters.llm_provider.and_then(non_empty) {
-        query = query.filter(llm_usage_events::llm_provider.eq(normalize_slug(provider)));
+    let providers = providers_filter(filters.llm_providers);
+    if !providers.is_empty() {
+        query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
     }
-    if let Some(model) = filters.llm_model.and_then(non_empty) {
-        query = query.filter(llm_usage_events::llm_model.eq(model.trim()));
+    let models = exact_values_filter(filters.llm_models);
+    if !models.is_empty() {
+        query = query.filter(llm_usage_events::llm_model.eq_any(models));
     }
     if let Some(event_type) = filters.event_type.and_then(non_empty) {
         query = query.filter(llm_usage_events::event_type.eq(validate_event_type(event_type)?));
@@ -954,29 +958,16 @@ pub(super) fn usage_summary(
     if !owner_matches_filter(user_id, &owner, query.user_filter.as_deref()) {
         return Ok(empty_summary(query, group_by));
     }
-    let agent_names = query
-        .agent_name
-        .as_deref()
-        .and_then(non_empty)
-        .map(agent_name_filter_values)
-        .unwrap_or_default();
-    let agent_names_json = serde_json::to_string(&agent_names)
-        .map_err(|error| AppError::internal(format!("serialize agent filter: {error}")))?;
-    let session_id = query
-        .session_id
-        .as_deref()
-        .and_then(non_empty)
-        .map(str::trim);
-    let provider = query
-        .llm_provider
-        .as_deref()
-        .and_then(non_empty)
-        .map(normalize_slug);
-    let model = query
-        .llm_model
-        .as_deref()
-        .and_then(non_empty)
-        .map(str::trim);
+    // Each list matches any of its values; an empty list matches everything.
+    let filter_list = |values: Vec<String>| {
+        serde_json::to_string(&values)
+            .map(|json| (!values.is_empty(), json))
+            .map_err(|error| AppError::internal(format!("serialize summary filter: {error}")))
+    };
+    let (has_agents, agent_names) = filter_list(agent_names_filter(&query.agent_name))?;
+    let (has_sessions, session_ids) = filter_list(exact_values_filter(&query.session_id))?;
+    let (has_providers, providers) = filter_list(providers_filter(&query.llm_provider))?;
+    let (has_models, models) = filter_list(exact_values_filter(&query.llm_model))?;
     let event_type = query
         .event_type
         .as_deref()
@@ -996,14 +987,14 @@ pub(super) fn usage_summary(
         .bind::<Text, _>(user_id.to_string())
         .bind::<BigInt, _>(query.from.map_or(i64::MIN, timestamp_to_micros))
         .bind::<BigInt, _>(query.to.map_or(i64::MAX, timestamp_to_micros))
-        .bind::<Bool, _>(!agent_names.is_empty())
-        .bind::<Text, _>(&agent_names_json)
-        .bind::<Bool, _>(session_id.is_some())
-        .bind::<Text, _>(session_id.unwrap_or_default())
-        .bind::<Bool, _>(provider.is_some())
-        .bind::<Text, _>(provider.as_deref().unwrap_or_default())
-        .bind::<Bool, _>(model.is_some())
-        .bind::<Text, _>(model.unwrap_or_default())
+        .bind::<Bool, _>(has_agents)
+        .bind::<Text, _>(&agent_names)
+        .bind::<Bool, _>(has_sessions)
+        .bind::<Text, _>(&session_ids)
+        .bind::<Bool, _>(has_providers)
+        .bind::<Text, _>(&providers)
+        .bind::<Bool, _>(has_models)
+        .bind::<Text, _>(&models)
         .bind::<Bool, _>(event_type.is_some())
         .bind::<Text, _>(event_type.unwrap_or_default())
         .bind::<BigInt, _>(limit)
@@ -1030,9 +1021,10 @@ pub(super) fn usage_summary(
 ///
 /// Bind order: `?1`..`?6` day, device, Agent, provider, model, and event-type
 /// dimensions; `?7` owner; `?8`/`?9` observation bounds in microseconds, kept
-/// unconditional so the owner-time index bounds the scan; `?10`/`?11` Agent
-/// filter flag and JSON name list; `?12`..`?19` session, provider, model, and
-/// event-type filter flags and values; `?20` row limit.
+/// unconditional so the owner-time index bounds the scan; `?10`..`?17` flags
+/// and JSON value lists for the Agent, session, provider, and model filters,
+/// each matching any listed value; `?18`/`?19` event-type filter; `?20` row
+/// limit.
 const SUMMARY_AGGREGATE_SQL: &str = "\
     SELECT \
         CASE WHEN ?1 THEN strftime('%Y-%m-%d', e.observed_at / 1000000, 'unixepoch') END AS day, \
@@ -1064,9 +1056,9 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         AND e.observed_at >= ?8 \
         AND e.observed_at < ?9 \
         AND (?10 = 0 OR e.agent_name IN (SELECT value FROM json_each(?11))) \
-        AND (?12 = 0 OR e.session_id = ?13) \
-        AND (?14 = 0 OR e.llm_provider = ?15) \
-        AND (?16 = 0 OR e.llm_model = ?17) \
+        AND (?12 = 0 OR e.session_id IN (SELECT value FROM json_each(?13))) \
+        AND (?14 = 0 OR e.llm_provider IN (SELECT value FROM json_each(?15))) \
+        AND (?16 = 0 OR e.llm_model IN (SELECT value FROM json_each(?17))) \
         AND (?18 = 0 OR e.event_type = ?19) \
     GROUP BY 1, 2, 3, 4, 5, 6, 7, 8 \
     ORDER BY total_tokens DESC, agent_name ASC, day ASC \
@@ -1402,9 +1394,9 @@ mod tests {
                 q: "searchable response".to_owned(),
                 from: None,
                 to: None,
-                agent_name: Some("codex".to_owned()),
-                llm_provider: None,
-                llm_model: None,
+                agent_name: vec!["claude-code".to_owned(), "codex".to_owned()],
+                llm_provider: Vec::new(),
+                llm_model: Vec::new(),
                 event_type: None,
                 page: None,
                 page_size: None,
@@ -1592,7 +1584,7 @@ mod tests {
 
         let rows = summary(
             &mut database,
-            json!({"group_by": "day,event_type", "agent_name": "claude", "limit": 10_i64}),
+            json!({"group_by": "day,event_type", "agent_name": ["claude"], "limit": 10_i64}),
         );
 
         let mut buckets = rows
@@ -1617,11 +1609,34 @@ mod tests {
         );
         let codex_requests = summary(
             &mut database,
-            json!({"group_by": "event_type", "agent_name": "codex", "event_type": "request"}),
+            json!({"group_by": "event_type", "agent_name": ["codex"], "event_type": "request"}),
         );
         assert_eq!(codex_requests[0]["requests"], json!(2_i64));
         assert_eq!(codex_requests[0]["turns"], json!(2_i64));
         assert_eq!(codex_requests.as_array().map(Vec::len), Some(1));
+        // A list matches any of its values.
+        let either = summary(
+            &mut database,
+            json!({
+                "group_by": "agent",
+                "llm_provider": ["OpenAI", "Anthropic"],
+                "session_id": ["alpha", "beta"],
+            }),
+        );
+        let mut agents = either
+            .as_array()
+            .expect("rows should be an array")
+            .iter()
+            .map(|row| (row["agent_name"].clone(), row["sessions"].clone()))
+            .collect::<Vec<_>>();
+        agents.sort_by_key(|agent| agent.0.to_string());
+        assert_eq!(
+            agents,
+            vec![
+                (json!("claude-code"), json!(1_i64)),
+                (json!("codex"), json!(1_i64)),
+            ]
+        );
     }
 
     #[test]
