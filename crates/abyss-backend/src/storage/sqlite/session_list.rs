@@ -20,7 +20,8 @@ use super::{
 ///
 /// Bind order: `?1` owner, `?2`/`?3` agent filter flag and JSON name list,
 /// `?4`/`?5` lower activity bound, `?6`/`?7` upper start bound, `?8`/`?9`
-/// provider and `?10`/`?11` model a session must have used.
+/// JSON provider list and `?10`/`?11` JSON model list a session must have used
+/// at least one of.
 const ACTIVITY_CTE: &str = "\
     WITH activity AS ( \
         SELECT \
@@ -34,7 +35,7 @@ const ACTIVITY_CTE: &str = "\
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
             (SELECT COUNT(*) FROM agent_turns t WHERE t.session_pk = s.id) AS turns, \
-            COUNT(e.id) AS events, \
+            COUNT(e.session_pk) AS events, \
             COALESCE(SUM(e.total_tokens), 0) AS total_tokens, \
             st.title AS title, \
             st.purpose AS purpose \
@@ -46,10 +47,12 @@ const ACTIVITY_CTE: &str = "\
             AND (?2 = 0 OR s.agent_name IN (SELECT value FROM json_each(?3))) \
             AND (?8 = 0 OR EXISTS ( \
                 SELECT 1 FROM llm_usage_events p \
-                WHERE p.session_pk = s.id AND p.llm_provider = ?9)) \
+                WHERE p.session_pk = s.id \
+                    AND p.llm_provider IN (SELECT value FROM json_each(?9)))) \
             AND (?10 = 0 OR EXISTS ( \
                 SELECT 1 FROM llm_usage_events m \
-                WHERE m.session_pk = s.id AND m.llm_model = ?11)) \
+                WHERE m.session_pk = s.id \
+                    AND m.llm_model IN (SELECT value FROM json_each(?11)))) \
         GROUP BY s.id \
     ), \
     filtered AS ( \
@@ -101,13 +104,12 @@ pub(super) fn list_sessions(
     user_id: Uuid,
     query: &ValidatedSessionListQuery,
 ) -> Result<SessionListResponse, AppError> {
-    let agent_names = serde_json::to_string(&query.agent_names)
-        .map_err(|error| AppError::internal(format!("serialize agent filter: {error}")))?;
+    let agent_names = json_list(&query.agent_names, "agent")?;
+    let providers = json_list(&query.llm_providers, "provider")?;
+    let models = json_list(&query.llm_models, "model")?;
     let has_agents = !query.agent_names.is_empty();
     let from = query.from.map_or(0, timestamp_to_micros);
     let to = query.to.map_or(0, timestamp_to_micros);
-    let provider = query.llm_provider.as_deref().unwrap_or_default();
-    let model = query.llm_model.as_deref().unwrap_or_default();
 
     let total = sql_query(format!(
         "{ACTIVITY_CTE} SELECT COUNT(*) AS total FROM filtered"
@@ -119,10 +121,10 @@ pub(super) fn list_sessions(
     .bind::<BigInt, _>(from)
     .bind::<Bool, _>(query.to.is_some())
     .bind::<BigInt, _>(to)
-    .bind::<Bool, _>(query.llm_provider.is_some())
-    .bind::<Text, _>(provider)
-    .bind::<Bool, _>(query.llm_model.is_some())
-    .bind::<Text, _>(model)
+    .bind::<Bool, _>(!query.llm_providers.is_empty())
+    .bind::<Text, _>(&providers)
+    .bind::<Bool, _>(!query.llm_models.is_empty())
+    .bind::<Text, _>(&models)
     .get_result::<CountRow>(connection)?
     .total;
 
@@ -137,10 +139,10 @@ pub(super) fn list_sessions(
     .bind::<BigInt, _>(from)
     .bind::<Bool, _>(query.to.is_some())
     .bind::<BigInt, _>(to)
-    .bind::<Bool, _>(query.llm_provider.is_some())
-    .bind::<Text, _>(provider)
-    .bind::<Bool, _>(query.llm_model.is_some())
-    .bind::<Text, _>(model)
+    .bind::<Bool, _>(!query.llm_providers.is_empty())
+    .bind::<Text, _>(&providers)
+    .bind::<Bool, _>(!query.llm_models.is_empty())
+    .bind::<Text, _>(&models)
     .bind::<BigInt, _>(i64::from(query.page_size))
     .bind::<BigInt, _>(query.offset)
     .load::<SessionListRow>(connection)?;
@@ -167,6 +169,11 @@ pub(super) fn list_sessions(
         })
         .collect::<Result<Vec<_>, AppError>>()?;
     Ok(SessionListResponse::new(query, total, items))
+}
+
+fn json_list(values: &[String], filter: &str) -> Result<String, AppError> {
+    serde_json::to_string(values)
+        .map_err(|error| AppError::internal(format!("serialize {filter} filter: {error}")))
 }
 
 #[cfg(test)]
@@ -268,10 +275,15 @@ mod tests {
     fn filters_by_agent_alias_and_activity_window() {
         let mut database = seeded();
         let claude = SessionListQuery {
-            agent_name: Some("Claude Code".to_owned()),
+            agent_name: vec!["Claude Code".to_owned()],
             ..SessionListQuery::default()
         };
         assert_eq!(list(&mut database, claude), [("beta".to_owned(), 1, 1)]);
+        let either = SessionListQuery {
+            agent_name: vec!["Claude Code".to_owned(), "codex".to_owned()],
+            ..SessionListQuery::default()
+        };
+        assert_eq!(list(&mut database, either).len(), 3);
 
         // gamma went quiet before the window; alpha is still active inside it.
         let window = SessionListQuery {
@@ -287,10 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn filters_by_a_model_or_provider_the_session_used() {
+    fn filters_by_models_or_providers_the_session_used() {
         let mut database = seeded();
         let mini = SessionListQuery {
-            llm_model: Some("gpt-5-mini".to_owned()),
+            llm_model: vec!["gpt-5-mini".to_owned(), "unused-model".to_owned()],
             ..SessionListQuery::default()
         };
         let ids: Vec<_> = list(&mut database, mini)
@@ -300,13 +312,13 @@ mod tests {
         assert_eq!(ids, ["alpha"]);
 
         let openai = SessionListQuery {
-            llm_provider: Some("OpenAI".to_owned()),
+            llm_provider: vec!["anthropic".to_owned(), "OpenAI".to_owned()],
             ..SessionListQuery::default()
         };
         assert_eq!(list(&mut database, openai).len(), 3);
 
         let other = SessionListQuery {
-            llm_provider: Some("anthropic".to_owned()),
+            llm_provider: vec!["anthropic".to_owned()],
             ..SessionListQuery::default()
         };
         assert!(list(&mut database, other).is_empty());

@@ -149,6 +149,10 @@ def matches_filters(document: dict[str, Any], filters: list[dict[str, Any]]) -> 
             for field, expected in clause["term"].items():
                 if document.get(field) != expected:
                     return False
+        if "terms" in clause:
+            for field, accepted in clause["terms"].items():
+                if document.get(field) not in accepted:
+                    return False
         if "range" in clause:
             for field, bounds in clause["range"].items():
                 value = document.get(field)

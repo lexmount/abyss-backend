@@ -46,10 +46,11 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            TurnIdentity, TurnIdentityKind, agent_name_filter_values, canonical_agent_name,
-            choose_turn_index, escape_like_pattern, non_empty, non_negative_count, normalize_limit,
-            normalize_slug, normalize_text, normalized_optional, normalized_tokens, parse_group_by,
-            sha256_bytes, turn_identity, unix_epoch, validate_batch, validate_event_type,
+            TurnIdentity, TurnIdentityKind, agent_names_filter, canonical_agent_name,
+            choose_turn_index, escape_like_pattern, exact_values_filter, non_empty,
+            non_negative_count, normalize_limit, normalize_slug, normalize_text,
+            normalized_optional, normalized_tokens, parse_group_by, providers_filter, sha256_bytes,
+            turn_identity, unix_epoch, validate_batch, validate_event_type,
         },
         session_metadata_from_event,
     },
@@ -103,11 +104,11 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
             )) \
         ) \
         AND ($17 = false OR e.agent_name = ANY($18)) \
-        AND ($19 = false OR e.session_id = $20) \
+        AND ($19 = false OR e.session_id = ANY($20)) \
         AND ($21 = false OR e.session_pk = $22) \
         AND ($23 = false OR e.turn_index = $24) \
-        AND ($25 = false OR e.llm_provider = $26) \
-        AND ($27 = false OR e.llm_model = $28) \
+        AND ($25 = false OR e.llm_provider = ANY($26)) \
+        AND ($27 = false OR e.llm_model = ANY($28)) \
         AND ($29 = false OR e.event_type = $30) \
     GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 \
     ORDER BY total_tokens DESC, agent_name ASC NULLS LAST, user_email ASC NULLS LAST, day ASC NULLS LAST \
@@ -251,12 +252,12 @@ pub fn usage_summary(
             from: query.from,
             to: query.to,
             user_filter: query.user_filter.as_deref(),
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
+            agent_names: &query.agent_name,
+            session_ids: &query.session_id,
             session_pk: None,
             turn_index: None,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
+            llm_providers: &query.llm_provider,
+            llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
             limit,
             offset: 0,
@@ -291,16 +292,16 @@ fn load_filtered_summary_rows(
     let has_user_filter = !user_filter_pattern.is_empty();
     let agent_names = sql_filters.agent_names;
     let has_agent_filter = !agent_names.is_empty();
-    let session_id = sql_filters.session_id.unwrap_or_default();
-    let has_session_id_filter = !session_id.is_empty();
+    let session_ids = sql_filters.session_ids;
+    let has_session_id_filter = !session_ids.is_empty();
     let session_pk = sql_filters.session_pk.unwrap_or_else(Uuid::nil);
     let has_session_pk_filter = session_pk != Uuid::nil();
     let turn_index = sql_filters.turn_index.unwrap_or_default();
     let has_turn_index_filter = turn_index > 0_i32;
-    let provider = sql_filters.provider.unwrap_or_default();
-    let has_provider_filter = !provider.is_empty();
-    let model = sql_filters.model.unwrap_or_default();
-    let has_model_filter = !model.is_empty();
+    let providers = sql_filters.providers;
+    let has_provider_filter = !providers.is_empty();
+    let models = sql_filters.models;
+    let has_model_filter = !models.is_empty();
     let event_type = sql_filters.event_type.unwrap_or_default();
     let has_event_type_filter = !event_type.is_empty();
 
@@ -327,15 +328,15 @@ fn load_filtered_summary_rows(
         .bind::<Bool, _>(has_agent_filter)
         .bind::<Array<Text>, _>(agent_names)
         .bind::<Bool, _>(has_session_id_filter)
-        .bind::<Text, _>(&session_id)
+        .bind::<Array<Text>, _>(session_ids)
         .bind::<Bool, _>(has_session_pk_filter)
         .bind::<SqlUuid, _>(session_pk)
         .bind::<Bool, _>(has_turn_index_filter)
         .bind::<Integer, _>(turn_index)
         .bind::<Bool, _>(has_provider_filter)
-        .bind::<Text, _>(&provider)
+        .bind::<Array<Text>, _>(providers)
         .bind::<Bool, _>(has_model_filter)
-        .bind::<Text, _>(&model)
+        .bind::<Array<Text>, _>(models)
         .bind::<Bool, _>(has_event_type_filter)
         .bind::<Text, _>(&event_type)
         .bind::<BigInt, _>(filters.limit)
@@ -567,12 +568,12 @@ pub fn raw_events(
             from: query.from,
             to: query.to,
             user_filter: None,
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
+            agent_names: &query.agent_name,
+            session_ids: &query.session_id,
             session_pk: query.session_pk,
             turn_index: query.turn_index,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
+            llm_providers: &query.llm_provider,
+            llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
             limit: page_size.saturating_add(1_i64),
             offset,
@@ -708,10 +709,6 @@ fn ingest_one_event(
     )?;
     let tokens = normalized_tokens(event)?;
     let text = normalized_optional(event.text.as_deref());
-    let naming_text = text
-        .as_deref()
-        .filter(|text| session_titles::is_candidate(event.event_type.as_str(), text))
-        .map(str::to_owned);
 
     // `event_id` is the idempotency key supplied by the collector. Duplicate
     // observations are accepted as no-ops instead of failing the whole batch.
@@ -772,7 +769,7 @@ fn ingest_one_event(
                 turn_index,
                 agent_name: &agent_name,
                 event_type: event.event_type.as_str(),
-                text: naming_text.as_deref(),
+                text: event.text.as_deref(),
                 metadata: &event.metadata,
                 observed_at,
             },
@@ -1042,12 +1039,13 @@ fn load_filtered_events(
     if let Some(to) = filters.to {
         query = query.filter(llm_usage_events::observed_at.lt(to));
     }
-    if let Some(agent_name) = filters.agent_name.and_then(non_empty) {
-        let normalized = agent_name_filter_values(agent_name);
-        query = query.filter(llm_usage_events::agent_name.eq_any(normalized));
+    let agent_names = agent_names_filter(filters.agent_names);
+    if !agent_names.is_empty() {
+        query = query.filter(llm_usage_events::agent_name.eq_any(agent_names));
     }
-    if let Some(session_id) = filters.session_id.and_then(non_empty) {
-        query = query.filter(llm_usage_events::session_id.eq(session_id));
+    let session_ids = exact_values_filter(filters.session_ids);
+    if !session_ids.is_empty() {
+        query = query.filter(llm_usage_events::session_id.eq_any(session_ids));
     }
     if let Some(session_pk) = filters.session_pk {
         query = query.filter(llm_usage_events::session_pk.eq(session_pk));
@@ -1055,12 +1053,13 @@ fn load_filtered_events(
     if let Some(turn_index) = filters.turn_index {
         query = query.filter(llm_usage_events::turn_index.eq(turn_index));
     }
-    if let Some(provider) = filters.llm_provider.and_then(non_empty) {
-        let normalized = normalize_slug(provider);
-        query = query.filter(llm_usage_events::llm_provider.eq(normalized));
+    let providers = providers_filter(filters.llm_providers);
+    if !providers.is_empty() {
+        query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
     }
-    if let Some(model) = filters.llm_model.and_then(non_empty) {
-        query = query.filter(llm_usage_events::llm_model.eq(model.trim()));
+    let models = exact_values_filter(filters.llm_models);
+    if !models.is_empty() {
+        query = query.filter(llm_usage_events::llm_model.eq_any(models));
     }
     if let Some(event_type) = event_type {
         query = query.filter(llm_usage_events::event_type.eq(event_type));
@@ -1215,12 +1214,13 @@ struct EventFilters<'a> {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
     user_filter: Option<&'a str>,
-    agent_name: Option<&'a str>,
-    session_id: Option<&'a str>,
+    /// Each list matches any of its values; an empty list matches everything.
+    agent_names: &'a [String],
+    session_ids: &'a [String],
     session_pk: Option<Uuid>,
     turn_index: Option<i32>,
-    llm_provider: Option<&'a str>,
-    llm_model: Option<&'a str>,
+    llm_providers: &'a [String],
+    llm_models: &'a [String],
     event_type: Option<&'a str>,
     limit: i64,
     offset: i64,
@@ -1281,11 +1281,11 @@ struct SummarySqlFilters {
     user_filter_id: Option<Uuid>,
     user_filter_pattern: Option<String>,
     agent_names: Vec<String>,
-    session_id: Option<String>,
+    session_ids: Vec<String>,
     session_pk: Option<Uuid>,
     turn_index: Option<i32>,
-    provider: Option<String>,
-    model: Option<String>,
+    providers: Vec<String>,
+    models: Vec<String>,
     event_type: Option<String>,
 }
 
@@ -1295,20 +1295,10 @@ impl SummarySqlFilters {
         let user_filter_id = user_filter.and_then(|value| Uuid::parse_str(value).ok());
         let user_filter_pattern =
             user_filter.map(|value| format!("%{}%", escape_like_pattern(value)));
-        let agent_names = filters
-            .agent_name
-            .and_then(non_empty)
-            .map(agent_name_filter_values)
-            .unwrap_or_default();
-        let session_id = filters
-            .session_id
-            .and_then(non_empty)
-            .map(|value| value.trim().to_owned());
-        let provider = filters.llm_provider.and_then(non_empty).map(normalize_slug);
-        let model = filters
-            .llm_model
-            .and_then(non_empty)
-            .map(|value| value.trim().to_owned());
+        let agent_names = agent_names_filter(filters.agent_names);
+        let session_ids = exact_values_filter(filters.session_ids);
+        let providers = providers_filter(filters.llm_providers);
+        let models = exact_values_filter(filters.llm_models);
         let event_type = filters.event_type.map(validate_event_type).transpose()?;
 
         Ok(Self {
@@ -1318,11 +1308,11 @@ impl SummarySqlFilters {
             user_filter_id,
             user_filter_pattern,
             agent_names,
-            session_id,
+            session_ids,
             session_pk: filters.session_pk,
             turn_index: filters.turn_index,
-            provider,
-            model,
+            providers,
+            models,
             event_type,
         })
     }
@@ -1424,9 +1414,9 @@ mod tests {
 
     use super::{
         EventFilters, SummaryDimension, SummaryDimensions, SummarySqlFilters, TurnIdentityKind,
-        agent_name_filter_values, canonical_agent_name, choose_turn_index, event_response,
-        latest_optional, normalize_limit, normalize_slug, normalized_tokens, parse_group_by,
-        turn_identity_from_metadata, validate_batch, validate_event, validate_event_type,
+        canonical_agent_name, choose_turn_index, event_response, latest_optional, normalize_limit,
+        normalize_slug, normalized_tokens, parse_group_by, turn_identity_from_metadata,
+        validate_batch, validate_event, validate_event_type,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::json;
@@ -1437,7 +1427,7 @@ mod tests {
         error::AppError,
         usage::{
             AgentPayload, DevicePayload, IngestEventsRequest, IngestUsageEvent, LlmPayload,
-            SummaryRow, TokenUsagePayload, UsageEventType,
+            SummaryRow, TokenUsagePayload, UsageEventType, persistence::agent_name_filter_values,
         },
     };
 
@@ -1676,12 +1666,16 @@ mod tests {
             from: Some(timestamp(2_u32, 0_u32, 0_u32)),
             to: None,
             user_filter: Some(" Alice_% "),
-            agent_name: Some("Claude Desktop"),
-            session_id: Some(" session-1 "),
+            agent_names: &["Claude Desktop".to_owned(), "codex".to_owned()],
+            session_ids: &[" session-1 ".to_owned(), "session-2".to_owned()],
             session_pk: None,
             turn_index: None,
-            llm_provider: Some("OpenAI"),
-            llm_model: Some(" gpt-5.5 "),
+            llm_providers: &["OpenAI".to_owned(), " ".to_owned()],
+            llm_models: &[
+                " gpt-5.5 ".to_owned(),
+                "gpt-5.5".to_owned(),
+                "o3".to_owned(),
+            ],
             event_type: Some(" Response "),
             limit: 50_i64,
             offset: 0_i64,
@@ -1700,17 +1694,13 @@ mod tests {
         );
         assert_eq!(
             sql_filters.agent_names,
-            vec![
-                "claude-code".to_owned(),
-                "claude".to_owned(),
-                "claude-desktop".to_owned(),
-            ]
+            ["claude", "claude-code", "claude-desktop", "codex"]
         );
-        assert_eq!(sql_filters.session_id.as_deref(), Some("session-1"));
+        assert_eq!(sql_filters.session_ids, ["session-1", "session-2"]);
         assert_eq!(sql_filters.session_pk, None);
         assert_eq!(sql_filters.turn_index, None);
-        assert_eq!(sql_filters.provider.as_deref(), Some("openai"));
-        assert_eq!(sql_filters.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(sql_filters.providers, ["openai"]);
+        assert_eq!(sql_filters.models, ["gpt-5.5", "o3"]);
         assert_eq!(sql_filters.event_type.as_deref(), Some("response"));
     }
 

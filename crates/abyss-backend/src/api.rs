@@ -7,11 +7,14 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+// Filter keys repeat to select several values, e.g. `llm_model=a&llm_model=b`;
+// axum's own Query cannot collect repeated keys.
+use axum_extra::extract::Query;
 use serde::Serialize;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;

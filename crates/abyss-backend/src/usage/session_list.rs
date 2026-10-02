@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    usage::persistence::{agent_name_filter_values, normalize_slug, normalized_optional},
+    usage::persistence::{agent_names_filter, exact_values_filter, providers_filter},
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
@@ -19,12 +19,16 @@ pub struct SessionListQuery {
     pub from: Option<DateTime<Utc>>,
     /// Keeps sessions that started before this instant.
     pub to: Option<DateTime<Utc>>,
-    /// Agent-name filter; Claude aliases match together.
-    pub agent_name: Option<String>,
-    /// Keeps sessions with at least one event from this LLM provider.
-    pub llm_provider: Option<String>,
-    /// Keeps sessions with at least one event from this LLM model.
-    pub llm_model: Option<String>,
+    /// Agent-name filter; repeat the key for several Agents. Claude aliases
+    /// match together.
+    #[serde(default)]
+    pub agent_name: Vec<String>,
+    /// Keeps sessions with at least one event from any of these LLM providers.
+    #[serde(default)]
+    pub llm_provider: Vec<String>,
+    /// Keeps sessions with at least one event from any of these LLM models.
+    #[serde(default)]
+    pub llm_model: Vec<String>,
     /// 1-based page number.
     pub page: Option<u32>,
     /// Sessions per page, at most 100.
@@ -38,10 +42,10 @@ pub struct ValidatedSessionListQuery {
     pub to: Option<DateTime<Utc>>,
     /// Stored agent names to match, or empty for every Agent.
     pub agent_names: Vec<String>,
-    /// Normalized provider slug a session must have used.
-    pub llm_provider: Option<String>,
-    /// Exact model a session must have used.
-    pub llm_model: Option<String>,
+    /// Normalized provider slugs; a session must have used one, or empty for any.
+    pub llm_providers: Vec<String>,
+    /// Exact models; a session must have used one, or empty for any.
+    pub llm_models: Vec<String>,
     pub page: u32,
     pub page_size: u32,
     pub offset: i64,
@@ -70,12 +74,9 @@ impl SessionListQuery {
         Ok(ValidatedSessionListQuery {
             from: self.from,
             to: self.to,
-            agent_names: normalized_optional(self.agent_name.as_deref())
-                .map(|value| agent_name_filter_values(&value))
-                .unwrap_or_default(),
-            llm_provider: normalized_optional(self.llm_provider.as_deref())
-                .map(|value| normalize_slug(&value)),
-            llm_model: normalized_optional(self.llm_model.as_deref()),
+            agent_names: agent_names_filter(&self.agent_name),
+            llm_providers: providers_filter(&self.llm_provider),
+            llm_models: exact_values_filter(&self.llm_model),
             page,
             page_size,
             offset,
@@ -110,7 +111,7 @@ pub struct SessionListItem {
     pub turns: i64,
     pub events: i64,
     pub total_tokens: i64,
-    /// Name the Agent generated for the session, when one was captured.
+    /// Agent-generated title, or a first-user-input preview for other Agents.
     pub title: Option<String>,
     /// Why the session exists when it only serves the Agent, such as
     /// `title_generation`; `None` for ordinary sessions.
@@ -152,7 +153,7 @@ mod tests {
     #[test]
     fn expands_claude_aliases_and_computes_the_offset() {
         let query = SessionListQuery {
-            agent_name: Some(" Claude ".to_owned()),
+            agent_name: vec![" Claude ".to_owned(), "codex".to_owned()],
             page: Some(3),
             page_size: Some(25),
             ..SessionListQuery::default()
@@ -162,28 +163,28 @@ mod tests {
         assert_eq!(query.offset, 50);
         assert_eq!(
             query.agent_names,
-            ["claude-code", "claude", "claude-desktop"]
+            ["claude", "claude-code", "claude-desktop", "codex"]
         );
     }
 
     #[test]
-    fn normalizes_provider_and_keeps_the_model_verbatim() {
+    fn normalizes_providers_and_keeps_models_verbatim() {
         let query = SessionListQuery {
-            llm_provider: Some(" OpenAI ".to_owned()),
-            llm_model: Some(" gpt-5 ".to_owned()),
+            llm_provider: vec![" OpenAI ".to_owned(), "anthropic".to_owned()],
+            llm_model: vec![" gpt-5 ".to_owned(), "Claude-Opus".to_owned()],
             ..SessionListQuery::default()
         }
         .validate()
         .expect("valid");
-        assert_eq!(query.llm_provider.as_deref(), Some("openai"));
-        assert_eq!(query.llm_model.as_deref(), Some("gpt-5"));
+        assert_eq!(query.llm_providers, ["anthropic", "openai"]);
+        assert_eq!(query.llm_models, ["Claude-Opus", "gpt-5"]);
         let blank = SessionListQuery {
-            llm_model: Some("  ".to_owned()),
+            llm_model: vec!["  ".to_owned()],
             ..SessionListQuery::default()
         }
         .validate()
         .expect("valid");
-        assert!(blank.llm_model.is_none());
+        assert!(blank.llm_models.is_empty());
     }
 
     #[test]

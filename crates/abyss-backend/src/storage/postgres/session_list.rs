@@ -15,8 +15,8 @@ use crate::{
 /// Per-session activity with the filters that apply before paging.
 ///
 /// Bind order: `$1` owner, `$2`/`$3` agent filter flag and names, `$4`/`$5`
-/// lower activity bound, `$6`/`$7` upper start bound, `$8`/`$9` provider and
-/// `$10`/`$11` model a session must have used.
+/// lower activity bound, `$6`/`$7` upper start bound, `$8`/`$9` providers and
+/// `$10`/`$11` models a session must have used at least one of.
 const ACTIVITY_CTE: &str = "\
     WITH activity AS ( \
         SELECT \
@@ -42,10 +42,10 @@ const ACTIVITY_CTE: &str = "\
             AND ($2 = false OR s.agent_name = ANY($3)) \
             AND ($8 = false OR EXISTS ( \
                 SELECT 1 FROM llm_usage_events p \
-                WHERE p.session_pk = s.id AND p.llm_provider = $9)) \
+                WHERE p.session_pk = s.id AND p.llm_provider = ANY($9))) \
             AND ($10 = false OR EXISTS ( \
                 SELECT 1 FROM llm_usage_events m \
-                WHERE m.session_pk = s.id AND m.llm_model = $11)) \
+                WHERE m.session_pk = s.id AND m.llm_model = ANY($11))) \
         GROUP BY s.id, d.host_name, d.platform, st.title, st.purpose \
     ), \
     filtered AS ( \
@@ -100,8 +100,6 @@ pub(super) fn list_sessions(
     let has_agents = !query.agent_names.is_empty();
     let from = query.from.unwrap_or(DateTime::UNIX_EPOCH);
     let to = query.to.unwrap_or(DateTime::UNIX_EPOCH);
-    let provider = query.llm_provider.as_deref().unwrap_or_default();
-    let model = query.llm_model.as_deref().unwrap_or_default();
 
     let total = sql_query(format!(
         "{ACTIVITY_CTE} SELECT COUNT(*)::bigint AS total FROM filtered"
@@ -113,10 +111,10 @@ pub(super) fn list_sessions(
     .bind::<Timestamptz, _>(from)
     .bind::<Bool, _>(query.to.is_some())
     .bind::<Timestamptz, _>(to)
-    .bind::<Bool, _>(query.llm_provider.is_some())
-    .bind::<Text, _>(provider)
-    .bind::<Bool, _>(query.llm_model.is_some())
-    .bind::<Text, _>(model)
+    .bind::<Bool, _>(!query.llm_providers.is_empty())
+    .bind::<Array<Text>, _>(&query.llm_providers)
+    .bind::<Bool, _>(!query.llm_models.is_empty())
+    .bind::<Array<Text>, _>(&query.llm_models)
     .get_result::<CountRow>(connection)?
     .total;
 
@@ -131,10 +129,10 @@ pub(super) fn list_sessions(
     .bind::<Timestamptz, _>(from)
     .bind::<Bool, _>(query.to.is_some())
     .bind::<Timestamptz, _>(to)
-    .bind::<Bool, _>(query.llm_provider.is_some())
-    .bind::<Text, _>(provider)
-    .bind::<Bool, _>(query.llm_model.is_some())
-    .bind::<Text, _>(model)
+    .bind::<Bool, _>(!query.llm_providers.is_empty())
+    .bind::<Array<Text>, _>(&query.llm_providers)
+    .bind::<Bool, _>(!query.llm_models.is_empty())
+    .bind::<Array<Text>, _>(&query.llm_models)
     .bind::<BigInt, _>(i64::from(query.page_size))
     .bind::<BigInt, _>(query.offset)
     .load::<SessionListRow>(connection)?;

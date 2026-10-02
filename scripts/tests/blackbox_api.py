@@ -253,6 +253,63 @@ def run(base_url: str, token: str, run_id: str) -> None:
     require(summary["requests"] == 1 and summary["responses"] == 1, "summary event counts are incorrect")
     require(summary["total_tokens"] == 40, "summary token total is incorrect")
 
+    # Repeating a filter key matches any of its values; filters still combine
+    # with each other.
+    other_session_id = f"{session_id}-absent"
+    any_of_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
+        [
+            ("session_id", other_session_id),
+            ("session_id", session_id),
+            ("agent_name", "claude-code"),
+            ("agent_name", "Codex"),
+            ("llm_provider", "anthropic"),
+            ("llm_provider", "OpenAI"),
+            ("llm_model", "gpt-5.5"),
+            ("llm_model", "absent-model"),
+            ("limit", 10),
+        ]
+    )
+    any_of_response = request(base_url, "GET", any_of_path, token=token)
+    require_status(any_of_response, 200, "raw event query with repeated filters")
+    require(
+        len(any_of_response.json()["events"]) == 2,
+        "repeated filter values must match any of the values",
+    )
+    none_of_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
+        [("session_id", session_id), ("llm_model", "absent-model"), ("llm_model", "other-model")]
+    )
+    none_of_response = request(base_url, "GET", none_of_path, token=token)
+    require_status(none_of_response, 200, "raw event query with unmatched models")
+    require(
+        none_of_response.json()["events"] == [],
+        "filters must still combine across dimensions",
+    )
+    any_of_summary_path = "/v1/agent-usage/summary?" + urllib.parse.urlencode(
+        [
+            ("group_by", "model"),
+            ("session_id", session_id),
+            ("session_id", other_session_id),
+            ("llm_model", "absent-model"),
+            ("llm_model", "gpt-5.5"),
+        ]
+    )
+    any_of_summary = request(base_url, "GET", any_of_summary_path, token=token)
+    require_status(any_of_summary, 200, "usage summary with repeated filters")
+    any_of_rows = any_of_summary.json()["rows"]
+    require(
+        [(row["llm_model"], row["total_tokens"]) for row in any_of_rows] == [("gpt-5.5", 40)],
+        "summary must aggregate every repeated filter value",
+    )
+    any_of_sessions_path = "/v1/agent-usage/sessions?" + urllib.parse.urlencode(
+        [("llm_model", "absent-model"), ("llm_model", "gpt-5.5"), ("page_size", 100)]
+    )
+    any_of_sessions = request(base_url, "GET", any_of_sessions_path, token=token)
+    require_status(any_of_sessions, 200, "session list with repeated filters")
+    require(
+        session_id in {item["session_id"] for item in any_of_sessions.json()["items"]},
+        "session list must keep sessions that used any selected model",
+    )
+
     session_pk = raw_events[0]["session_pk"]
     timeline = request(
         base_url,
@@ -375,7 +432,13 @@ def run(base_url: str, token: str, run_id: str) -> None:
     require_status(unauthenticated_event, 401, "unauthenticated single event query")
 
     search_path = "/v1/agent-usage/search?" + urllib.parse.urlencode(
-        {"q": "blackbox response", "agent_name": "codex"}
+        [
+            ("q", "blackbox response"),
+            ("agent_name", "claude-code"),
+            ("agent_name", "codex"),
+            ("llm_model", "absent-model"),
+            ("llm_model", "gpt-5.5"),
+        ]
     )
     search_result: dict[str, Any] = {}
     for _attempt in range(100):
@@ -400,6 +463,9 @@ def run(base_url: str, token: str, run_id: str) -> None:
         "search must return structured highlights",
     )
 
+    from session_titles_api import run_title_contract
+
+    run_title_contract(base_url, token, run_id)
     print(f"blackbox API contract passed for {session_id}")
 
 

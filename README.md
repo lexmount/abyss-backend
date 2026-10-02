@@ -16,6 +16,15 @@ and optional full-text search.
 - Health and storage-readiness probes.
 - Embedded migrations for both supported storage profiles.
 
+Session titles have dedicated adapters for Codex and Claude Code. Claude Code
+names its own session; Codex names a separate task thread, matched by quoted
+user content, turn start time, and device.
+Only a unique task candidate receives the generated title. Other Agents use
+their first nonempty user input, collapsed to one line and truncated to 80
+characters with an ellipsis. Both adapters read archived protocol messages and support older
+structured event records. Auxiliary title calls retain their own events and usage.
+Existing sessions receive default titles through a one-time backfill.
+
 Exactly one storage profile is compiled into a binary:
 
 - `postgres-es` uses PostgreSQL as the source of truth and optionally projects
