@@ -21,8 +21,8 @@ use crate::{
     usage::{
         SessionInfo,
         session_title::{
-            TITLE_GENERATION_PURPOSE, TitleTask, codex_naming_prompt, codex_turn_id,
-            codex_turn_id_range, may_carry_title, opens_with_prompt, title_from_response,
+            NamingRequest, TITLE_GENERATION_PURPOSE, TitleTask, codex_turn_id, codex_turn_id_range,
+            default_title, may_carry_title, opens_with_prompt, title_from_response,
         },
     },
 };
@@ -32,6 +32,10 @@ const BACKFILL_NAME: &str = "session_titles_v1";
 /// Marks the one-time matching of Codex naming threads captured before
 /// matching existed.
 const LINK_BACKFILL_NAME: &str = "codex_title_links_v1";
+/// Rebuild links after switching to archived request bodies and scoped adapters.
+const LINK_REPAIR_NAME: &str = "codex_title_links_v2";
+/// Names existing sessions from other Agents using their first user input.
+const DEFAULT_BACKFILL_NAME: &str = "first_user_titles_v1";
 /// Widest delivery delay tolerated between a naming thread and its task when
 /// looking for candidates, in microseconds.
 const LINK_DELIVERY_WINDOW_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
@@ -80,23 +84,66 @@ pub(super) fn capture(
     connection: &mut SqliteConnection,
     event: &CapturedEvent<'_>,
 ) -> Result<(), AppError> {
+    if !matches!(event.agent_name, "codex" | "claude-code") {
+        return capture_default(connection, event);
+    }
     match naming_call(connection, event)? {
         Some(call) => store(connection, event, call),
         None => match_pending_naming_threads(connection, event),
     }
 }
 
+/// Default sessions keep the earliest captured user input, even after late delivery.
+fn capture_default(
+    connection: &mut SqliteConnection,
+    event: &CapturedEvent<'_>,
+) -> Result<(), AppError> {
+    if event.event_type != "request" {
+        return Ok(());
+    }
+    let session = event.session_pk.to_string();
+    let stored_at = session_titles::table
+        .find(&session)
+        .select(session_titles::title_observed_at)
+        .first::<Option<i64>>(connection)
+        .optional()?
+        .flatten();
+    if stored_at.is_some_and(|at| at <= event.observed_at) {
+        return Ok(());
+    }
+    let Some(title) = default_title(event.metadata) else {
+        return Ok(());
+    };
+    diesel::insert_into(session_titles::table)
+        .values((
+            session_titles::session_pk.eq(&session),
+            session_titles::user_id.eq(event.user_id.to_string()),
+            session_titles::title.eq(&title),
+            session_titles::title_event_pk.eq(event.event_pk.to_string()),
+            session_titles::title_observed_at.eq(event.observed_at),
+            session_titles::updated_at.eq(Utc::now().timestamp_micros()),
+        ))
+        .on_conflict(session_titles::session_pk)
+        .do_update()
+        .set((
+            session_titles::title.eq(&title),
+            session_titles::title_event_pk.eq(event.event_pk.to_string()),
+            session_titles::title_observed_at.eq(event.observed_at),
+            session_titles::updated_at.eq(Utc::now().timestamp_micros()),
+        ))
+        .execute(connection)?;
+    Ok(())
+}
+
 fn naming_call(
     connection: &mut SqliteConnection,
     event: &CapturedEvent<'_>,
 ) -> Result<Option<NamingCall>, AppError> {
-    let Some(text) = event.text else {
-        return Ok(None);
-    };
     let session = event.session_pk.to_string();
     match event.event_type {
         "request" => {
-            let Some(task) = TitleTask::from_request(text) else {
+            let Some(naming) = NamingRequest::parse(event.agent_name, event.text, event.metadata)
+            else {
                 return Ok(None);
             };
             let response = llm_usage_events::table
@@ -117,32 +164,33 @@ fn naming_call(
                     .and_then(title_from_response)
                     .map(|title| (title, id, observed_at))
             });
-            let prompt = codex_naming_prompt(text).map(str::to_owned);
             Ok(Some(NamingCall {
-                task,
+                task: naming.task,
                 title,
-                prompt,
+                prompt: naming.prompt,
             }))
         }
-        "response" if may_carry_title(text) => {
-            let Some(title) = title_from_response(text) else {
+        "response" if event.text.is_some_and(may_carry_title) => {
+            let Some(title) = event.text.and_then(title_from_response) else {
                 return Ok(None);
             };
-            let request_text = llm_usage_events::table
+            let request = llm_usage_events::table
                 .filter(llm_usage_events::session_pk.eq(&session))
                 .filter(llm_usage_events::turn_index.eq(event.turn_index))
                 .filter(llm_usage_events::event_type.eq("request"))
                 .filter(llm_usage_events::observed_at.le(event.observed_at))
                 .order_by(llm_usage_events::observed_at.desc())
-                .select(llm_usage_events::text)
-                .first::<Option<String>>(connection)
-                .optional()?
-                .flatten();
-            Ok(request_text.as_deref().and_then(|request_text| {
-                TitleTask::from_request(request_text).map(|task| NamingCall {
-                    task,
-                    title: Some((title, event.event_pk.to_string(), event.observed_at)),
-                    prompt: codex_naming_prompt(request_text).map(str::to_owned),
+                .select((llm_usage_events::text, llm_usage_events::metadata))
+                .first::<(Option<String>, String)>(connection)
+                .optional()?;
+            Ok(request.and_then(|(text, metadata)| {
+                let metadata = serde_json::from_str::<Value>(&metadata).ok()?;
+                NamingRequest::parse(event.agent_name, text.as_deref(), &metadata).map(|naming| {
+                    NamingCall {
+                        task: naming.task,
+                        title: Some((title, event.event_pk.to_string(), event.observed_at)),
+                        prompt: naming.prompt,
+                    }
                 })
             }))
         }
@@ -246,28 +294,26 @@ fn match_pending_naming_threads(
     let Some((low, high)) = codex_turn_id(event.metadata).and_then(codex_turn_id_range) else {
         return Ok(());
     };
-    let session = event.session_pk.to_string();
     let nearby = session_titles::table
         .filter(session_titles::user_id.eq(event.user_id.to_string()))
+        .filter(session_titles::purpose.eq(TITLE_GENERATION_PURPOSE))
         .filter(session_titles::title.is_not_null())
+        .filter(
+            session_titles::parent_session_pk
+                .is_null()
+                .or(session_titles::parent_session_pk.ne(event.session_pk.to_string())),
+        )
         .filter(session_titles::naming_turn_id.between(low, high))
-        .select((
-            session_titles::session_pk,
-            session_titles::naming_prompt,
-            session_titles::parent_session_pk,
-            session_titles::title_event_pk,
-        ))
-        .load::<(String, Option<String>, Option<String>, Option<String>)>(connection)?;
-    for (naming_session, prompt, parent, title_event_pk) in nearby {
-        if !prompt.is_some_and(|prompt| opens_with_prompt(event.metadata, &prompt)) {
-            continue;
-        }
-        match parent {
-            None => match_naming_thread(connection, &naming_session)?,
-            Some(parent) if parent != session => {
-                unmatch(connection, &naming_session, &parent, title_event_pk)?;
-            }
-            Some(_) => {}
+        .select((session_titles::session_pk, session_titles::naming_prompt))
+        .load::<(String, Option<String>)>(connection)?;
+    if nearby.is_empty() {
+        return Ok(());
+    }
+    for (naming_session, prompt) in nearby {
+        if prompt.is_some_and(|prompt| opens_with_prompt(event.metadata, &prompt)) {
+            // Recompute the complete candidate set before adding or withdrawing
+            // a link. A request from a different device is not a conflict.
+            match_naming_thread(connection, &naming_session)?;
         }
     }
     Ok(())
@@ -306,10 +352,9 @@ fn match_naming_thread(
     connection: &mut SqliteConnection,
     naming_session: &str,
 ) -> Result<(), AppError> {
-    let Some((user_id, title, title_event_pk, title_observed_at, turn_id, prompt)) =
+    let Some((user_id, title, title_event_pk, title_observed_at, turn_id, prompt, old_parent)) =
         session_titles::table
             .find(naming_session)
-            .filter(session_titles::parent_session_pk.is_null())
             .select((
                 session_titles::user_id,
                 session_titles::title,
@@ -317,12 +362,14 @@ fn match_naming_thread(
                 session_titles::title_observed_at,
                 session_titles::naming_turn_id,
                 session_titles::naming_prompt,
+                session_titles::parent_session_pk,
             ))
             .first::<(
                 String,
                 Option<String>,
                 Option<String>,
                 Option<i64>,
+                Option<String>,
                 Option<String>,
                 Option<String>,
             )>(connection)
@@ -367,7 +414,21 @@ fn match_naming_thread(
         .map(|(session, _)| session)
         .collect::<BTreeSet<_>>();
     let mut sessions = sessions.into_iter();
-    let (Some(task_session), None) = (sessions.next(), sessions.next()) else {
+    let task_session = match (sessions.next(), sessions.next()) {
+        (Some(session), None) => Some(session),
+        _ => None,
+    };
+    if let Some(parent) = old_parent.as_deref()
+        && Some(parent) != task_session.as_deref()
+    {
+        unmatch(
+            connection,
+            naming_session,
+            parent,
+            Some(title_event_pk.clone()),
+        )?;
+    }
+    let Some(task_session) = task_session else {
         return Ok(());
     };
     diesel::update(session_titles::table.find(naming_session))
@@ -388,7 +449,9 @@ fn match_naming_thread(
 /// to date.
 pub(super) fn backfill(connection: &mut SqliteConnection) -> Result<(), AppError> {
     run_once(connection, BACKFILL_NAME, backfill_titles)?;
-    run_once(connection, LINK_BACKFILL_NAME, backfill_links)
+    run_once(connection, LINK_BACKFILL_NAME, backfill_links)?;
+    run_once(connection, LINK_REPAIR_NAME, backfill_links)?;
+    run_once(connection, DEFAULT_BACKFILL_NAME, backfill_defaults)
 }
 
 fn run_once(
@@ -421,6 +484,7 @@ fn run_once(
 fn backfill_titles(connection: &mut SqliteConnection) -> Result<(), AppError> {
     let requests = llm_usage_events::table
         .filter(llm_usage_events::event_type.eq("request"))
+        .filter(llm_usage_events::agent_name.eq_any(["codex", "claude-code"]))
         .filter(
             llm_usage_events::text
                 .like("%You are naming a coding session%")
@@ -432,12 +496,24 @@ fn backfill_titles(connection: &mut SqliteConnection) -> Result<(), AppError> {
             llm_usage_events::user_id,
             llm_usage_events::session_pk,
             llm_usage_events::turn_index,
+            llm_usage_events::agent_name,
             llm_usage_events::text,
             llm_usage_events::metadata,
             llm_usage_events::observed_at,
         ))
-        .load::<(String, String, String, i32, Option<String>, String, i64)>(connection)?;
-    for (event_pk, user_id, session_pk, turn_index, text, metadata, observed_at) in requests {
+        .load::<(
+            String,
+            String,
+            String,
+            i32,
+            String,
+            Option<String>,
+            String,
+            i64,
+        )>(connection)?;
+    for (event_pk, user_id, session_pk, turn_index, agent_name, text, metadata, observed_at) in
+        requests
+    {
         let metadata = serde_json::from_str::<Value>(&metadata).unwrap_or(Value::Null);
         capture(
             connection,
@@ -446,7 +522,7 @@ fn backfill_titles(connection: &mut SqliteConnection) -> Result<(), AppError> {
                 session_pk: parse_uuid(&session_pk, "event session id")?,
                 event_pk: parse_uuid(&event_pk, "event id")?,
                 turn_index,
-                agent_name: "",
+                agent_name: &agent_name,
                 event_type: "request",
                 text: text.as_deref(),
                 metadata: &metadata,
@@ -461,14 +537,13 @@ fn backfill_titles(connection: &mut SqliteConnection) -> Result<(), AppError> {
 fn backfill_links(connection: &mut SqliteConnection) -> Result<(), AppError> {
     let naming_sessions = session_titles::table
         .filter(session_titles::purpose.eq(TITLE_GENERATION_PURPOSE))
-        .filter(session_titles::naming_turn_id.is_null())
         .select(session_titles::session_pk)
         .load::<String>(connection)?;
     for naming_session in naming_sessions {
         let request = llm_usage_events::table
             .filter(llm_usage_events::session_pk.eq(&naming_session))
             .filter(llm_usage_events::event_type.eq("request"))
-            .filter(llm_usage_events::text.like("%Generate a concise, single-line task title%"))
+            .filter(llm_usage_events::agent_name.eq("codex"))
             .order_by(llm_usage_events::observed_at.desc())
             .select((llm_usage_events::text, llm_usage_events::metadata))
             .first::<(Option<String>, String)>(connection)
@@ -477,13 +552,79 @@ fn backfill_links(connection: &mut SqliteConnection) -> Result<(), AppError> {
             continue;
         };
         let metadata = serde_json::from_str::<Value>(&metadata).unwrap_or(Value::Null);
+        let Some(naming) = NamingRequest::parse("codex", text.as_deref(), &metadata) else {
+            continue;
+        };
         diesel::update(session_titles::table.find(&naming_session))
             .set((
                 session_titles::naming_turn_id.eq(codex_turn_id(&metadata)),
-                session_titles::naming_prompt.eq(text.as_deref().and_then(codex_naming_prompt)),
+                session_titles::naming_prompt.eq(naming.prompt),
             ))
             .execute(connection)?;
         match_naming_thread(connection, &naming_session)?;
+    }
+    Ok(())
+}
+
+/// Visit requests in time order until the first readable user input is found.
+fn backfill_defaults(connection: &mut SqliteConnection) -> Result<(), AppError> {
+    let sessions = agent_sessions::table
+        .filter(agent_sessions::agent_name.ne_all(["codex", "claude-code"]))
+        .select((
+            agent_sessions::id,
+            agent_sessions::user_id,
+            agent_sessions::agent_name,
+        ))
+        .load::<(String, String, String)>(connection)?;
+    for (session, user_id, agent_name) in sessions {
+        let mut offset = 0_i64;
+        loop {
+            let requests = llm_usage_events::table
+                .filter(llm_usage_events::session_pk.eq(&session))
+                .filter(llm_usage_events::event_type.eq("request"))
+                .order_by((
+                    llm_usage_events::observed_at.asc(),
+                    llm_usage_events::id.asc(),
+                ))
+                .offset(offset)
+                .limit(16)
+                .select((
+                    llm_usage_events::id,
+                    llm_usage_events::observed_at,
+                    llm_usage_events::metadata,
+                ))
+                .load::<(String, i64, String)>(connection)?;
+            if requests.is_empty() {
+                break;
+            }
+            let mut found = false;
+            for (event_pk, observed_at, metadata) in requests {
+                let metadata = serde_json::from_str::<Value>(&metadata).unwrap_or(Value::Null);
+                if default_title(&metadata).is_none() {
+                    continue;
+                }
+                capture_default(
+                    connection,
+                    &CapturedEvent {
+                        user_id: parse_uuid(&user_id, "user id")?,
+                        session_pk: parse_uuid(&session, "session id")?,
+                        event_pk: parse_uuid(&event_pk, "event id")?,
+                        turn_index: 0,
+                        agent_name: &agent_name,
+                        event_type: "request",
+                        text: None,
+                        metadata: &metadata,
+                        observed_at,
+                    },
+                )?;
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+            offset = offset.saturating_add(16);
+        }
     }
     Ok(())
 }
@@ -689,6 +830,75 @@ mod tests {
     }
 
     #[test]
+    fn default_titles_keep_the_earliest_user_request_even_when_delivered_late() {
+        let mut database = database();
+        for (id, at, kind, input, expected) in [
+            ("r2", "2026-09-30T00:00:02Z", "request", "Second", "Second"),
+            ("r3", "2026-09-30T00:00:03Z", "request", "Third", "Second"),
+            ("r1", "2026-09-30T00:00:01Z", "request", "First", "First"),
+            (
+                "s0",
+                "2026-09-30T00:00:00Z",
+                "response",
+                "Response",
+                "First",
+            ),
+        ] {
+            let mut value = event("cursor", "default", id, at, kind, input);
+            value["metadata"] = json!({"conversation": {"messages": [
+                {"role": "user", "text": input}
+            ]}});
+            ingest(&mut database, &[value]);
+            assert_eq!(
+                session_title(&mut database, "default").0.as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn backfills_default_titles_past_empty_requests_once() {
+        let mut database = database();
+        let mut values: Vec<_> = (0_i32..17_i32)
+            .map(|index| {
+                event(
+                    "cursor",
+                    "default",
+                    &format!("empty-{index}"),
+                    "2026-09-30T00:00:00Z",
+                    "request",
+                    "No structured user input",
+                )
+            })
+            .collect();
+        let mut first = event(
+            "cursor",
+            "default",
+            "first",
+            "2026-09-30T00:00:01Z",
+            "request",
+            "First request",
+        );
+        archive(&mut first, "user");
+        values.push(first);
+        ingest(&mut database, &values);
+        diesel::delete(session_titles::table)
+            .execute(&mut database)
+            .expect("clear titles");
+
+        backfill(&mut database).expect("backfill");
+        assert_eq!(
+            session_title(&mut database, "default").0.as_deref(),
+            Some("First request")
+        );
+        diesel::delete(session_titles::table)
+            .execute(&mut database)
+            .expect("clear titles");
+        backfill(&mut database).expect("second backfill");
+        assert_eq!(session_title(&mut database, "default"), (None, None));
+    }
+
+    #[test]
     fn marks_codex_naming_threads_as_auxiliary_even_when_the_response_arrives_first() {
         let mut database = database();
         ingest(
@@ -830,8 +1040,8 @@ mod tests {
                 .count()
                 .get_result::<i64>(&mut database)
                 .expect("count"),
-            2,
-            "titles and Codex links are each scanned once"
+            4,
+            "generated titles, both link versions and default titles are each scanned once"
         );
     }
 
@@ -882,5 +1092,160 @@ mod tests {
         );
         assert_eq!(parent_of(&mut database, "title-thread"), None);
         assert_eq!(session_title(&mut database, "second"), (None, None));
+    }
+    fn archive(event: &mut Value, source: &str) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let turn = event["metadata"]["codex_turn_id"].clone();
+        let payload = json!({
+            "input": [
+                {"role": "developer", "content": "Instructions"},
+                {"role": "user", "content": [{"type": "input_text", "text": event["text"]}]}
+            ],
+            "client_metadata": {"x-codex-turn-metadata": json!({
+                "thread_source": source
+            }).to_string()}
+        });
+        event["metadata"] = json!({"codex_turn_id": turn, "raw_body": {"parts": [{
+            "truncated": false, "content_base64": STANDARD.encode(payload.to_string())
+        }]}});
+    }
+
+    #[test]
+    fn raw_codex_links_work_for_every_arrival_order() {
+        for naming_first in [false, true] {
+            for response_first in [false, true] {
+                let mut database = database();
+                let mut naming = codex_naming_thread("title-thread");
+                archive(&mut naming[0], "thread_title");
+                // Raw-only requests also work when the flattened text is absent.
+                naming[0]["text"] = Value::Null;
+                if response_first {
+                    naming.reverse();
+                }
+                let mut task = codex_task("task", TASK_TURN, TASK);
+                archive(&mut task, "user");
+                if naming_first {
+                    ingest(&mut database, &naming);
+                    ingest(&mut database, &[task]);
+                } else {
+                    ingest(&mut database, &[task]);
+                    ingest(&mut database, &naming);
+                }
+                assert_eq!(
+                    session_title(&mut database, "task").0.as_deref(),
+                    Some("Draw a pelican")
+                );
+                let task_pk = session_pk(&mut database, "task");
+                assert_eq!(parent_of(&mut database, "title-thread"), Some(task_pk));
+            }
+        }
+    }
+
+    #[test]
+    fn other_devices_and_auxiliary_threads_do_not_withdraw_links() {
+        let mut database = database();
+        let mut naming = codex_naming_thread("title-thread");
+        archive(&mut naming[0], "thread_title");
+        let mut task = codex_task("task", TASK_TURN, TASK);
+        archive(&mut task, "user");
+        ingest(&mut database, &[task]);
+        ingest(&mut database, &naming);
+        let task_pk = session_pk(&mut database, "task");
+        for (session, host, source) in [
+            ("other-device", "another-host", "user"),
+            ("guardian", "local", "guardian_review"),
+            ("subagent", "local", "subagent"),
+        ] {
+            let mut request = codex_task(session, TASK_TURN, TASK);
+            request["device"]["host_name"] = json!(host);
+            archive(&mut request, source);
+            ingest(&mut database, &[request]);
+            assert_eq!(
+                parent_of(&mut database, "title-thread"),
+                Some(task_pk),
+                "{session}"
+            );
+            assert_eq!(
+                session_title(&mut database, "task").0.as_deref(),
+                Some("Draw a pelican")
+            );
+        }
+        let mut conflict = codex_task("second-task", TASK_TURN, TASK);
+        archive(&mut conflict, "user");
+        ingest(&mut database, &[conflict]);
+        assert_eq!(parent_of(&mut database, "title-thread"), None);
+        assert_eq!(session_title(&mut database, "task").0, None);
+    }
+
+    #[test]
+    fn repairs_existing_unlinked_raw_titles_once() {
+        let mut database = database();
+        let mut naming = codex_naming_thread("title-thread");
+        archive(&mut naming[0], "thread_title");
+        let mut task = codex_task("task", TASK_TURN, TASK);
+        archive(&mut task, "user");
+        ingest(&mut database, &[task]);
+        ingest(&mut database, &naming);
+        let task_pk = session_pk(&mut database, "task");
+        let naming_pk = session_pk(&mut database, "title-thread");
+        diesel::delete(session_titles::table.find(task_pk.to_string()))
+            .execute(&mut database)
+            .expect("remove projection");
+        diesel::update(session_titles::table.find(naming_pk.to_string()))
+            .set(session_titles::parent_session_pk.eq(None::<String>))
+            .execute(&mut database)
+            .expect("simulate old raw-body mismatch");
+        for name in [super::BACKFILL_NAME, super::LINK_BACKFILL_NAME] {
+            diesel::insert_into(schema_backfills::table)
+                .values((
+                    schema_backfills::name.eq(name),
+                    schema_backfills::completed_at.eq(0_i64),
+                ))
+                .execute(&mut database)
+                .expect("mark older scans completed");
+        }
+        backfill(&mut database).expect("repair");
+        assert_eq!(parent_of(&mut database, "title-thread"), Some(task_pk));
+        assert_eq!(
+            session_title(&mut database, "task").0.as_deref(),
+            Some("Draw a pelican")
+        );
+        backfill(&mut database).expect("idempotent repair");
+        assert_eq!(parent_of(&mut database, "title-thread"), Some(task_pk));
+    }
+
+    #[test]
+    fn generic_agents_are_not_classified_by_codex_or_claude_templates() {
+        let mut database = database();
+        for (session, instruction) in [
+            ("generic-cc", CLAUDE_NAMING),
+            ("generic-codex", CODEX_NAMING),
+        ] {
+            ingest(
+                &mut database,
+                &[
+                    event(
+                        "cursor",
+                        session,
+                        &format!("{session}-r"),
+                        "2026-09-30T00:00:01Z",
+                        "request",
+                        instruction,
+                    ),
+                    event(
+                        "cursor",
+                        session,
+                        &format!("{session}-s"),
+                        "2026-09-30T00:00:02Z",
+                        "response",
+                        r#"{"title":"Quoted title"}"#,
+                    ),
+                ],
+            );
+            assert_eq!(session_title(&mut database, session), (None, None));
+        }
+        backfill(&mut database).expect("historical scan follows the same adapter policy");
+        assert_eq!(session_title(&mut database, "generic-cc"), (None, None));
+        assert_eq!(session_title(&mut database, "generic-codex"), (None, None));
     }
 }

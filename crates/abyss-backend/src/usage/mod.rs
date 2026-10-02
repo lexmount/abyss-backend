@@ -11,6 +11,7 @@ pub mod attachments;
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
+mod provider_body;
 /// Owner-scoped session index contracts.
 pub mod session_list;
 pub mod session_title;
@@ -538,7 +539,7 @@ pub struct SessionInfo {
     pub ended_at: Option<DateTime<Utc>>,
     /// Stable, allowlisted session metadata.
     pub metadata: Value,
-    /// Name the Agent generated for the session, when one was captured.
+    /// Agent-generated title, or a first-user-input preview for other Agents.
     pub title: Option<String>,
     /// Why the session exists when it only serves the Agent, such as
     /// `title_generation`; `None` for ordinary sessions.
