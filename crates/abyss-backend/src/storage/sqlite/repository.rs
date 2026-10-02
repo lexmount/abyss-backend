@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use diesel::{
-    ExpressionMethods, QueryDsl, RunQueryDsl, SelectableHelper, SqliteConnection,
+    ExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl, SelectableHelper, SqliteConnection,
     dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
@@ -946,7 +946,7 @@ pub(super) fn usage_summary(
     connection: &mut SqliteConnection,
     query: &SummaryQuery,
     user_id: Uuid,
-    scan_limit: i64,
+    default_limit: i64,
 ) -> Result<SummaryResponse, AppError> {
     let group_by = parse_group_by(query.group_by.as_deref());
     let dimensions = SummaryDimensions::from_group_by(&group_by);
@@ -954,45 +954,65 @@ pub(super) fn usage_summary(
     if !owner_matches_filter(user_id, &owner, query.user_filter.as_deref()) {
         return Ok(empty_summary(query, group_by));
     }
-    let events = load_filtered_events(
-        connection,
-        &EventFilters {
-            user_id,
-            from: query.from,
-            to: query.to,
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
-            session_pk: None,
-            turn_index: None,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
-            event_type: query.event_type.as_deref(),
-            limit: scan_limit,
-            offset: 0,
-        },
-    )?;
-    let devices = load_device_contexts(connection, &events)?;
-    let mut buckets: HashMap<SummaryKey, SummaryBucket> = HashMap::new();
-    for event in events {
-        let device = devices.get(&event.device_context_id);
-        let key = SummaryKey::new(&event, device, user_id, &owner, &dimensions);
-        buckets.entry(key).or_default().add(&event);
-    }
-    let mut rows = buckets
+    let agent_names = query
+        .agent_name
+        .as_deref()
+        .and_then(non_empty)
+        .map(agent_name_filter_values)
+        .unwrap_or_default();
+    let agent_names_json = serde_json::to_string(&agent_names)
+        .map_err(|error| AppError::internal(format!("serialize agent filter: {error}")))?;
+    let session_id = query
+        .session_id
+        .as_deref()
+        .and_then(non_empty)
+        .map(str::trim);
+    let provider = query
+        .llm_provider
+        .as_deref()
+        .and_then(non_empty)
+        .map(normalize_slug);
+    let model = query
+        .llm_model
+        .as_deref()
+        .and_then(non_empty)
+        .map(str::trim);
+    let event_type = query
+        .event_type
+        .as_deref()
+        .and_then(non_empty)
+        .map(validate_event_type)
+        .transpose()?;
+    let limit = normalize_limit(query.limit, default_limit, 100_000);
+
+    // Bind order mirrors the numbered placeholders in the query.
+    let rows = sql_query(SUMMARY_AGGREGATE_SQL)
+        .bind::<Bool, _>(dimensions.enabled(SummaryDimension::Day))
+        .bind::<Bool, _>(dimensions.enabled(SummaryDimension::Device))
+        .bind::<Bool, _>(dimensions.enabled(SummaryDimension::Agent))
+        .bind::<Bool, _>(dimensions.enabled(SummaryDimension::Provider))
+        .bind::<Bool, _>(dimensions.enabled(SummaryDimension::Model))
+        .bind::<Bool, _>(dimensions.enabled(SummaryDimension::EventType))
+        .bind::<Text, _>(user_id.to_string())
+        .bind::<BigInt, _>(query.from.map_or(i64::MIN, timestamp_to_micros))
+        .bind::<BigInt, _>(query.to.map_or(i64::MAX, timestamp_to_micros))
+        .bind::<Bool, _>(!agent_names.is_empty())
+        .bind::<Text, _>(&agent_names_json)
+        .bind::<Bool, _>(session_id.is_some())
+        .bind::<Text, _>(session_id.unwrap_or_default())
+        .bind::<Bool, _>(provider.is_some())
+        .bind::<Text, _>(provider.as_deref().unwrap_or_default())
+        .bind::<Bool, _>(model.is_some())
+        .bind::<Text, _>(model.unwrap_or_default())
+        .bind::<Bool, _>(event_type.is_some())
+        .bind::<Text, _>(event_type.unwrap_or_default())
+        .bind::<BigInt, _>(limit)
+        .load::<SummaryAggregateRow>(connection)?;
+    let include_user = dimensions.enabled(SummaryDimension::User);
+    let rows = rows
         .into_iter()
-        .map(|(key, bucket)| bucket.into_row(key))
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .total_tokens
-            .cmp(&left.total_tokens)
-            .then_with(|| left.agent_name.cmp(&right.agent_name))
-            .then_with(|| left.user_email.cmp(&right.user_email))
-            .then_with(|| left.day.cmp(&right.day))
-    });
-    let row_limit = usize::try_from(normalize_limit(query.limit, scan_limit, 100_000))
-        .map_err(|error| AppError::internal(format!("invalid summary row limit: {error}")))?;
-    rows.truncate(row_limit);
+        .map(|row| row.into_summary_row(include_user.then_some((user_id, &owner))))
+        .collect::<Result<Vec<_>, AppError>>()?;
     Ok(SummaryResponse {
         from: query.from,
         to: query.to,
@@ -1000,6 +1020,128 @@ pub(super) fn usage_summary(
         rows,
         next_page_token: None,
     })
+}
+
+/// Usage totals grouped in SQL, reading only the columns a summary reports.
+///
+/// Event text and metadata hold whole request bodies, so loading rows to sum
+/// them in memory read gigabytes for a week of usage. The owner is the single
+/// standalone user, so the user dimension is filled in afterwards.
+///
+/// Bind order: `?1`..`?6` day, device, Agent, provider, model, and event-type
+/// dimensions; `?7` owner; `?8`/`?9` observation bounds in microseconds, kept
+/// unconditional so the owner-time index bounds the scan; `?10`/`?11` Agent
+/// filter flag and JSON name list; `?12`..`?19` session, provider, model, and
+/// event-type filter flags and values; `?20` row limit.
+const SUMMARY_AGGREGATE_SQL: &str = "\
+    SELECT \
+        CASE WHEN ?1 THEN strftime('%Y-%m-%d', e.observed_at / 1000000, 'unixepoch') END AS day, \
+        CASE WHEN ?2 THEN d.host_name END AS host_name, \
+        CASE WHEN ?2 THEN d.platform END AS platform, \
+        CASE WHEN ?2 THEN d.os_version END AS os_version, \
+        CASE \
+            WHEN ?3 THEN CASE \
+                WHEN e.agent_name IN ('claude', 'claude-desktop') THEN 'claude-code' \
+                ELSE e.agent_name \
+            END \
+        END AS agent_name, \
+        CASE WHEN ?4 THEN e.llm_provider END AS llm_provider, \
+        CASE WHEN ?5 THEN e.llm_model END AS llm_model, \
+        CASE WHEN ?6 THEN e.event_type END AS event_type, \
+        COUNT(DISTINCT e.session_pk) AS sessions, \
+        COUNT(DISTINCT e.turn_pk) AS turns, \
+        COUNT(*) FILTER (WHERE e.event_type = 'request') AS requests, \
+        COUNT(*) FILTER (WHERE e.event_type = 'response') AS responses, \
+        COALESCE(SUM(e.input_tokens), 0) AS input_tokens, \
+        COALESCE(SUM(e.output_tokens), 0) AS output_tokens, \
+        COALESCE(SUM(e.cache_read_tokens), 0) AS cache_read_tokens, \
+        COALESCE(SUM(e.cache_write_tokens), 0) AS cache_write_tokens, \
+        COALESCE(SUM(e.reasoning_tokens), 0) AS reasoning_tokens, \
+        COALESCE(SUM(e.total_tokens), 0) AS total_tokens \
+    FROM llm_usage_events e \
+    LEFT JOIN devices d ON ?2 AND d.id = e.device_context_id \
+    WHERE e.user_id = ?7 \
+        AND e.observed_at >= ?8 \
+        AND e.observed_at < ?9 \
+        AND (?10 = 0 OR e.agent_name IN (SELECT value FROM json_each(?11))) \
+        AND (?12 = 0 OR e.session_id = ?13) \
+        AND (?14 = 0 OR e.llm_provider = ?15) \
+        AND (?16 = 0 OR e.llm_model = ?17) \
+        AND (?18 = 0 OR e.event_type = ?19) \
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8 \
+    ORDER BY total_tokens DESC, agent_name ASC, day ASC \
+    LIMIT ?20";
+
+#[derive(QueryableByName)]
+struct SummaryAggregateRow {
+    #[diesel(sql_type = Nullable<Text>)]
+    day: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    host_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    platform: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    os_version: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    agent_name: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    llm_provider: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    llm_model: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    event_type: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    sessions: i64,
+    #[diesel(sql_type = BigInt)]
+    turns: i64,
+    #[diesel(sql_type = BigInt)]
+    requests: i64,
+    #[diesel(sql_type = BigInt)]
+    responses: i64,
+    #[diesel(sql_type = BigInt)]
+    input_tokens: i64,
+    #[diesel(sql_type = BigInt)]
+    output_tokens: i64,
+    #[diesel(sql_type = BigInt)]
+    cache_read_tokens: i64,
+    #[diesel(sql_type = BigInt)]
+    cache_write_tokens: i64,
+    #[diesel(sql_type = BigInt)]
+    reasoning_tokens: i64,
+    #[diesel(sql_type = BigInt)]
+    total_tokens: i64,
+}
+
+impl SummaryAggregateRow {
+    fn into_summary_row(self, user: Option<(Uuid, &OwnerRecord)>) -> Result<SummaryRow, AppError> {
+        let count = |value: i64, name: &str| {
+            usize::try_from(value)
+                .map_err(|error| AppError::internal(format!("invalid summary {name}: {error}")))
+        };
+        Ok(SummaryRow {
+            day: self.day,
+            user_id: user.map(|(user_id, _)| user_id),
+            user_name: user.and_then(|(_, owner)| owner.name.clone()),
+            user_email: user.map(|(_, owner)| owner.email.clone()),
+            host_name: self.host_name,
+            platform: self.platform,
+            os_version: self.os_version,
+            agent_name: self.agent_name,
+            llm_provider: self.llm_provider,
+            llm_model: self.llm_model,
+            event_type: self.event_type,
+            sessions: count(self.sessions, "sessions")?,
+            turns: count(self.turns, "turns")?,
+            requests: self.requests,
+            responses: self.responses,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            total_tokens: self.total_tokens,
+        })
+    }
 }
 
 struct OwnerRecord {
@@ -1085,126 +1227,6 @@ impl SummaryDimensions {
 
     const fn enabled(&self, dimension: SummaryDimension) -> bool {
         self.0[dimension.index()]
-    }
-}
-
-#[derive(Hash, Eq, PartialEq)]
-struct SummaryKey {
-    day: Option<String>,
-    user_id: Option<Uuid>,
-    user_name: Option<String>,
-    user_email: Option<String>,
-    host_name: Option<String>,
-    platform: Option<String>,
-    os_version: Option<String>,
-    agent_name: Option<String>,
-    llm_provider: Option<String>,
-    llm_model: Option<String>,
-    event_type: Option<String>,
-}
-
-impl SummaryKey {
-    fn new(
-        event: &EventRecord,
-        device: Option<&DeviceRecord>,
-        user_id: Uuid,
-        owner: &OwnerRecord,
-        dimensions: &SummaryDimensions,
-    ) -> Self {
-        let include_user = dimensions.enabled(SummaryDimension::User);
-        let include_device = dimensions.enabled(SummaryDimension::Device);
-        Self {
-            day: dimensions
-                .enabled(SummaryDimension::Day)
-                .then(|| event.observed_at.format("%Y-%m-%d").to_string()),
-            user_id: include_user.then_some(user_id),
-            user_name: include_user.then(|| owner.name.clone()).flatten(),
-            user_email: include_user.then(|| owner.email.clone()),
-            host_name: include_device
-                .then(|| device.map(|value| value.host_name.clone()))
-                .flatten(),
-            platform: include_device
-                .then(|| device.map(|value| value.platform.clone()))
-                .flatten(),
-            os_version: include_device
-                .then(|| device.and_then(|value| value.os_version.clone()))
-                .flatten(),
-            agent_name: dimensions
-                .enabled(SummaryDimension::Agent)
-                .then(|| canonical_agent_name(&event.agent_name)),
-            llm_provider: dimensions
-                .enabled(SummaryDimension::Provider)
-                .then(|| event.llm_provider.clone()),
-            llm_model: dimensions
-                .enabled(SummaryDimension::Model)
-                .then(|| event.llm_model.clone()),
-            event_type: dimensions
-                .enabled(SummaryDimension::EventType)
-                .then(|| event.event_type.clone()),
-        }
-    }
-}
-
-#[derive(Default)]
-struct SummaryBucket {
-    sessions: HashSet<Uuid>,
-    turns: HashSet<Uuid>,
-    requests: i64,
-    responses: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_write_tokens: i64,
-    reasoning_tokens: i64,
-    total_tokens: i64,
-}
-
-impl SummaryBucket {
-    fn add(&mut self, event: &EventRecord) {
-        self.sessions.insert(event.session_pk);
-        self.turns.insert(event.turn_pk);
-        self.requests = self
-            .requests
-            .saturating_add(i64::from(event.event_type == "request"));
-        self.responses = self
-            .responses
-            .saturating_add(i64::from(event.event_type == "response"));
-        self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
-        self.cache_read_tokens = self
-            .cache_read_tokens
-            .saturating_add(event.cache_read_tokens);
-        self.cache_write_tokens = self
-            .cache_write_tokens
-            .saturating_add(event.cache_write_tokens);
-        self.reasoning_tokens = self.reasoning_tokens.saturating_add(event.reasoning_tokens);
-        self.total_tokens = self.total_tokens.saturating_add(event.total_tokens);
-    }
-
-    fn into_row(self, key: SummaryKey) -> SummaryRow {
-        SummaryRow {
-            day: key.day,
-            user_id: key.user_id,
-            user_name: key.user_name,
-            user_email: key.user_email,
-            host_name: key.host_name,
-            platform: key.platform,
-            os_version: key.os_version,
-            agent_name: key.agent_name,
-            llm_provider: key.llm_provider,
-            llm_model: key.llm_model,
-            event_type: key.event_type,
-            sessions: self.sessions.len(),
-            turns: self.turns.len(),
-            requests: self.requests,
-            responses: self.responses,
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            cache_read_tokens: self.cache_read_tokens,
-            cache_write_tokens: self.cache_write_tokens,
-            reasoning_tokens: self.reasoning_tokens,
-            total_tokens: self.total_tokens,
-        }
     }
 }
 
@@ -1330,11 +1352,14 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::{search::SessionSearchQuery, usage::IngestEventsRequest};
+    use crate::{
+        search::SessionSearchQuery,
+        usage::{IngestEventsRequest, SummaryQuery},
+    };
 
     use super::{
         super::{migrations, schema::llm_usage_events, search},
-        ingest_events, session_outline,
+        ingest_events, session_outline, usage_summary,
     };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -1482,6 +1507,137 @@ mod tests {
         let after = super::session_timeline(&mut database, OWNER_ID, session_pk).unwrap();
         assert_eq!(after.turns[0].events.len(), 1);
         assert_eq!(after.turns[0].events[0].metadata, expected);
+    }
+
+    fn summary_seeded() -> SqliteConnection {
+        let mut database = database();
+        let event = |id: &str, agent: &str, session: &str, turn: i32, observed_at: &str| {
+            let (provider, model) = if agent == "Codex" {
+                ("OpenAI", "gpt-5")
+            } else {
+                ("Anthropic", "claude-x")
+            };
+            json!({
+                "event_id": id,
+                "observed_at": observed_at,
+                "device": {"host_name": "alice-mbp", "platform": "macos", "os_version": "15.1"},
+                "agent": {"name": agent},
+                "session_id": session,
+                "turn_index": turn,
+                "llm": {"provider": provider, "model": model},
+                "event_type": if id.ends_with("req") { "request" } else { "response" },
+                "text": "body",
+                "token_usage": if id.ends_with("req") {
+                    json!({"input_tokens": 10_i64, "cache_read_tokens": 4_i64})
+                } else {
+                    json!({"output_tokens": 5_i64})
+                },
+                "metadata": {"raw_body": "large"}
+            })
+        };
+        let request: IngestEventsRequest = serde_json::from_value(json!({
+            "events": [
+                event("a-req", "Codex", "alpha", 1_i32, "2026-09-01T23:00:00Z"),
+                event("a-res", "Codex", "alpha", 1_i32, "2026-09-01T23:30:00Z"),
+                event("b-req", "claude-desktop", "beta", 1_i32, "2026-09-02T01:00:00Z"),
+                event("c-res", "claude-code", "gamma", 1_i32, "2026-09-02T02:00:00Z"),
+                event("a2-req", "Codex", "alpha", 2_i32, "2026-09-03T00:00:00Z"),
+            ]
+        }))
+        .expect("request should deserialize");
+        ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+        database
+    }
+
+    fn summary(database: &mut SqliteConnection, query: serde_json::Value) -> serde_json::Value {
+        let query: SummaryQuery = serde_json::from_value(query).expect("query should deserialize");
+        let response =
+            usage_summary(database, &query, OWNER_ID, 500).expect("summary should succeed");
+        serde_json::to_value(response.rows).expect("rows should serialize")
+    }
+
+    #[test]
+    fn summary_groups_in_sql_with_canonical_agents_and_distinct_counts() {
+        let mut database = summary_seeded();
+
+        let rows = summary(
+            &mut database,
+            json!({"group_by": "agent,provider,model", "to": "2026-09-03T00:00:00Z"}),
+        );
+
+        assert_eq!(
+            rows,
+            json!([
+                // Equal totals fall back to the Agent name.
+                {
+                    "agent_name": "claude-code", "llm_provider": "anthropic",
+                    "llm_model": "claude-x",
+                    "sessions": 2_i64, "turns": 2_i64, "requests": 1_i64, "responses": 1_i64,
+                    "input_tokens": 10_i64, "output_tokens": 5_i64, "cache_read_tokens": 4_i64,
+                    "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 19_i64
+                },
+                {
+                    "agent_name": "codex", "llm_provider": "openai", "llm_model": "gpt-5",
+                    "sessions": 1_i64, "turns": 1_i64, "requests": 1_i64, "responses": 1_i64,
+                    "input_tokens": 10_i64, "output_tokens": 5_i64, "cache_read_tokens": 4_i64,
+                    "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 19_i64
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn summary_filters_and_groups_by_utc_day_and_event_type() {
+        let mut database = summary_seeded();
+
+        let rows = summary(
+            &mut database,
+            json!({"group_by": "day,event_type", "agent_name": "claude", "limit": 10_i64}),
+        );
+
+        let mut buckets = rows
+            .as_array()
+            .expect("rows should be an array")
+            .iter()
+            .map(|row| {
+                (
+                    row["day"].clone(),
+                    row["event_type"].clone(),
+                    row["total_tokens"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        buckets.sort_by_key(|bucket| bucket.1.to_string());
+        assert_eq!(
+            buckets,
+            vec![
+                (json!("2026-09-02"), json!("request"), json!(14_i64)),
+                (json!("2026-09-02"), json!("response"), json!(5_i64)),
+            ]
+        );
+        let codex_requests = summary(
+            &mut database,
+            json!({"group_by": "event_type", "agent_name": "codex", "event_type": "request"}),
+        );
+        assert_eq!(codex_requests[0]["requests"], json!(2_i64));
+        assert_eq!(codex_requests[0]["turns"], json!(2_i64));
+        assert_eq!(codex_requests.as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn summary_fills_owner_and_device_dimensions() {
+        let mut database = summary_seeded();
+
+        let rows = summary(&mut database, json!({"group_by": "user,device"}));
+
+        assert_eq!(rows.as_array().map(Vec::len), Some(1));
+        assert_eq!(rows[0]["user_id"], json!(OWNER_ID));
+        assert!(rows[0]["user_email"].is_string());
+        assert_eq!(rows[0]["host_name"], json!("alice-mbp"));
+        assert_eq!(rows[0]["platform"], json!("macos"));
+        assert_eq!(rows[0]["os_version"], json!("15.1"));
+        assert_eq!(rows[0]["sessions"], json!(3_i64));
+        assert!(rows[0].get("agent_name").is_none());
     }
 
     fn request_with_text(text: &str) -> IngestEventsRequest {

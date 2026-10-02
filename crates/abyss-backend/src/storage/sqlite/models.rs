@@ -215,7 +215,6 @@ pub(super) struct DeviceRecord {
     pub(super) id: Uuid,
     pub(super) host_name: String,
     pub(super) platform: String,
-    pub(super) os_version: Option<String>,
 }
 
 pub(super) struct SessionRecord {
@@ -298,12 +297,16 @@ pub(super) struct AttachmentRecord {
 
 impl DeviceRow {
     pub(super) fn into_record(self) -> Result<DeviceRecord, AppError> {
-        let _ = (&self.user_id, self.created_at, self.updated_at);
+        let _ = (
+            &self.user_id,
+            &self.os_version,
+            self.created_at,
+            self.updated_at,
+        );
         Ok(DeviceRecord {
             id: parse_uuid(&self.id, "device id")?,
             host_name: self.host_name,
             platform: self.platform,
-            os_version: self.os_version,
         })
     }
 }
