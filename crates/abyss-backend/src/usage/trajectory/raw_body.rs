@@ -46,42 +46,34 @@ struct StreamHistory {
 }
 
 impl RawProjection {
-    pub(super) fn context(event: &UsageEventResponse) -> Option<String> {
-        let values = bodies(event)?;
-        let payload = request_payload(&values)?;
-        if payload
-            .get("previous_response_id")
-            .is_some_and(Value::is_string)
-            && payload.get("instructions").is_none()
-            && payload.get("system").is_none()
-        {
-            return None;
-        }
-        Some(
-            request_messages(payload)
-                .into_iter()
-                .filter(|m| m.kind() == TrajectoryItemKind::Context)
-                .map(|m| format!("{}: {}", m.role, m.text))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        )
-    }
-
     pub(super) fn project(
         &mut self,
         event: &UsageEventResponse,
-        stream: usize,
+        stream: &mut usize,
+        stream_ids: &mut HashMap<u64, usize>,
     ) -> Option<Vec<TrajectoryItem>> {
         let values = bodies(event)?;
         let request = event.event_type == "request";
         let (messages, incremental) = if request {
             let payload = request_payload(&values)?;
-            (
-                request_messages(payload),
-                payload
-                    .get("previous_response_id")
-                    .is_some_and(Value::is_string),
-            )
+            let messages = request_messages(payload);
+            let incremental = payload
+                .get("previous_response_id")
+                .is_some_and(Value::is_string);
+            if !incremental
+                || payload.get("instructions").is_some()
+                || payload.get("system").is_some()
+            {
+                let context = messages
+                    .iter()
+                    .filter(|message| message.kind() == TrajectoryItemKind::Context)
+                    .map(|message| format!("{}: {}", message.role, message.text))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let next = stream_ids.len();
+                *stream = *stream_ids.entry(super::hash_str(&context)).or_insert(next);
+            }
+            (messages, incremental)
         } else {
             let mut messages = response_messages(&values);
             if messages.is_empty()
@@ -100,7 +92,7 @@ impl RawProjection {
         if !request && messages.is_empty() {
             return None;
         }
-        let state = self.streams.entry(stream).or_default();
+        let state = self.streams.entry(*stream).or_default();
         let mut cursor = 0;
         let mut next = Vec::new();
         let mut added = Vec::new();
@@ -133,7 +125,7 @@ impl RawProjection {
                 }
             }
             if !known && !message.text.is_empty() {
-                let mut item = TrajectoryItem::new(message.kind(), stream, event);
+                let mut item = TrajectoryItem::new(message.kind(), *stream, event);
                 item.text = Some(message.text);
                 added.push(item);
             }

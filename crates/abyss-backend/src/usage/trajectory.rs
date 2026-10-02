@@ -177,12 +177,10 @@ impl Merger {
     fn request(&mut self, event: &UsageEventResponse) {
         self.pending_compaction = None;
         let first_new = self.items.len();
-        if let Some(context) = RawProjection::context(event) {
-            let key = hash_str(&context);
-            let next = self.streams.len();
-            self.current_stream = *self.streams.entry(key).or_insert(next);
-        }
-        if let Some(items) = self.raw.project(event, self.current_stream) {
+        if let Some(items) = self
+            .raw
+            .project(event, &mut self.current_stream, &mut self.streams)
+        {
             self.items.extend(items);
         } else {
             self.unclassified_request(event);
@@ -293,7 +291,9 @@ impl Merger {
 
     fn response(&mut self, event: &UsageEventResponse) {
         let stream = self.current_stream;
-        let projected = self.raw.project(event, stream);
+        let projected = self
+            .raw
+            .project(event, &mut self.current_stream, &mut self.streams);
         if let Some(index) = self.pending_compaction.take() {
             // The response to the compaction prompt is the handoff summary.
             if let Some(summary) = event.text.as_deref().map(str::trim)
