@@ -1,4 +1,4 @@
-//! Session names recovered from the Agents' own title-generation calls.
+//! Agent-generated session names, or first-user-input previews for other Agents.
 //!
 //! Claude Code and Codex ask a model to name each session and record the
 //! answer as `{"title": "..."}`. Those calls are captured like any other, so
@@ -143,6 +143,39 @@ fn codex_user_message(metadata: &Value, source: &str) -> Option<String> {
 /// A naming prompt may be a truncated prefix of the task's user message.
 pub fn opens_with_prompt(metadata: &Value, prompt: &str) -> bool {
     codex_user_message(metadata, "user").is_some_and(|text| text.trim_start().starts_with(prompt))
+}
+
+/// Default name: the first non-empty user input, on one line, at most 80 chars.
+pub fn default_title(metadata: &Value) -> Option<String> {
+    let input = if metadata.get("raw_body").is_some() {
+        let values = bodies(metadata)?;
+        let payload = request_payload(&values)?;
+        if let Some(input) = payload.get("input").and_then(Value::as_str) {
+            input.to_owned()
+        } else {
+            request_messages(payload)
+                .into_iter()
+                .find(|message| message.role == "user" && !message.text.trim().is_empty())?
+                .text
+        }
+    } else {
+        metadata
+            .pointer("/conversation/messages")?
+            .as_array()?
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["text"].as_str())
+            .find(|text| !text.trim().is_empty())?
+            .to_owned()
+    };
+    let input = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = input.chars();
+    let mut title: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        title.pop();
+        title.push('…');
+    }
+    (!title.is_empty()).then_some(title)
 }
 
 #[derive(Deserialize)]
@@ -319,6 +352,54 @@ mod tests {
     }
 
     #[test]
+    fn default_title_reads_the_first_nonempty_user_input() {
+        let messages = serde_json::json!([
+            {"role": "system", "content": "System instructions"},
+            {"role": "assistant", "content": "Assistant output"},
+            {"role": "tool", "content": "Tool output"},
+            {"role": "user", "content": "  "},
+            {"role": "user", "content": [{"type": "text", "text": " 修复\n  登录问题 "}]},
+            {"role": "user", "content": "Second request"}
+        ]);
+        for key in ["input", "messages"] {
+            let metadata = archived_request(&serde_json::json!({key: messages}), "unused");
+            assert_eq!(default_title(&metadata).as_deref(), Some("修复 登录问题"));
+        }
+        let legacy = serde_json::json!({"conversation": {"messages": [
+            {"role": "system", "text": "Instructions"},
+            {"role": "user", "text": "First request"},
+            {"role": "user", "text": "Second request"}
+        ]}});
+        assert_eq!(default_title(&legacy).as_deref(), Some("First request"));
+    }
+
+    #[test]
+    fn default_title_truncates_unicode_and_leaves_short_input_intact() {
+        for (input, expected) in [
+            ("修复登录".to_owned(), "修复登录".to_owned()),
+            ("修".repeat(80), "修".repeat(80)),
+            ("修".repeat(81), format!("{}…", "修".repeat(79))),
+        ] {
+            let metadata = archived_request(&serde_json::json!({"input": input}), "unused");
+            assert_eq!(default_title(&metadata), Some(expected));
+        }
+    }
+
+    #[test]
+    fn default_title_requires_readable_user_input() {
+        for payload in [
+            serde_json::json!({"input": " \n "}),
+            serde_json::json!({"messages": [{"role": "system", "content": "Instructions"}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "content": "Output"}
+            ]}]}),
+        ] {
+            assert_eq!(default_title(&archived_request(&payload, "unused")), None);
+        }
+        assert_eq!(default_title(&serde_json::json!({"text": "No role"})), None);
+    }
+
+    #[test]
     fn other_agents_keep_the_default_session_strategy() {
         let text = format!("{CLAUDE_CODE_NAMING_INSTRUCTION}\n{CODEX_NAMING_INSTRUCTION}");
         for agent in ["cursor", "openai", "unknown", ""] {
@@ -391,6 +472,7 @@ mod tests {
             let metadata = serde_json::json!({"raw_body": {"parts": [part]},
                 "conversation": {"messages": [{"role": "user", "text": "hello"}]}});
             assert!(!opens_with_prompt(&metadata, "hello"));
+            assert_eq!(default_title(&metadata), None);
             assert!(
                 NamingRequest::parse("codex", Some(CODEX_NAMING_INSTRUCTION), &metadata).is_none()
             );

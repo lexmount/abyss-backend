@@ -19,7 +19,7 @@ use crate::{
         SessionInfo,
         session_title::{
             NamingRequest, TITLE_GENERATION_PURPOSE, TitleTask, codex_turn_id, codex_turn_id_range,
-            may_carry_title, opens_with_prompt, title_from_response,
+            default_title, may_carry_title, opens_with_prompt, title_from_response,
         },
     },
 };
@@ -31,6 +31,8 @@ const BACKFILL_NAME: &str = "session_titles_v1";
 const LINK_BACKFILL_NAME: &str = "codex_title_links_v1";
 /// Rebuild links after switching to archived request bodies and scoped adapters.
 const LINK_REPAIR_NAME: &str = "codex_title_links_v2";
+/// Names existing sessions from other Agents using their first user input.
+const DEFAULT_BACKFILL_NAME: &str = "first_user_titles_v1";
 /// Widest delivery delay tolerated between a naming thread and its task when
 /// looking for candidates, in hours.
 const LINK_DELIVERY_WINDOW_HOURS: i64 = 24;
@@ -79,10 +81,55 @@ pub(super) fn capture(
     connection: &mut PgConnection,
     event: &CapturedEvent<'_>,
 ) -> Result<(), AppError> {
+    if !matches!(event.agent_name, "codex" | "claude-code") {
+        return capture_default(connection, event);
+    }
     match naming_call(connection, event)? {
         Some(call) => store(connection, event, call),
         None => match_pending_naming_threads(connection, event),
     }
+}
+
+/// Default sessions keep the earliest captured user input, even after late delivery.
+fn capture_default(
+    connection: &mut PgConnection,
+    event: &CapturedEvent<'_>,
+) -> Result<(), AppError> {
+    if event.event_type != "request" {
+        return Ok(());
+    }
+    let session = event.session_pk;
+    let stored_at = session_titles::table
+        .find(session)
+        .select(session_titles::title_observed_at)
+        .first::<Option<DateTime<Utc>>>(connection)
+        .optional()?
+        .flatten();
+    if stored_at.is_some_and(|at| at <= event.observed_at) {
+        return Ok(());
+    }
+    let Some(title) = default_title(event.metadata) else {
+        return Ok(());
+    };
+    diesel::insert_into(session_titles::table)
+        .values((
+            session_titles::session_pk.eq(session),
+            session_titles::user_id.eq(event.user_id),
+            session_titles::title.eq(&title),
+            session_titles::title_event_pk.eq(event.event_pk),
+            session_titles::title_observed_at.eq(event.observed_at),
+            session_titles::updated_at.eq(Utc::now()),
+        ))
+        .on_conflict(session_titles::session_pk)
+        .do_update()
+        .set((
+            session_titles::title.eq(&title),
+            session_titles::title_event_pk.eq(event.event_pk),
+            session_titles::title_observed_at.eq(event.observed_at),
+            session_titles::updated_at.eq(Utc::now()),
+        ))
+        .execute(connection)?;
+    Ok(())
 }
 
 fn naming_call(
@@ -395,7 +442,8 @@ fn match_naming_thread(
 pub(super) fn backfill(connection: &mut PgConnection) -> Result<(), AppError> {
     run_once(connection, BACKFILL_NAME, backfill_titles)?;
     run_once(connection, LINK_BACKFILL_NAME, backfill_links)?;
-    run_once(connection, LINK_REPAIR_NAME, backfill_links)
+    run_once(connection, LINK_REPAIR_NAME, backfill_links)?;
+    run_once(connection, DEFAULT_BACKFILL_NAME, backfill_defaults)
 }
 
 fn run_once(
@@ -504,6 +552,68 @@ fn backfill_links(connection: &mut PgConnection) -> Result<(), AppError> {
             ))
             .execute(connection)?;
         match_naming_thread(connection, naming_session)?;
+    }
+    Ok(())
+}
+
+/// Visit requests in time order until the first readable user input is found.
+fn backfill_defaults(connection: &mut PgConnection) -> Result<(), AppError> {
+    let sessions = agent_sessions::table
+        .filter(agent_sessions::agent_name.ne_all(["codex", "claude-code"]))
+        .select((
+            agent_sessions::id,
+            agent_sessions::user_id,
+            agent_sessions::agent_name,
+        ))
+        .load::<(Uuid, Uuid, String)>(connection)?;
+    for (session, user_id, agent_name) in sessions {
+        let mut offset = 0_i64;
+        loop {
+            let requests = llm_usage_events::table
+                .filter(llm_usage_events::session_pk.eq(session))
+                .filter(llm_usage_events::event_type.eq("request"))
+                .order_by((
+                    llm_usage_events::observed_at.asc(),
+                    llm_usage_events::id.asc(),
+                ))
+                .offset(offset)
+                .limit(16)
+                .select((
+                    llm_usage_events::id,
+                    llm_usage_events::observed_at,
+                    llm_usage_events::metadata,
+                ))
+                .load::<(Uuid, DateTime<Utc>, Value)>(connection)?;
+            if requests.is_empty() {
+                break;
+            }
+            let mut found = false;
+            for (event_pk, observed_at, metadata) in requests {
+                if default_title(&metadata).is_none() {
+                    continue;
+                }
+                capture_default(
+                    connection,
+                    &CapturedEvent {
+                        user_id,
+                        session_pk: session,
+                        event_pk,
+                        turn_index: 0,
+                        agent_name: &agent_name,
+                        event_type: "request",
+                        text: None,
+                        metadata: &metadata,
+                        observed_at,
+                    },
+                )?;
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+            offset = offset.saturating_add(16);
+        }
     }
     Ok(())
 }

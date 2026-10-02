@@ -110,7 +110,7 @@ pub struct SessionListItem {
     pub turns: i64,
     pub events: i64,
     pub total_tokens: i64,
-    /// Name the Agent generated for the session, when one was captured.
+    /// Agent-generated title, or a first-user-input preview for other Agents.
     pub title: Option<String>,
     /// Why the session exists when it only serves the Agent, such as
     /// `title_generation`; `None` for ordinary sessions.

@@ -70,8 +70,8 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
 
     for agent, name, instruction, expected in [
         ("claude-code", "claude", CLAUDE_NAMING, "Build fix"),
-        ("cursor", "generic-claude", CLAUDE_NAMING, None),
-        ("cursor", "generic-codex", CODEX_NAMING, None),
+        ("cursor", "generic-claude", CLAUDE_NAMING, CLAUDE_NAMING),
+        ("cursor", "generic-codex", CODEX_NAMING, " ".join(CODEX_NAMING.split())[:79] + "…"),
         ("codex", "quoted-user", CODEX_NAMING, None),
     ]:
         ingest(make(name, "request", instruction, agent=agent),
@@ -79,4 +79,23 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
         value = session(name)
         require(value["title"] == expected, f"{agent}/{name} follows its adapter policy")
         require(value["purpose"] is None, f"{agent}/{name} is not an auxiliary title thread")
+
+    first = make("default", "request", "  修复\n登录问题 " + "好" * 90, agent="cursor")
+    ingest(first)
+    expected = "修复 登录问题 " + "好" * 71 + "…"
+    require(session("default")["title"] == expected, "default title truncates Unicode user input")
+    later = make("default", "request", "Later request", agent="cursor")
+    later["observed_at"] = "2026-09-30T00:00:03Z"
+    ingest(later, make("default", "response", '{"title":"Do not rename"}', agent="cursor"))
+    require(session("default")["title"] == expected, "later requests and responses preserve the first input")
+    earlier = make("default", "request", "Earlier request", agent="cursor")
+    earlier["observed_at"] = "2026-09-30T00:00:00Z"
+    ingest(earlier)
+    require(session("default")["title"] == "Earlier request", "late delivery restores the earliest input")
+
+    result = request(base_url, "GET", "/v1/agent-usage/sessions?agent_name=cursor&page_size=100", token=token)
+    require_status(result, 200, "default title session list")
+    pk = session("default")["session_pk"]
+    listed = next(item for item in result.json()["items"] if item["session_pk"] == pk)
+    require(listed["title"] == "Earlier request", "session list and outline share the default title")
     print("session title adapter API contract passed")
