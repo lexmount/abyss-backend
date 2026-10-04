@@ -729,6 +729,75 @@ mod tests {
     }
 
     #[test]
+    fn changing_billing_headers_and_token_budgets_keep_one_stream() {
+        let request = |hash: &str, left: u32, messages: &str| {
+            format!(
+                r#"{{"system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.288; cch={hash}; cc_prev_req=req_{hash};"}},{{"type":"text","text":"instructions\n\n<total_tokens>{left} tokens left</total_tokens>"}}],"messages":{messages}}}"#
+            )
+        };
+        let items = build(timeline(vec![
+            raw_event(
+                "request",
+                &request("a1", 900, r#"[{"role":"user","content":"hello"}]"#),
+            ),
+            raw_event("response", r#"{"content":[{"type":"text","text":"hi"}]}"#),
+            raw_event(
+                "request",
+                &request(
+                    "b2",
+                    850,
+                    r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"next"}]"#,
+                ),
+            ),
+        ]))
+        .items;
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.kind, i.text.as_deref().unwrap_or_default()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    TrajectoryItemKind::Context,
+                    "x-anthropic-billing-header: cc_version=2.1.288; cch=a1; cc_prev_req=req_a1;\ninstructions\n\n<total_tokens>900 tokens left</total_tokens>"
+                ),
+                (TrajectoryItemKind::User, "hello"),
+                (TrajectoryItemKind::Assistant, "hi"),
+                (TrajectoryItemKind::User, "next"),
+            ]
+        );
+        assert!(items.iter().all(|i| i.stream == 0));
+    }
+
+    #[test]
+    fn system_messages_inside_the_conversation_keep_one_stream() {
+        let first = r#"{"system":"instructions","messages":[{"role":"user","content":"hello"},{"role":"system","content":"reminder one"}]}"#;
+        let second = r#"{"system":"instructions","messages":[{"role":"user","content":"hello"},{"role":"system","content":"reminder one"},{"role":"assistant","content":"hi"},{"role":"system","content":"reminder two"},{"role":"user","content":"next"}]}"#;
+        let items = build(timeline(vec![
+            raw_event("request", first),
+            raw_event("request", second),
+        ]))
+        .items;
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.kind, i.text.as_deref().unwrap_or_default()))
+                .collect::<Vec<_>>(),
+            [
+                (TrajectoryItemKind::Context, "instructions"),
+                (TrajectoryItemKind::User, "hello"),
+                (TrajectoryItemKind::Context, "reminder one"),
+                (TrajectoryItemKind::Assistant, "hi"),
+                (TrajectoryItemKind::Context, "reminder two"),
+                (TrajectoryItemKind::User, "next"),
+            ]
+        );
+        assert!(items.iter().all(|i| i.stream == 0));
+    }
+
+    #[test]
     fn raw_compaction_keeps_existing_summary_presentation() {
         let request = json!({"input": [{"role": "user", "content": "write report"}, {"role": "user", "content": PROMPT}]}).to_string();
         let replay = json!({"input": [{"role": "user", "content": "write report"}, {"role": "user", "content": handoff()}]}).to_string();

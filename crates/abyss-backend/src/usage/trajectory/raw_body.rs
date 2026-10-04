@@ -59,10 +59,13 @@ impl RawProjection {
                 || payload.get("instructions").is_some()
                 || payload.get("system").is_some()
             {
+                // A stream is named by the prompt the conversation opens with.
+                // System messages later in the conversation are part of it:
+                // counting them made each new one start another stream.
                 let context = messages
                     .iter()
-                    .filter(|message| message.kind() == TrajectoryItemKind::Context)
-                    .map(|message| format!("{}: {}", message.role, message.text))
+                    .take_while(|message| message.kind() == TrajectoryItemKind::Context)
+                    .map(|message| format!("{}: {}", message.role, stable_context(&message.text)))
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 let next = stream_ids.len();
@@ -96,7 +99,7 @@ impl RawProjection {
             let known = if context {
                 !state
                     .contexts
-                    .insert((message.role.clone(), message.text.clone()))
+                    .insert((message.role.clone(), stable_context(&message.text)))
             } else if request && !incremental {
                 let found = state.history[cursor..]
                     .iter()
@@ -130,6 +133,32 @@ impl RawProjection {
         }
         Some(added)
     }
+}
+
+/// Claude Code adds two lines to its system prompt that change on every
+/// request: a leading billing header whose request hash and previous-request
+/// id differ each time, for example `x-anthropic-billing-header:
+/// cc_version=2.1.288.9e5; cc_entrypoint=cli; cch=e4f32; cc_is_subagent=true;
+/// cc_prev_req=req_…; cc_prompt_id=…;`, and a trailing context budget such as
+/// `<total_tokens>14964936 tokens left</total_tokens>`. Counting them made
+/// every request a new stream that replayed the whole conversation, so
+/// streams and system prompts are told apart without them. The archived body
+/// keeps both, so they can still be counted for billing.
+const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+const TOKEN_BUDGET_OPEN: &str = "<total_tokens>";
+const TOKEN_BUDGET_CLOSE: &str = "</total_tokens>";
+
+/// A system prompt without the lines that change on every request.
+fn stable_context(text: &str) -> String {
+    text.lines()
+        .filter(|line| !changes_every_request(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn changes_every_request(line: &str) -> bool {
+    line.starts_with(BILLING_HEADER_PREFIX)
+        || (line.starts_with(TOKEN_BUDGET_OPEN) && line.ends_with(TOKEN_BUDGET_CLOSE))
 }
 
 fn response_messages(values: &[Value]) -> Vec<Message> {
