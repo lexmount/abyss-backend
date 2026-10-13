@@ -1,6 +1,5 @@
-"""Session title adapter contract shared by both storage black-box suites."""
+"""Session title contract shared by both storage black-box suites."""
 
-import base64
 import json
 import urllib.parse
 import uuid
@@ -8,32 +7,23 @@ import uuid
 from blackbox_api import event, request, require, require_status
 
 
-NAMING_TURN = "01a0f320-138e-7d21-99ea-03a7ae2a9b50"
-TASK_TURN = "01a0f320-1350-71c2-9c93-5fc5fd7a6bfb"
 PROMPT = "Draw a pelican riding a bicycle"
 CODEX_NAMING = "Generate a concise, single-line task title\nUser prompt:\n" + PROMPT
-CLAUDE_NAMING = "You are naming a coding session"
 
 
 def run_title_contract(base_url: str, token: str, run_id: str) -> None:
-    def make(session, kind, text, *, source="user", agent="codex"):
+    def make(session, kind, text, *, source="user", agent="codex", metadata=None):
         value = event(str(uuid.uuid4()), f"{run_id}-{session}", kind, text, {}, run_id)
         value.pop("attachments", None)
         value["agent"]["name"] = agent
         value["device"]["host_name"] = f"title-contract-{run_id}"
         value["observed_at"] = "2026-09-30T00:00:01Z" if kind == "request" else "2026-09-30T00:00:02Z"
-        value["metadata"] = {"codex_turn_id": NAMING_TURN if source == "thread_title" else TASK_TURN}
+        value["metadata"] = dict(metadata or {})
         if kind == "request":
-            payload = {
-                "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
-                "client_metadata": {"x-codex-turn-metadata": json.dumps({
-                    "thread_source": source,
-                })},
+            value["metadata"]["conversation"] = {
+                "messages": [{"role": "user", "text": text}],
+                "thread_source": source, "completeness": "complete",
             }
-            value["metadata"]["raw_body"] = {"parts": [{
-                "truncated": False,
-                "content_base64": base64.b64encode(json.dumps(payload).encode()).decode(),
-            }]}
         return value
 
     def ingest(*events):
@@ -49,36 +39,40 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
         require_status(result, 200, "title outline")
         return result.json()["session"]
 
-    # Response-first and raw-only naming requests exercise both storage paths.
-    naming = make("naming", "request", CODEX_NAMING, source="thread_title")
-    naming["text"] = None
-    ingest(make("naming", "response", '{"title":"Draw a pelican"}', source="thread_title"))
-    ingest(naming)
+    # Claude Code: the collector reports the naming call and its title, in
+    # either arrival order relative to the session's first user input.
+    naming = {"purpose": "session_title"}
+    for name, title_first in [("claude", False), ("claude-late-input", True)]:
+        events = [
+            make(name, "request", "fix the build", agent="claude-code"),
+            make(name, "request", "<session>fix the build</session>", agent="claude-code", metadata=naming),
+            make(name, "response", '{"title":"Build fix"}', agent="claude-code",
+                 metadata={**naming, "session_title": "Build fix"}),
+        ]
+        if title_first:
+            events.reverse()
+        for value in events:
+            ingest(value)
+        value = session(name)
+        require(value["title"] == "Build fix", f"{name}: the collector title names the session")
+        require(value["purpose"] is None, f"{name}: a session naming itself is not a title thread")
+
+    # Codex: the naming thread is marked; its task keeps its first user input.
+    ingest(make("naming", "request", CODEX_NAMING, source="thread_title"),
+           make("naming", "response", '{"title":"Draw a pelican"}', source="thread_title"))
+    value = session("naming")
+    require(value["purpose"] == "title_generation", "Codex naming threads are marked")
+    require(value["title"] is None and value["parent_session_pk"] is None, "Codex naming threads are not linked")
     ingest(make("task", "request", PROMPT))
-    task = session("task")
-    require(task["title"] == "Draw a pelican", "raw Codex task receives its generated title")
-    require(session("naming")["parent_session_pk"] == task["session_pk"], "title source links to the task")
+    require(session("task")["title"] == PROMPT, "Codex tasks keep their first user input")
 
-    other_device = make("other-device", "request", PROMPT)
-    other_device["device"]["host_name"] += "-other"
-    ingest(other_device, make("guardian", "request", PROMPT, source="guardian_review"))
-    require(session("naming")["parent_session_pk"] == task["session_pk"], "unrelated requests do not withdraw the link")
-
-    ingest(make("conflict", "request", PROMPT))
-    require(session("naming")["parent_session_pk"] is None, "a real second candidate withdraws the link")
-    require(session("task")["title"] is None, "ambiguous title is removed from its former task")
-
-    for agent, name, instruction, expected in [
-        ("claude-code", "claude", CLAUDE_NAMING, "Build fix"),
-        ("cursor", "generic-claude", CLAUDE_NAMING, CLAUDE_NAMING),
-        ("cursor", "generic-codex", CODEX_NAMING, " ".join(CODEX_NAMING.split())[:79] + "…"),
-        ("codex", "quoted-user", CODEX_NAMING, None),
-    ]:
-        ingest(make(name, "request", instruction, agent=agent),
+    # Instruction text and title-shaped replies never name a session by themselves.
+    for agent, name in [("claude-code", "quoted-claude"), ("cursor", "generic-codex")]:
+        ingest(make(name, "request", CODEX_NAMING, agent=agent),
                make(name, "response", '{"title":"Build fix"}', agent=agent))
         value = session(name)
-        require(value["title"] == expected, f"{agent}/{name} follows its adapter policy")
-        require(value["purpose"] is None, f"{agent}/{name} is not an auxiliary title thread")
+        require(value["title"] == " ".join(CODEX_NAMING.split())[:79] + "…", f"{agent}/{name} keeps its first input")
+        require(value["purpose"] is None, f"{agent}/{name} is not a title thread")
 
     first = make("default", "request", "  修复\n登录问题 " + "好" * 90, agent="cursor")
     ingest(first)
@@ -98,4 +92,4 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
     pk = session("default")["session_pk"]
     listed = next(item for item in result.json()["items"] if item["session_pk"] == pk)
     require(listed["title"] == "Earlier request", "session list and outline share the default title")
-    print("session title adapter API contract passed")
+    print("session title API contract passed")

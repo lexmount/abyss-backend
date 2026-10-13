@@ -27,10 +27,11 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            TurnIdentity, agent_names_filter, canonical_agent_name, choose_turn_index,
+            SessionTurnAttachment, TurnIdentity, agent_names_filter, canonical_agent_name,
             exact_values_filter, non_empty, normalize_limit, normalize_slug, normalize_text,
-            normalized_optional, normalized_tokens, parse_group_by, providers_filter, sha256_bytes,
-            turn_identity, validate_batch, validate_event_type,
+            normalized_optional, normalized_tokens, parse_group_by, providers_filter,
+            session_turn_attachment, sha256_bytes, turn_identity, validate_batch,
+            validate_event_type,
         },
         session_metadata_from_event,
     },
@@ -125,7 +126,7 @@ fn ingest_one_event(
         observed_at,
         now,
     )?;
-    let turn_index = resolve_turn_index(connection, session_pk, event)?;
+    let turn_index = resolve_turn_index(connection, session_pk, event, &agent_name, observed_at)?;
     let turn_pk = upsert_turn(
         connection,
         user_id,
@@ -181,10 +182,7 @@ fn ingest_one_event(
             user_id,
             session_pk,
             event_pk,
-            turn_index,
-            agent_name: &agent_name,
             event_type: event.event_type.as_str(),
-            text: text.as_deref(),
             metadata: &event.metadata,
             observed_at,
         },
@@ -336,18 +334,87 @@ fn resolve_turn_index(
     connection: &mut SqliteConnection,
     session_pk: Uuid,
     event: &IngestUsageEvent,
+    agent_name: &str,
+    observed_at: i64,
 ) -> Result<i32, AppError> {
-    let Some(identity) = turn_identity(event) else {
-        return Ok(event.turn_index);
-    };
-    let existing = existing_turn_index_for_identity(connection, session_pk, &identity)?;
-    let next = agent_turns::table
+    if let Some(attachment) = session_turn_attachment(agent_name, &event.metadata)
+        && let Some(turn_index) =
+            attached_turn_index(connection, session_pk, &attachment, observed_at)?
+    {
+        return Ok(turn_index);
+    }
+    // Events of one turn share its identity; an event without any identity
+    // is a turn of its own.
+    if let Some(identity) = turn_identity(event)
+        && let Some(existing) = existing_turn_index_for_identity(connection, session_pk, &identity)?
+    {
+        return Ok(existing);
+    }
+    Ok(agent_turns::table
         .filter(agent_turns::session_pk.eq(session_pk.to_string()))
         .select(max(agent_turns::turn_index))
         .first::<Option<i32>>(connection)?
         .unwrap_or(0_i32)
-        .saturating_add(1);
-    Ok(choose_turn_index(event.turn_index, existing, next))
+        .saturating_add(1))
+}
+
+/// Finds the stored turn a Claude Code side or subagent request belongs to;
+/// `None` only when the session has no turn yet.
+fn attached_turn_index(
+    connection: &mut SqliteConnection,
+    session_pk: Uuid,
+    attachment: &SessionTurnAttachment,
+    observed_at: i64,
+) -> Result<Option<i32>, AppError> {
+    let session = session_pk.to_string();
+    if let Some(prompt_id) = &attachment.prompt_id {
+        // Only main-loop events anchor a prompt, and each prompt id belongs to
+        // one turn. Walking the session index from its latest turn usually
+        // stops within the current turn instead of reading every megabyte
+        // metadata row of the session.
+        let prompt_turn = sql_query(
+            "SELECT turn_index FROM llm_usage_events \
+             WHERE session_pk = ?1 \
+               AND json_extract(metadata, '$.claude_code_billing.cc_prompt_id') = ?2 \
+               AND json_extract(metadata, '$.claude_turn_id') IS NOT NULL \
+             ORDER BY turn_index DESC, observed_at DESC, id DESC \
+             LIMIT 1",
+        )
+        .bind::<Text, _>(&session)
+        .bind::<Text, _>(prompt_id)
+        .get_result::<TurnIndexRow>(connection)
+        .optional()?;
+        if let Some(row) = prompt_turn {
+            return Ok(Some(row.turn_index));
+        }
+    }
+    // Events may arrive out of order, so the observation time picks the turn.
+    let preceding = agent_turns::table
+        .filter(agent_turns::session_pk.eq(&session))
+        .filter(agent_turns::started_at.le(observed_at))
+        .order_by((
+            agent_turns::started_at.desc(),
+            agent_turns::turn_index.desc(),
+        ))
+        .select(agent_turns::turn_index)
+        .first::<i32>(connection)
+        .optional()?;
+    if preceding.is_some() {
+        return Ok(preceding);
+    }
+    agent_turns::table
+        .filter(agent_turns::session_pk.eq(&session))
+        .order_by((agent_turns::started_at.asc(), agent_turns::turn_index.asc()))
+        .select(agent_turns::turn_index)
+        .first::<i32>(connection)
+        .optional()
+        .map_err(AppError::from)
+}
+
+#[derive(QueryableByName)]
+struct TurnIndexRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    turn_index: i32,
 }
 
 fn existing_turn_index_for_identity(
@@ -1378,7 +1445,10 @@ pub(super) const fn timestamp_to_micros(value: DateTime<Utc>) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use diesel::{Connection, QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star, sql_query};
+    use diesel::{
+        Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star,
+        sql_query,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -1388,7 +1458,11 @@ mod tests {
     };
 
     use super::{
-        super::{migrations, schema::llm_usage_events, search},
+        super::{
+            migrations,
+            schema::{agent_turns, llm_usage_events},
+            search,
+        },
         ingest_events, raw_events, session_outline, usage_summary,
     };
 
@@ -1579,7 +1653,6 @@ mod tests {
                 "device": {"host_name": "alice-mbp", "platform": "macos", "os_version": "15.1"},
                 "agent": {"name": agent},
                 "session_id": session,
-                "turn_index": turn,
                 "llm": {"provider": provider, "model": model},
                 "event_type": if id.ends_with("req") { "request" } else { "response" },
                 "text": "body",
@@ -1588,7 +1661,7 @@ mod tests {
                 } else {
                     json!({"output_tokens": 5_i64})
                 },
-                "metadata": {"raw_body": "large"}
+                "metadata": {"raw_body": "large", "turn_id": format!("{session}-{turn}")}
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({
@@ -1717,6 +1790,181 @@ mod tests {
         assert_eq!(rows[0]["os_version"], json!("15.1"));
         assert_eq!(rows[0]["sessions"], json!(3_i64));
         assert!(rows[0].get("agent_name").is_none());
+    }
+
+    /// One request of `agent` observed `second` seconds into a fixed minute.
+    fn turn_event(
+        id: &str,
+        agent: &str,
+        second: u32,
+        metadata: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut event = json!({
+            "event_id": id,
+            "observed_at": format!("2026-10-08T00:00:{second:02}Z"),
+            "device": {"host_name": "local", "platform": "macos"},
+            "agent": {"name": agent},
+            "session_id": "thread-session",
+            // Distinct collector indexes expose any event left on its own turn.
+            "turn_index": second,
+            "llm": {"provider": "Anthropic", "model": "claude-x"},
+            "event_type": "request",
+            "token_usage": {"input_tokens": 1_i64}
+        });
+        event["metadata"] = metadata;
+        event
+    }
+
+    fn ingest_turn_events(database: &mut SqliteConnection, events: Vec<serde_json::Value>) {
+        let request: IngestEventsRequest =
+            serde_json::from_value(json!({"events": serde_json::Value::Array(events)}))
+                .expect("request should deserialize");
+        ingest_events(database, &request, OWNER_ID, 100).expect("ingest should succeed");
+    }
+
+    fn turn_of(database: &mut SqliteConnection, event_id: &str) -> i32 {
+        llm_usage_events::table
+            .filter(llm_usage_events::event_id.eq(event_id))
+            .select(llm_usage_events::turn_index)
+            .first::<i32>(database)
+            .expect("event should be stored")
+    }
+
+    fn main_loop(turn: u32, prompt: &str) -> serde_json::Value {
+        json!({
+            "claude_turn_id": format!("cc_turn:{turn}"),
+            "claude_code_billing": {"cc_prompt_id": prompt, "cc_turn_index": turn.to_string()}
+        })
+    }
+
+    #[test]
+    fn claude_code_side_and_subagent_requests_join_the_turn_they_occur_in() {
+        let mut database = database();
+        ingest_turn_events(
+            &mut database,
+            vec![
+                turn_event("main-1", "claude-code", 10, main_loop(1, "prompt-1")),
+                turn_event(
+                    "subagent-1",
+                    "claude-code",
+                    12,
+                    json!({"claude_code_billing": {"cc_prompt_id": "prompt-1", "cc_is_subagent": "true"}}),
+                ),
+                turn_event("main-2", "claude-code", 30, main_loop(2, "prompt-2")),
+                // A failed `continue` replays with a new prompt id, same turn.
+                turn_event(
+                    "main-2-replay",
+                    "claude-code",
+                    35,
+                    main_loop(2, "prompt-2b"),
+                ),
+                turn_event(
+                    "subagent-2",
+                    "claude-code",
+                    40,
+                    json!({"claude_code_billing": {"cc_prompt_id": "prompt-2b", "cc_is_subagent": "true"}}),
+                ),
+                // A recap between the turns carries no billing header.
+                turn_event(
+                    "recap",
+                    "claude-code",
+                    20,
+                    json!({"message_id": "msg-recap"}),
+                ),
+            ],
+        );
+        // Out of order: observed during turn 2, delivered after everything.
+        ingest_turn_events(
+            &mut database,
+            vec![
+                turn_event(
+                    "late-title",
+                    "claude-code",
+                    32,
+                    json!({"request_hash": "title"}),
+                ),
+                turn_event(
+                    "late-subagent",
+                    "claude-code",
+                    45,
+                    json!({"claude_code_billing": {"cc_prompt_id": "prompt-1"}}),
+                ),
+            ],
+        );
+
+        let main_1 = turn_of(&mut database, "main-1");
+        let main_2 = turn_of(&mut database, "main-2");
+        assert_ne!(main_1, main_2);
+        assert_eq!(turn_of(&mut database, "main-2-replay"), main_2);
+        assert_eq!(turn_of(&mut database, "subagent-1"), main_1);
+        assert_eq!(turn_of(&mut database, "subagent-2"), main_2);
+        assert_eq!(turn_of(&mut database, "recap"), main_1);
+        assert_eq!(turn_of(&mut database, "late-title"), main_2);
+        assert_eq!(turn_of(&mut database, "late-subagent"), main_1);
+        let turns = agent_turns::table
+            .order_by(agent_turns::turn_index.asc())
+            .select((
+                agent_turns::turn_index,
+                agent_turns::started_at,
+                agent_turns::ended_at,
+            ))
+            .load::<(i32, i64, Option<i64>)>(&mut database)
+            .expect("turns should load");
+        let second = |value: i64| {
+            super::timestamp_to_micros(
+                chrono::DateTime::parse_from_rfc3339(&format!("2026-10-08T00:00:{value:02}Z"))
+                    .expect("timestamp should parse")
+                    .into(),
+            )
+        };
+        assert_eq!(
+            turns,
+            vec![
+                (main_1, second(10), Some(second(45))),
+                (main_2, second(30), Some(second(40))),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_code_side_request_before_any_turn_keeps_todays_turn() {
+        let mut database = database();
+        ingest_turn_events(
+            &mut database,
+            vec![turn_event(
+                "title",
+                "claude-code",
+                5,
+                json!({"request_hash": "title"}),
+            )],
+        );
+        let first = turn_of(&mut database, "title");
+        ingest_turn_events(
+            &mut database,
+            vec![
+                turn_event("main-1", "claude-code", 10, main_loop(1, "prompt-1")),
+                // Earlier than every turn: joins the session's earliest turn.
+                turn_event("probe", "claude-code", 1, json!({})),
+            ],
+        );
+        assert_ne!(turn_of(&mut database, "main-1"), first);
+        assert_eq!(turn_of(&mut database, "probe"), first);
+    }
+
+    #[test]
+    fn other_agents_keep_provider_turn_identities() {
+        let mut database = database();
+        ingest_turn_events(
+            &mut database,
+            vec![
+                turn_event("codex-1", "codex", 10, json!({"codex_turn_id": "turn-a"})),
+                turn_event("codex-2", "codex", 20, json!({"response_id": "resp-b"})),
+            ],
+        );
+        assert_ne!(
+            turn_of(&mut database, "codex-1"),
+            turn_of(&mut database, "codex-2")
+        );
     }
 
     fn request_with_text(text: &str) -> IngestEventsRequest {

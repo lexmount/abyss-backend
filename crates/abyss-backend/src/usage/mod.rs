@@ -7,11 +7,11 @@
 
 /// Image attachment contracts and validation.
 pub mod attachments;
+mod conversation;
 /// Opaque diagnostic-capture ingest contracts.
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
-mod provider_body;
 /// Owner-scoped session index contracts.
 pub mod session_list;
 pub mod session_title;
@@ -47,10 +47,6 @@ pub struct IngestUsageEvent {
     pub agent: AgentPayload,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// Collector-side best-effort turn number. Ingest normalizes this when a
-    /// stable logical-turn/provider identity shows that a restarted collector
-    /// reused an earlier local sequence number.
-    pub turn_index: i32,
     /// LLM provider and model labels.
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.

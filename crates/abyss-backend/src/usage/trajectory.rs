@@ -5,9 +5,9 @@
 //! role-aware messages, first-seen tool results, and response text and tool
 //! calls, with each tool call paired to its result by call identifier.
 
-mod raw_body;
+mod conversation;
 
-use raw_body::RawProjection;
+use conversation::ConversationProjection;
 
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
@@ -230,7 +230,7 @@ pub fn build(timeline: SessionTimelineResponse) -> SessionTrajectoryResponse {
 
 #[derive(Default)]
 struct Merger {
-    raw: RawProjection,
+    conversation: ConversationProjection,
     items: Vec<TrajectoryItem>,
     seen_results: HashSet<String>,
     streams: HashMap<u64, usize>,
@@ -248,9 +248,9 @@ impl Merger {
     fn request(&mut self, event: &UsageEventResponse) {
         self.pending_compaction = None;
         let first_new = self.items.len();
-        if let Some(items) = self
-            .raw
-            .project(event, &mut self.current_stream, &mut self.streams)
+        if let Some(items) =
+            self.conversation
+                .project(event, &mut self.current_stream, &mut self.streams)
         {
             self.items.extend(items);
         } else {
@@ -362,9 +362,9 @@ impl Merger {
 
     fn response(&mut self, event: &UsageEventResponse) {
         let stream = self.current_stream;
-        let projected = self
-            .raw
-            .project(event, &mut self.current_stream, &mut self.streams);
+        let projected =
+            self.conversation
+                .project(event, &mut self.current_stream, &mut self.streams);
         if let Some(index) = self.pending_compaction.take() {
             // The response to the compaction prompt is the handoff summary.
             if let Some(summary) = event.text.as_deref().map(str::trim)
@@ -431,13 +431,13 @@ fn segment_str<'a>(segment: &'a Value, key: &str) -> Option<&'a str> {
 mod tests {
     #[test]
     fn usage_retains_events_without_new_content_and_counts_each_event_once() {
-        let body = r#"{"input":[{"role":"user","content":"hello"}]}"#;
-        let mut request = raw_event("request", body);
+        let body = r#"{"messages":[{"id":null,"role":"user","text":"hello"}],"instructions_present":false,"previous_response_id":null}"#;
+        let mut request = structured_event("request", body);
         request.input_tokens = 2;
         request.cache_read_tokens = 77_000;
         request.cache_write_tokens = 400;
         request.total_tokens = 77_402;
-        let repeated = raw_event("request", body);
+        let repeated = structured_event("request", body);
         let mut response = event("response", "", json!({"token_usage_estimated": true}));
         response.llm_model = "other-model".to_owned();
         response.output_tokens = 150;
@@ -580,7 +580,7 @@ mod tests {
     }
 
     fn user_request(texts: &[&str]) -> UsageEventResponse {
-        raw_event("request", &json!({"input": texts.iter().map(|text| json!({"role":"user", "content":text})).collect::<Vec<_>>()}).to_string())
+        structured_event("request", &json!({"messages": texts.iter().map(|text| json!({"role":"user", "text":text})).collect::<Vec<_>>()}).to_string())
     }
 
     #[test]
@@ -588,8 +588,11 @@ mod tests {
         let text = "system: instructions\n\n用户内容\n\n用户内容";
         for metadata in [
             json!({}),
-            json!({"raw_body":{"parts":[{"truncated":true}]}}),
-            json!({"raw_body":{"parts":[{"truncated":false,"content_base64":"invalid"}]}}),
+            json!({"conversation":{"completeness":"partial","messages":[]}}),
+            json!({"conversation":{"messages":"invalid"}}),
+            json!({"conversation":{"messages":[],"completeness":"complete"}}),
+            // Older collectors stored messages without completeness.
+            json!({"conversation":{"messages":[{"role":"user","text":"用户内容"}]}}),
         ] {
             let items = build(timeline(vec![event("request", text, metadata)])).items;
             assert_eq!(items.len(), 1);
@@ -597,7 +600,7 @@ mod tests {
             assert_eq!(items[0].text.as_deref(), Some(text));
             assert!(!items[0].continued);
         }
-        let items = build(timeline(vec![raw_event("request", r#"{"input":[{"content":"system: unknown"},{"role":"unrecognized","content":"hello"},{"role":"user","content":"system: quoted text"}]}"#)])).items;
+        let items = build(timeline(vec![structured_event("request", r#"{"messages":[{"id":null,"role":"unknown","text":"system: unknown"},{"id":null,"role":"unrecognized","text":"hello"},{"id":null,"role":"user","text":"system: quoted text"}],"instructions_present":false,"previous_response_id":null}"#)])).items;
         assert_eq!(
             items.iter().map(|i| i.kind).collect::<Vec<_>>(),
             [
@@ -608,28 +611,31 @@ mod tests {
         );
     }
 
-    fn raw_event(side: &str, body: &str) -> UsageEventResponse {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+    /// A current collector always declares completeness; default it to complete.
+    fn structured_event(side: &str, body: &str) -> UsageEventResponse {
+        let mut conversation = serde_json::from_str::<Value>(body).unwrap();
+        conversation
+            .as_object_mut()
+            .unwrap()
+            .entry("completeness")
+            .or_insert_with(|| json!("complete"));
         event(
             side,
             "legacy fallback",
-            json!({"raw_body": {"transport": "http", "parts": [{
-                "content_base64": STANDARD.encode(body.as_bytes()), "truncated": false,
-                "byte_size": body.len(), "content_type": "application/json"
-            }]}}),
+            json!({"conversation": conversation}),
         )
     }
 
     #[test]
-    fn raw_archive_projection_keeps_roles_and_repeated_user_occurrences() {
-        let first = r#" {"instructions":"system instructions","input":[{"role":"user","content":"继续"}],"unknown":[1,1]} "#;
-        let response = r#"{"output":[{"id":"a1","role":"assistant","content":[{"type":"output_text","text":"working"}]}]}"#;
-        let replay = r#"{"instructions":"system instructions","input":[{"role":"user","content":"继续"},{"id":"a1","role":"assistant","content":[{"type":"output_text","text":"working"}]},{"role":"user","content":"继续"}]}"#;
+    fn structured_projection_keeps_roles_and_repeated_user_occurrences() {
+        let first = r#"{"messages":[{"role":"developer","text":"system instructions"},{"id":null,"role":"user","text":"继续"}],"instructions_present":true,"previous_response_id":null}"#;
+        let response = r#"{"messages":[{"id":"a1","role":"assistant","text":"working"}],"instructions_present":false,"previous_response_id":null}"#;
+        let replay = r#"{"messages":[{"role":"developer","text":"system instructions"},{"id":null,"role":"user","text":"继续"},{"id":"a1","role":"assistant","text":"working"},{"id":null,"role":"user","text":"继续"}],"instructions_present":true,"previous_response_id":null}"#;
         let events = vec![
-            raw_event("request", first),
-            raw_event("response", response),
-            raw_event("request", replay),
-            raw_event("request", replay),
+            structured_event("request", first),
+            structured_event("response", response),
+            structured_event("request", replay),
+            structured_event("request", replay),
         ];
         let metadata_before = events
             .iter()
@@ -665,11 +671,11 @@ mod tests {
 
     #[test]
     fn streamed_anthropic_response_is_not_replayed_as_user_input() {
-        let response = "event: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\r\n\r\n";
+        let response = r#"{"messages":[{"role":"assistant","text":"hi"}]}"#;
         let items = build(timeline(vec![
-            raw_event("request", r#"{"system":"instructions","messages":[{"role":"user","content":"hello"}]}"#),
-            raw_event("response", response),
-            raw_event("request", r#"{"system":"instructions","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"hello"}]}"#),
+            structured_event("request", r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null}"#),
+            structured_event("response", response),
+            structured_event("request", r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null}"#),
         ])).items;
         assert_eq!(
             items.iter().map(|i| i.kind).collect::<Vec<_>>(),
@@ -684,16 +690,43 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_reasoning_is_shown_once_with_its_assistant_message() {
+        let first = r#"{"messages":[{"id":null,"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null,"completeness":"complete"}"#;
+        let response = r#"{"messages":[{"id":"msg_1","role":"reasoning","text":"thinking it over"},{"id":"msg_1","role":"assistant","text":"hi"}],"instructions_present":false,"previous_response_id":null,"completeness":"complete"}"#;
+        let replay = r#"{"messages":[{"id":null,"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"reasoning","text":"thinking it over"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"next"}],"instructions_present":true,"previous_response_id":null,"completeness":"complete"}"#;
+        let items = build(timeline(vec![
+            structured_event("request", first),
+            structured_event("response", response),
+            structured_event("request", replay),
+        ]))
+        .items;
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.kind, i.text.as_deref().unwrap_or_default()))
+                .collect::<Vec<_>>(),
+            [
+                (TrajectoryItemKind::Context, "instructions"),
+                (TrajectoryItemKind::User, "hello"),
+                (TrajectoryItemKind::Assistant, "thinking it over"),
+                (TrajectoryItemKind::Assistant, "hi"),
+                (TrajectoryItemKind::User, "next"),
+            ]
+        );
+        assert!(items.iter().all(|i| i.stream == 0));
+    }
+
+    #[test]
     fn incremental_requests_keep_identical_new_user_messages() {
         let items = build(timeline(vec![
-            raw_event(
+            structured_event(
                 "request",
-                r#"{"instructions":"instructions","input":[{"role":"user","content":"continue"}]}"#,
+                r#"{"messages":[{"role":"developer","text":"instructions"},{"id":null,"role":"user","text":"continue"}],"instructions_present":true,"previous_response_id":null}"#,
             ),
-            raw_event("response", r#"{"output_text":"working"}"#),
-            raw_event(
+            structured_event("response", r#"{"messages":[{"id":null,"role":"assistant","text":"working"}],"instructions_present":false,"previous_response_id":null}"#),
+            structured_event(
                 "request",
-                r#"{"previous_response_id":"r1","input":[{"role":"user","content":"continue"}]}"#,
+                r#"{"messages":[{"id":null,"role":"user","text":"continue"}],"instructions_present":false,"previous_response_id":"r1"}"#,
             ),
         ]))
         .items;
@@ -710,11 +743,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_anthropic_request_retains_system_and_assistant_roles() {
-        let body = r#"{"system":[{"type":"text","text":"instructions"}],"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":[{"type":"text","text":"hi"}]},{"role":"user","content":"hello"}]}"#;
+    fn structured_request_retains_system_and_assistant_roles() {
+        let body = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null}"#;
         let items = build(timeline(vec![
-            raw_event("request", body),
-            raw_event("request", body),
+            structured_event("request", body),
+            structured_event("request", body),
         ]))
         .items;
         assert_eq!(
@@ -731,22 +764,22 @@ mod tests {
     #[test]
     fn changing_billing_headers_and_token_budgets_keep_one_stream() {
         let request = |hash: &str, left: u32, messages: &str| {
-            format!(
-                r#"{{"system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.288; cch={hash}; cc_prev_req=req_{hash};"}},{{"type":"text","text":"instructions\n\n<total_tokens>{left} tokens left</total_tokens>"}}],"messages":{messages}}}"#
-            )
+            let mut messages: Vec<Value> = serde_json::from_str(messages).unwrap();
+            messages.insert(0, json!({"role":"system", "text": format!("x-anthropic-billing-header: cc_version=2.1.288; cch={hash}; cc_prev_req=req_{hash};\ninstructions\n\n<total_tokens>{left} tokens left</total_tokens>")}));
+            json!({"messages": messages, "instructions_present": true}).to_string()
         };
         let items = build(timeline(vec![
-            raw_event(
+            structured_event(
                 "request",
-                &request("a1", 900, r#"[{"role":"user","content":"hello"}]"#),
+                &request("a1", 900, r#"[{"role":"user","text":"hello"}]"#),
             ),
-            raw_event("response", r#"{"content":[{"type":"text","text":"hi"}]}"#),
-            raw_event(
+            structured_event("response", r#"{"messages":[{"id":null,"role":"assistant","text":"hi"}],"instructions_present":false,"previous_response_id":null}"#),
+            structured_event(
                 "request",
                 &request(
                     "b2",
                     850,
-                    r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"next"}]"#,
+                    r#"[{"role":"user","text":"hello"},{"role":"assistant","text":"hi"},{"role":"user","text":"next"}]"#,
                 ),
             ),
         ]))
@@ -770,13 +803,253 @@ mod tests {
         assert!(items.iter().all(|i| i.stream == 0));
     }
 
+    /// Claude Code thread requests as the collector projects them: a
+    /// `create` carries the whole system prompt and history, a `continue`
+    /// only the billing header and the messages added since
+    /// `previous_message_id`.
+    fn claude_request(thread: Value, system: &[&str], messages: Value) -> UsageEventResponse {
+        let system = std::iter::once(
+            "x-anthropic-billing-header: cc_version=2.1.293.af3; cc_entrypoint=cli; cch=3ceb5;",
+        )
+        .chain(system.iter().copied())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mut conversation = json!({
+            "messages": [{"id": null, "role": "system", "text": system}],
+            "instructions_present": true,
+            "previous_response_id": null,
+        });
+        conversation["messages"]
+            .as_array_mut()
+            .unwrap()
+            .extend(serde_json::from_value::<Vec<Value>>(messages).unwrap());
+        let mut request = structured_event("request", &conversation.to_string());
+        if !thread.is_null() {
+            request.metadata["claude_thread"] = thread;
+        }
+        request
+    }
+
+    fn create(messages: Value) -> UsageEventResponse {
+        claude_request(
+            json!({"type": "create"}),
+            &["You are Claude Code.", "Main loop instructions."],
+            messages,
+        )
+    }
+
+    fn continue_from(previous: &str, messages: Value) -> UsageEventResponse {
+        claude_request(
+            json!({"type": "continue", "previous_message_id": previous}),
+            &[],
+            messages,
+        )
+    }
+
+    fn user(text: &str) -> Value {
+        json!({"id": null, "role": "user", "text": text})
+    }
+
+    fn budget() -> Value {
+        json!({"id": null, "role": "system", "text": "<total_tokens>15000000 tokens left</total_tokens>"})
+    }
+
+    fn tool_result() -> Value {
+        json!({"id": null, "role": "tool", "text": ""})
+    }
+
+    /// The replayed form of a response: thinking is redacted.
+    fn replayed(text: &str) -> [Value; 3] {
+        [
+            json!({"id": null, "role": "reasoning", "text": ""}),
+            json!({"id": null, "role": "assistant", "text": text}),
+            json!({"id": null, "role": "tool", "text": ""}),
+        ]
+    }
+
+    fn streamed(id: &str, text: &str) -> UsageEventResponse {
+        let conversation = json!({
+            "messages": [
+                {"id": id, "role": "reasoning", "text": ""},
+                {"id": id, "role": "assistant", "text": text},
+                {"id": null, "role": "tool", "text": ""},
+            ],
+            "instructions_present": false,
+            "previous_response_id": null,
+        });
+        structured_event("response", &conversation.to_string())
+    }
+
+    /// A `thread_not_found` error carries no messages.
+    fn thread_not_found() -> UsageEventResponse {
+        let mut response = structured_event(
+            "response",
+            r#"{"messages":[],"instructions_present":false,"previous_response_id":null,"completeness":"unsupported"}"#,
+        );
+        response.text = None;
+        response
+    }
+
+    fn texts(items: &[TrajectoryItem]) -> Vec<(TrajectoryItemKind, usize, &str)> {
+        items
+            .iter()
+            .map(|i| (i.kind, i.stream, i.text.as_deref().unwrap_or_default()))
+            .collect()
+    }
+
+    const MAIN_CONTEXT: &str = "x-anthropic-billing-header: cc_version=2.1.293.af3; \
+                                cc_entrypoint=cli; cch=3ceb5;\nYou are Claude Code.\nMain loop \
+                                instructions.";
+
+    #[test]
+    fn thread_continue_appends_new_messages_in_the_stream_it_continues() {
+        let search = claude_request(
+            Value::Null,
+            &[
+                "You are Claude Code.",
+                "You are an assistant for performing a web search tool use",
+            ],
+            json!([user("search the web")]),
+        );
+        let events = vec![
+            create(json!([user("hello"), budget()])),
+            streamed("msg_1", "looking"),
+            search,
+            streamed("msg_side", "results"),
+            continue_from("msg_1", json!([tool_result(), budget()])),
+            streamed("msg_2", "found it"),
+            continue_from("msg_2", json!([tool_result(), user("thanks"), budget()])),
+        ];
+        let items = build(timeline(events)).items;
+
+        assert_eq!(
+            texts(&items),
+            [
+                (TrajectoryItemKind::Context, 0, MAIN_CONTEXT),
+                (TrajectoryItemKind::User, 0, "hello"),
+                (
+                    TrajectoryItemKind::Context,
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
+                (TrajectoryItemKind::Assistant, 0, "looking"),
+                (
+                    TrajectoryItemKind::Context,
+                    1,
+                    "x-anthropic-billing-header: cc_version=2.1.293.af3; cc_entrypoint=cli; \
+                     cch=3ceb5;\nYou are Claude Code.\nYou are an assistant for performing a web \
+                     search tool use"
+                ),
+                (TrajectoryItemKind::User, 1, "search the web"),
+                (TrajectoryItemKind::Assistant, 1, "results"),
+                (TrajectoryItemKind::Assistant, 0, "found it"),
+                (TrajectoryItemKind::User, 0, "thanks"),
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_replay_after_a_failed_continue_adds_no_duplicates() {
+        let first = user("hello");
+        let retry = user("try the wire");
+        let [looking_thinking, looking, looking_tool] = replayed("looking");
+        let [found_thinking, found, found_tool] = replayed("found it");
+        let replay = json!([
+            first,
+            budget(),
+            looking_thinking,
+            looking,
+            looking_tool,
+            tool_result(),
+            budget(),
+            found_thinking,
+            found,
+            found_tool,
+            retry,
+            budget(),
+        ]);
+        let events = vec![
+            create(json!([first, budget()])),
+            streamed("msg_1", "looking"),
+            continue_from("msg_1", json!([tool_result(), budget()])),
+            streamed("msg_2", "found it"),
+            continue_from("msg_2", json!([retry, budget()])),
+            thread_not_found(),
+            create(replay),
+            streamed("msg_3", "no wire port"),
+            continue_from("msg_3", json!([tool_result(), budget()])),
+            streamed("msg_4", "compressed"),
+        ];
+        let trajectory = build(timeline(events));
+
+        assert_eq!(
+            texts(&trajectory.items),
+            [
+                (TrajectoryItemKind::Context, 0, MAIN_CONTEXT),
+                (TrajectoryItemKind::User, 0, "hello"),
+                (
+                    TrajectoryItemKind::Context,
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
+                (TrajectoryItemKind::Assistant, 0, "looking"),
+                (TrajectoryItemKind::Assistant, 0, "found it"),
+                (TrajectoryItemKind::User, 0, "try the wire"),
+                (TrajectoryItemKind::Assistant, 0, "no wire port"),
+                (TrajectoryItemKind::Assistant, 0, "compressed"),
+            ]
+        );
+        assert_eq!(trajectory.events.len(), 10);
+    }
+
+    #[test]
+    fn thread_continue_of_an_unknown_message_follows_the_latest_thread() {
+        let events = vec![
+            create(json!([user("hello"), budget()])),
+            claude_request(
+                Value::Null,
+                &["You are a title generator."],
+                json!([user("name it")]),
+            ),
+            continue_from("msg_uncaptured", json!([user("next"), budget()])),
+        ];
+        let items = build(timeline(events)).items;
+        assert_eq!(
+            items.last().map(|i| (i.kind, i.stream, i.text.as_deref())),
+            Some((TrajectoryItemKind::User, 0, Some("next")))
+        );
+
+        // Without any earlier thread request the continue keeps its own stream.
+        let items = build(timeline(vec![
+            claude_request(
+                Value::Null,
+                &["You are a title generator."],
+                json!([user("name it")]),
+            ),
+            continue_from("msg_uncaptured", json!([user("next")])),
+        ]))
+        .items;
+        assert_eq!(
+            texts(&items)[2..],
+            [
+                (
+                    TrajectoryItemKind::Context,
+                    1,
+                    "x-anthropic-billing-header: cc_version=2.1.293.af3; cc_entrypoint=cli; \
+                     cch=3ceb5;"
+                ),
+                (TrajectoryItemKind::User, 1, "next"),
+            ]
+        );
+    }
+
     #[test]
     fn system_messages_inside_the_conversation_keep_one_stream() {
-        let first = r#"{"system":"instructions","messages":[{"role":"user","content":"hello"},{"role":"system","content":"reminder one"}]}"#;
-        let second = r#"{"system":"instructions","messages":[{"role":"user","content":"hello"},{"role":"system","content":"reminder one"},{"role":"assistant","content":"hi"},{"role":"system","content":"reminder two"},{"role":"user","content":"next"}]}"#;
+        let first = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"system","text":"reminder one"}],"instructions_present":true,"previous_response_id":null}"#;
+        let second = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"system","text":"reminder one"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"system","text":"reminder two"},{"id":null,"role":"user","text":"next"}],"instructions_present":true,"previous_response_id":null}"#;
         let items = build(timeline(vec![
-            raw_event("request", first),
-            raw_event("request", second),
+            structured_event("request", first),
+            structured_event("request", second),
         ]))
         .items;
 
@@ -798,13 +1071,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_compaction_keeps_existing_summary_presentation() {
-        let request = json!({"input": [{"role": "user", "content": "write report"}, {"role": "user", "content": PROMPT}]}).to_string();
-        let replay = json!({"input": [{"role": "user", "content": "write report"}, {"role": "user", "content": handoff()}]}).to_string();
+    fn structured_compaction_keeps_existing_summary_presentation() {
+        let request = json!({"messages": [{"role": "user", "text": "write report"}, {"role": "user", "text": PROMPT}]}).to_string();
+        let replay = json!({"messages": [{"role": "user", "text": "write report"}, {"role": "user", "text": handoff()}]}).to_string();
         let items = build(timeline(vec![
-            raw_event("request", &request),
+            structured_event("request", &request),
             event("response", SUMMARY, json!({})),
-            raw_event("request", &replay),
+            structured_event("request", &replay),
         ]))
         .items;
         assert_eq!(

@@ -16,14 +16,15 @@ and optional full-text search.
 - Health and storage-readiness probes.
 - Embedded migrations for both supported storage profiles.
 
-Session titles have dedicated adapters for Codex and Claude Code. Claude Code
-names its own session; Codex names a separate task thread, matched by quoted
-user content, turn start time, and device.
-Only a unique task candidate receives the generated title. Other Agents use
-their first nonempty user input, collapsed to one line and truncated to 80
-characters with an ellipsis. Both adapters read archived protocol messages and support older
-structured event records. Auxiliary title calls retain their own events and usage.
-Existing sessions receive default titles through a one-time backfill.
+A session is titled by the `session_title` the collector reports for a call in
+which the Agent names its own session (Claude Code); otherwise by its first
+nonempty user input, collapsed to one line and truncated to 80 characters with
+an ellipsis. An Agent title is never replaced by a default title. Requests whose
+`purpose` marks them as naming calls are not user input. Codex names tasks from
+separate threads that do not say which session they name; those threads are
+marked `title_generation` from their `thread_source` and are not linked to a
+task. Naming calls retain their own events and usage. Existing sessions receive
+default titles through a one-time backfill.
 
 Exactly one storage profile is compiled into a binary:
 

@@ -46,11 +46,12 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            TurnIdentity, TurnIdentityKind, agent_names_filter, canonical_agent_name,
-            choose_turn_index, escape_like_pattern, exact_values_filter, non_empty,
+            SessionTurnAttachment, TurnIdentity, TurnIdentityKind, agent_names_filter,
+            canonical_agent_name, escape_like_pattern, exact_values_filter, non_empty,
             non_negative_count, normalize_limit, normalize_slug, normalize_text,
-            normalized_optional, normalized_tokens, parse_group_by, providers_filter, sha256_bytes,
-            turn_identity, unix_epoch, validate_batch, validate_event_type,
+            normalized_optional, normalized_tokens, parse_group_by, providers_filter,
+            session_turn_attachment, sha256_bytes, turn_identity, unix_epoch, validate_batch,
+            validate_event_type,
         },
         session_metadata_from_event,
     },
@@ -59,7 +60,7 @@ use crate::{
 use super::session_titles;
 
 #[cfg(test)]
-use crate::usage::persistence::{turn_identity_from_metadata, validate_event};
+use crate::usage::persistence::turn_identity_from_metadata;
 
 const SUMMARY_AGGREGATE_SQL: &str = "\
     SELECT \
@@ -703,7 +704,7 @@ fn ingest_one_event(
             now,
         },
     )?;
-    let turn_index = resolve_turn_index(connection, session.id, event)?;
+    let turn_index = resolve_turn_index(connection, session.id, event, &agent_name, observed_at)?;
     let turn = upsert_turn(
         connection,
         user_id,
@@ -771,10 +772,7 @@ fn ingest_one_event(
                 user_id,
                 session_pk: session.id,
                 event_pk: usage_event_id,
-                turn_index,
-                agent_name: &agent_name,
                 event_type: event.event_type.as_str(),
-                text: event.text.as_deref(),
                 metadata: &event.metadata,
                 observed_at,
             },
@@ -900,20 +898,76 @@ fn resolve_turn_index(
     connection: &mut PgConnection,
     session_pk: Uuid,
     event: &IngestUsageEvent,
+    agent_name: &str,
+    observed_at: DateTime<Utc>,
 ) -> Result<i32, AppError> {
-    // Older collectors without a stable provider identity retain their supplied
-    // index. Newer evidence lets restarted collectors avoid merging new work
-    // into an already-used local turn number.
-    let Some(identity) = turn_identity(event) else {
-        return Ok(event.turn_index);
-    };
-    let existing_turn_index = existing_turn_index_for_identity(connection, session_pk, &identity)?;
-    let next_turn_index = next_session_turn_index(connection, session_pk)?;
-    Ok(choose_turn_index(
-        event.turn_index,
-        existing_turn_index,
-        next_turn_index,
-    ))
+    if let Some(attachment) = session_turn_attachment(agent_name, &event.metadata)
+        && let Some(turn_index) =
+            attached_turn_index(connection, session_pk, &attachment, observed_at)?
+    {
+        return Ok(turn_index);
+    }
+    // Events of one turn share its identity; an event without any identity
+    // is a turn of its own.
+    if let Some(identity) = turn_identity(event)
+        && let Some(existing) = existing_turn_index_for_identity(connection, session_pk, &identity)?
+    {
+        return Ok(existing);
+    }
+    next_session_turn_index(connection, session_pk)
+}
+
+/// Finds the stored turn a Claude Code side or subagent request belongs to;
+/// `None` only when the session has no turn yet.
+fn attached_turn_index(
+    connection: &mut PgConnection,
+    session_pk: Uuid,
+    attachment: &SessionTurnAttachment,
+    observed_at: DateTime<Utc>,
+) -> Result<Option<i32>, AppError> {
+    if let Some(prompt_id) = &attachment.prompt_id {
+        // Only main-loop events anchor a prompt, and each prompt id belongs to
+        // one turn. Walking the session index from its latest turn usually
+        // stops within the current turn instead of detoasting every megabyte
+        // metadata row of the session.
+        let prompt_turn = sql_query(
+            "SELECT turn_index \
+             FROM llm_usage_events \
+             WHERE session_pk = $1 \
+               AND metadata->'claude_code_billing'->>'cc_prompt_id' = $2 \
+               AND metadata->>'claude_turn_id' IS NOT NULL \
+             ORDER BY turn_index DESC, observed_at DESC \
+             LIMIT 1",
+        )
+        .bind::<SqlUuid, _>(session_pk)
+        .bind::<Text, _>(prompt_id)
+        .get_result::<TurnIndexRow>(connection)
+        .optional()?;
+        if let Some(row) = prompt_turn {
+            return Ok(Some(row.turn_index));
+        }
+    }
+    // Events may arrive out of order, so the observation time picks the turn.
+    let preceding = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session_pk))
+        .filter(agent_turns::started_at.le(observed_at))
+        .order_by((
+            agent_turns::started_at.desc(),
+            agent_turns::turn_index.desc(),
+        ))
+        .select(agent_turns::turn_index)
+        .first::<i32>(connection)
+        .optional()?;
+    if preceding.is_some() {
+        return Ok(preceding);
+    }
+    agent_turns::table
+        .filter(agent_turns::session_pk.eq(session_pk))
+        .order_by((agent_turns::started_at.asc(), agent_turns::turn_index.asc()))
+        .select(agent_turns::turn_index)
+        .first::<i32>(connection)
+        .optional()
+        .map_err(AppError::from)
 }
 
 fn existing_turn_index_for_identity(
@@ -936,6 +990,16 @@ fn existing_turn_index_for_identity(
             "SELECT turn_index \
              FROM llm_usage_events \
              WHERE session_pk = $1 AND metadata->>'claude_turn_id' = $2 \
+             ORDER BY observed_at ASC \
+             LIMIT 1",
+        )
+        .bind::<SqlUuid, _>(session_pk)
+        .bind::<Text, _>(&identity.value)
+        .get_result::<TurnIndexRow>(connection),
+        TurnIdentityKind::TurnId => sql_query(
+            "SELECT turn_index \
+             FROM llm_usage_events \
+             WHERE session_pk = $1 AND metadata->>'turn_id' = $2 \
              ORDER BY observed_at ASC \
              LIMIT 1",
         )
@@ -1452,9 +1516,9 @@ mod tests {
 
     use super::{
         EventFilters, SummaryDimension, SummaryDimensions, SummarySqlFilters, TurnIdentityKind,
-        canonical_agent_name, choose_turn_index, event_response, latest_optional, normalize_limit,
-        normalize_slug, normalized_tokens, parse_group_by, turn_identity_from_metadata,
-        validate_batch, validate_event, validate_event_type,
+        canonical_agent_name, event_response, latest_optional, normalize_limit, normalize_slug,
+        normalized_tokens, parse_group_by, turn_identity_from_metadata, validate_batch,
+        validate_event_type,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::json;
@@ -1743,18 +1807,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_event_rejects_zero_turn_index() {
-        let mut event = sample_event();
-        event.turn_index = 0_i32;
-
-        let error = validate_event(&event).expect_err("zero turn_index should be invalid");
-        assert!(
-            matches!(&error, AppError::Validation(message) if message.contains("turn_index")),
-            "zero turn_index should return a validation error"
-        );
-    }
-
-    #[test]
     fn validate_batch_rejects_oversized_batches() {
         let request = IngestEventsRequest {
             events: vec![sample_event()],
@@ -1826,42 +1878,6 @@ mod tests {
         assert!(
             matches!(&error, AppError::Validation(message) if message.contains("request or response")),
             "unknown event_type should return a validation error"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_reuses_existing_provider_identity() {
-        assert_eq!(
-            choose_turn_index(9_i32, Some(1_i32), 5_i32),
-            1_i32,
-            "request and response events for the same provider response should share one turn"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_allocates_after_conflicting_restarted_counter() {
-        assert_eq!(
-            choose_turn_index(1_i32, None, 5_i32),
-            5_i32,
-            "a restarted collector must not merge a new provider response into an old turn"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_allocates_after_restarted_counter_gap() {
-        assert_eq!(
-            choose_turn_index(2_i32, None, 5_i32),
-            5_i32,
-            "a restarted collector should append even if earlier filtered turns left a gap"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_keeps_requested_gap_when_there_is_no_collision() {
-        assert_eq!(
-            choose_turn_index(4_i32, None, 2_i32),
-            4_i32,
-            "non-conflicting collector indexes should remain stable"
         );
     }
 
@@ -2081,7 +2097,6 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
             },
             session_id: "session-001".to_owned(),
-            turn_index: 1_i32,
             llm: LlmPayload {
                 provider: "OpenAI".to_owned(),
                 model: "gpt-5.5".to_owned(),
