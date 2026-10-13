@@ -147,7 +147,7 @@ mod tests {
     fn defaults_to_the_first_page_of_every_agent() {
         let query = SessionListQuery::default().validate().expect("valid");
         assert_eq!((query.page, query.page_size, query.offset), (1, 20, 0));
-        assert!(query.agent_names.is_empty());
+        assert_eq!(query.agent_names, Vec::<String>::new());
     }
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
         }
         .validate()
         .expect("valid");
-        assert!(blank.llm_models.is_empty());
+        assert_eq!(blank.llm_models, Vec::<String>::new());
     }
 
     #[test]

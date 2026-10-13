@@ -321,7 +321,7 @@ mod tests {
             llm_provider: vec!["anthropic".to_owned()],
             ..SessionListQuery::default()
         };
-        assert!(list(&mut database, other).is_empty());
+        assert_eq!(list(&mut database, other), Vec::new());
     }
 
     #[test]
