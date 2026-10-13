@@ -133,6 +133,32 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+
+    session_titles (session_pk) {
+        session_pk -> Text,
+        user_id -> Text,
+        title -> Nullable<Text>,
+        title_event_pk -> Nullable<Text>,
+        title_observed_at -> Nullable<BigInt>,
+        purpose -> Nullable<Text>,
+        updated_at -> BigInt,
+        naming_turn_id -> Nullable<Text>,
+        naming_prompt -> Nullable<Text>,
+        parent_session_pk -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::{BigInt, Text};
+
+    schema_backfills (name) {
+        name -> Text,
+        completed_at -> BigInt,
+    }
+}
+
 diesel::joinable!(agent_sessions -> app_users (user_id));
 diesel::joinable!(agent_sessions -> devices (device_context_id));
 diesel::joinable!(agent_turns -> agent_sessions (session_pk));
@@ -149,6 +175,7 @@ diesel::joinable!(agent_diagnostic_capture_events -> llm_usage_events (event_pk)
 diesel::joinable!(agent_diagnostic_captures -> agent_sessions (session_pk));
 diesel::joinable!(agent_diagnostic_captures -> app_users (user_id));
 diesel::joinable!(agent_diagnostic_captures -> devices (device_context_id));
+diesel::joinable!(session_titles -> agent_sessions (session_pk));
 
 diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_capture_events,
@@ -159,4 +186,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     devices,
     llm_usage_events,
     llm_usage_event_attachments,
+    schema_backfills,
+    session_titles,
 );

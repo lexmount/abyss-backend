@@ -7,10 +7,15 @@
 
 /// Image attachment contracts and validation.
 pub mod attachments;
+mod conversation;
 /// Opaque diagnostic-capture ingest contracts.
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
+/// Owner-scoped session index contracts.
+pub mod session_list;
+pub mod session_title;
+pub mod trajectory;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,10 +47,6 @@ pub struct IngestUsageEvent {
     pub agent: AgentPayload,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// Collector-side best-effort turn number. Ingest normalizes this when a
-    /// stable logical-turn/provider identity shows that a restarted collector
-    /// reused an earlier local sequence number.
-    pub turn_index: i32,
     /// LLM provider and model labels.
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.
@@ -118,18 +119,22 @@ impl UsageEventType {
     clippy::struct_field_names,
     reason = "Public JSON token usage fields intentionally include the token suffix."
 )]
+/// Token counters reported by the event producer.
+///
+/// Input, cache read, cache write, and output counters are disjoint;
+/// reasoning is a breakdown of output.
 pub struct TokenUsagePayload {
-    /// Input tokens reported by the provider.
+    /// Input tokens neither read from nor written into a provider cache.
     pub input_tokens: Option<i64>,
-    /// Output tokens reported by the provider.
+    /// Output tokens, including reasoning.
     pub output_tokens: Option<i64>,
-    /// Tokens served from a provider cache.
+    /// Input tokens served from a provider cache.
     pub cache_read_tokens: Option<i64>,
-    /// Tokens written to a provider cache.
+    /// Input tokens written to a provider cache.
     pub cache_write_tokens: Option<i64>,
-    /// Provider-reported reasoning tokens.
+    /// Part of output tokens spent on reasoning.
     pub reasoning_tokens: Option<i64>,
-    /// Provider total, or a derived sum when omitted.
+    /// Sum of the four disjoint counters, derived when omitted.
     pub total_tokens: Option<i64>,
 }
 
@@ -163,14 +168,18 @@ pub struct SummaryQuery {
     pub fields: Option<SummaryFields>,
     /// User UUID, name, or email filter retained for the summary contract.
     pub user_filter: Option<String>,
-    /// Agent-name filter.
-    pub agent_name: Option<String>,
-    /// Agent-native session identifier filter.
-    pub session_id: Option<String>,
-    /// LLM provider filter.
-    pub llm_provider: Option<String>,
-    /// LLM model filter.
-    pub llm_model: Option<String>,
+    /// Agent-name filter; repeat the key to match any of several Agents.
+    #[serde(default)]
+    pub agent_name: Vec<String>,
+    /// Agent-native session identifier filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub session_id: Vec<String>,
+    /// LLM provider filter; repeat the key to match any of several providers.
+    #[serde(default)]
+    pub llm_provider: Vec<String>,
+    /// LLM model filter; repeat the key to match any of several models.
+    #[serde(default)]
+    pub llm_model: Vec<String>,
     /// Event-side filter.
     pub event_type: Option<String>,
     /// Requested aggregate row limit.
@@ -183,7 +192,7 @@ pub struct SummaryQuery {
 pub enum SummaryFields {
     /// Return dimensions, event counts, and every token counter.
     Full,
-    /// Return only day, input-token, and total-token fields.
+    /// Return only the day and disjoint token counters used by charts.
     TokenUsage,
 }
 
@@ -298,9 +307,15 @@ pub struct TokenUsageSummaryRow {
     /// UTC calendar day when day grouping was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub day: Option<String>,
-    /// Summed input tokens.
+    /// Summed input tokens that were neither read from nor written to a cache.
     pub input_tokens: i64,
-    /// Summed provider or derived total tokens.
+    /// Summed output tokens, including reasoning.
+    pub output_tokens: i64,
+    /// Summed input tokens read from a provider cache.
+    pub cache_read_tokens: i64,
+    /// Summed input tokens written into a provider cache.
+    pub cache_write_tokens: i64,
+    /// Summed total of the four disjoint counters.
     pub total_tokens: i64,
 }
 
@@ -309,6 +324,9 @@ impl From<SummaryRow> for TokenUsageSummaryRow {
         Self {
             day: row.day,
             input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cache_read_tokens: row.cache_read_tokens,
+            cache_write_tokens: row.cache_write_tokens,
             total_tokens: row.total_tokens,
         }
     }
@@ -321,24 +339,49 @@ pub struct RawEventsQuery {
     pub from: Option<DateTime<Utc>>,
     /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
-    /// Agent-name filter.
-    pub agent_name: Option<String>,
-    /// Agent-native session identifier filter.
-    pub session_id: Option<String>,
+    /// Agent-name filter; repeat the key to match any of several Agents.
+    #[serde(default)]
+    pub agent_name: Vec<String>,
+    /// Agent-native session identifier filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub session_id: Vec<String>,
     /// Backend session primary-key filter.
     pub session_pk: Option<Uuid>,
     /// Normalized turn-number filter.
     pub turn_index: Option<i32>,
-    /// LLM provider filter.
-    pub llm_provider: Option<String>,
-    /// LLM model filter.
-    pub llm_model: Option<String>,
+    /// LLM provider filter; repeat the key to match any of several providers.
+    #[serde(default)]
+    pub llm_provider: Vec<String>,
+    /// LLM model filter; repeat the key to match any of several models.
+    #[serde(default)]
+    pub llm_model: Vec<String>,
     /// Request or response filter.
     pub event_type: Option<String>,
     /// Requested page size.
     pub limit: Option<i64>,
     /// Number of newest matching events to skip.
     pub offset: Option<i64>,
+    /// Selects complete events or the content-free list projection.
+    pub fields: Option<RawEventFields>,
+}
+
+impl RawEventsQuery {
+    /// Whether events carry their text, metadata, and attachments.
+    pub fn includes_content(&self) -> bool {
+        self.fields.unwrap_or_default() == RawEventFields::Full
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Response projection requested from the raw-event endpoint.
+pub enum RawEventFields {
+    /// Return every event field, including text, metadata, and attachments.
+    #[default]
+    Full,
+    /// Return what an event list shows. Text and metadata hold whole request
+    /// bodies, so storage does not read them and attachments are not loaded.
+    List,
 }
 
 #[derive(Debug, Serialize)]
@@ -348,6 +391,110 @@ pub struct RawEventsResponse {
     pub events: Vec<UsageEventResponse>,
     /// Decimal offset for the next page, or `None` at the end.
     pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+/// One page of usage events without their content, for event lists.
+pub struct RawEventListResponse {
+    /// Events ordered from newest to oldest observation time.
+    pub events: Vec<UsageEventListItem>,
+    /// Decimal offset for the next page, or `None` at the end.
+    pub next_page_token: Option<String>,
+}
+
+impl RawEventListResponse {
+    /// Drops the content fields from a page loaded without them.
+    pub fn from_events(response: RawEventsResponse) -> Self {
+        Self {
+            events: response
+                .events
+                .into_iter()
+                .map(UsageEventListItem::from)
+                .collect(),
+            next_page_token: response.next_page_token,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+/// One usage event as an event list shows it: identity, model, Agent, device,
+/// and token counts, without text, metadata, or attachments.
+pub struct UsageEventListItem {
+    /// Backend-generated event primary key.
+    pub id: Uuid,
+    /// Collector-generated idempotency key.
+    pub event_id: String,
+    /// Authenticated owner identifier.
+    pub user_id: Uuid,
+    /// Backend device-context primary key.
+    pub device_context_id: Uuid,
+    /// Device host name, when the referenced device still exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
+    /// Device platform, when the referenced device still exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// Backend session primary key.
+    pub session_pk: Uuid,
+    /// Backend turn primary key.
+    pub turn_pk: Uuid,
+    /// Canonical Agent name.
+    pub agent_name: String,
+    /// Agent version observed on this event.
+    pub agent_version: Option<String>,
+    /// Agent-native session identifier.
+    pub session_id: String,
+    /// Backend-normalized turn number.
+    pub turn_index: i32,
+    /// Canonical LLM provider slug.
+    pub llm_provider: String,
+    /// Provider-specific model identifier.
+    pub llm_model: String,
+    /// Canonical request or response value.
+    pub event_type: String,
+    /// Normalized input-token count.
+    pub input_tokens: i64,
+    /// Normalized output-token count.
+    pub output_tokens: i64,
+    /// Normalized cache-read-token count.
+    pub cache_read_tokens: i64,
+    /// Normalized cache-write-token count.
+    pub cache_write_tokens: i64,
+    /// Normalized reasoning-token count.
+    pub reasoning_tokens: i64,
+    /// Provider-reported or derived total-token count.
+    pub total_tokens: i64,
+    /// Collector observation timestamp.
+    pub observed_at: DateTime<Utc>,
+}
+
+impl From<UsageEventResponse> for UsageEventListItem {
+    fn from(event: UsageEventResponse) -> Self {
+        Self {
+            id: event.id,
+            event_id: event.event_id,
+            user_id: event.user_id,
+            device_context_id: event.device_context_id,
+            host_name: event.host_name,
+            platform: event.platform,
+            session_pk: event.session_pk,
+            turn_pk: event.turn_pk,
+            agent_name: event.agent_name,
+            agent_version: event.agent_version,
+            session_id: event.session_id,
+            turn_index: event.turn_index,
+            llm_provider: event.llm_provider,
+            llm_model: event.llm_model,
+            event_type: event.event_type,
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_write_tokens,
+            reasoning_tokens: event.reasoning_tokens,
+            total_tokens: event.total_tokens,
+            observed_at: event.observed_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -411,11 +558,85 @@ pub struct UsageEventResponse {
 
 #[derive(Debug, Serialize)]
 /// Session metadata and its ordered turn timelines.
-pub struct SessionTimelineResponse {
+///
+/// `E` is the per-event representation: complete events for the full
+/// timeline, or [`UsageEventOutline`] for the content-free outline.
+pub struct SessionTimelineResponse<E = UsageEventResponse> {
     /// Authoritative session information.
     pub session: SessionInfo,
     /// Turns ordered by normalized turn index.
-    pub turns: Vec<TurnTimeline>,
+    pub turns: Vec<TurnTimeline<E>>,
+}
+
+/// Session timeline whose events omit text and metadata bodies.
+pub type SessionOutlineResponse = SessionTimelineResponse<UsageEventOutline>;
+
+/// Maximum number of characters returned in an outline event preview.
+pub const OUTLINE_PREVIEW_CHARS: i64 = 200;
+
+#[derive(Debug, Serialize)]
+/// Content-free representation of one event, sized independently of its text.
+///
+/// Full content is loaded separately by event primary key.
+pub struct UsageEventOutline {
+    /// Backend-generated event primary key.
+    pub id: Uuid,
+    /// Collector-generated idempotency key.
+    pub event_id: String,
+    /// Owning turn, used only to group events.
+    #[serde(skip)]
+    pub turn_pk: Uuid,
+    /// Backend-normalized turn number.
+    pub turn_index: i32,
+    /// Canonical LLM provider slug.
+    pub llm_provider: String,
+    /// Provider-specific model identifier.
+    pub llm_model: String,
+    /// Canonical request or response value.
+    pub event_type: String,
+    /// Normalized input-token count.
+    pub input_tokens: i64,
+    /// Normalized output-token count.
+    pub output_tokens: i64,
+    /// Normalized cache-read-token count.
+    pub cache_read_tokens: i64,
+    /// Normalized cache-write-token count.
+    pub cache_write_tokens: i64,
+    /// Normalized reasoning-token count.
+    pub reasoning_tokens: i64,
+    /// Provider-reported or derived total-token count.
+    pub total_tokens: i64,
+    /// Whether the collector estimated token usage.
+    pub token_usage_estimated: bool,
+    /// Collector observation timestamp.
+    pub observed_at: DateTime<Utc>,
+    /// Text length in characters; zero when text is absent.
+    pub text_chars: i64,
+    /// Up to [`OUTLINE_PREVIEW_CHARS`] characters of text: the tail of a
+    /// request, where the newest prompt is, or the head of a response.
+    pub preview: Option<String>,
+    /// Number of image attachments on the event.
+    pub attachment_count: i64,
+    /// Provider response-chain identifiers needed by timeline ordering.
+    #[serde(skip)]
+    pub ordering_metadata: Value,
+}
+
+impl UsageEventOutline {
+    /// Builds the minimal metadata object consumed by timeline ordering.
+    pub fn ordering_metadata(
+        response_id: Option<String>,
+        previous_response_id: Option<String>,
+    ) -> Value {
+        let mut metadata = serde_json::Map::new();
+        if let Some(value) = response_id {
+            metadata.insert("response_id".to_owned(), Value::String(value));
+        }
+        if let Some(value) = previous_response_id {
+            metadata.insert("previous_response_id".to_owned(), Value::String(value));
+        }
+        Value::Object(metadata)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -439,6 +660,13 @@ pub struct SessionInfo {
     pub ended_at: Option<DateTime<Utc>>,
     /// Stable, allowlisted session metadata.
     pub metadata: Value,
+    /// Agent-generated title, or a first-user-input preview for other Agents.
+    pub title: Option<String>,
+    /// Why the session exists when it only serves the Agent, such as
+    /// `title_generation`; `None` for ordinary sessions.
+    pub purpose: Option<String>,
+    /// For a naming thread, the task session its title was matched to.
+    pub parent_session_pk: Option<Uuid>,
 }
 
 /// Extracts the endpoint working directory retained in session metadata.
@@ -462,7 +690,7 @@ pub fn session_metadata_from_event(metadata: &Value) -> Value {
 
 #[derive(Debug, Serialize)]
 /// One normalized turn and its deterministically ordered events.
-pub struct TurnTimeline {
+pub struct TurnTimeline<E = UsageEventResponse> {
     /// Backend turn primary key.
     pub turn_pk: Uuid,
     /// Backend-normalized turn number.
@@ -472,7 +700,7 @@ pub struct TurnTimeline {
     /// Latest event observation time in the turn.
     pub ended_at: Option<DateTime<Utc>>,
     /// Request and response events in authoritative timeline order.
-    pub events: Vec<UsageEventResponse>,
+    pub events: Vec<E>,
 }
 
 /// Returns the JSON object used when optional metadata is absent.
@@ -483,9 +711,9 @@ pub fn empty_metadata() -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        IngestEventsRequest, SummaryFields, SummaryQuery, SummaryResponse, SummaryRow,
-        TokenUsageSummaryResponse, UsageEventType, session_metadata_from_event,
-        session_working_directory,
+        IngestEventsRequest, RawEventFields, RawEventsQuery, SummaryFields, SummaryQuery,
+        SummaryResponse, SummaryRow, TokenUsageSummaryResponse, UsageEventType,
+        session_metadata_from_event, session_working_directory,
     };
     use serde_json::json;
 
@@ -625,6 +853,18 @@ mod tests {
     }
 
     #[test]
+    fn raw_events_query_selects_the_list_projection() {
+        let list = serde_json::from_value::<RawEventsQuery>(json!({"fields": "list"}))
+            .expect("list query should deserialize");
+        let full = serde_json::from_value::<RawEventsQuery>(json!({}))
+            .expect("default query should deserialize");
+
+        assert_eq!(list.fields, Some(RawEventFields::List));
+        assert!(!list.includes_content());
+        assert!(full.includes_content());
+    }
+
+    #[test]
     fn token_usage_summary_response_omits_non_token_fields() {
         let response = TokenUsageSummaryResponse::from_summary(SummaryResponse {
             from: None,
@@ -668,6 +908,9 @@ mod tests {
                     {
                         "day": "2026-07-01",
                         "input_tokens": 123_i64,
+                        "output_tokens": 456_i64,
+                        "cache_read_tokens": 11_i64,
+                        "cache_write_tokens": 12_i64,
                         "total_tokens": 615_i64
                     }
                 ],

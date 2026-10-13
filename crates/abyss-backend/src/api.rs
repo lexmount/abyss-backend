@@ -7,11 +7,14 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+// Filter keys repeat to select several values, e.g. `llm_model=a&llm_model=b`;
+// axum's own Query cannot collect repeated keys.
+use axum_extra::extract::Query;
 use serde::Serialize;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -22,12 +25,15 @@ use crate::{
     search::{SessionSearchQuery, SessionSearchResponse},
     storage::StorageBackend,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionTimelineResponse, SummaryFields, SummaryQuery, TokenUsageSummaryResponse,
+        IngestEventsRequest, IngestEventsResponse, RawEventListResponse, RawEventsQuery,
+        SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
+        TokenUsageSummaryResponse, UsageEventResponse,
+        session_list::{SessionListQuery, SessionListResponse},
+        trajectory::{self, SessionTrajectoryResponse},
     },
 };
 
-const MAX_INGEST_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INGEST_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 /// Cloneable dependencies and request limits shared by all Axum handlers.
@@ -61,15 +67,25 @@ pub fn router(state: AppState) -> Router {
                 .get(raw_events)
                 .layer(DefaultBodyLimit::max(MAX_INGEST_REQUEST_BODY_BYTES)),
         )
+        .route("/v1/agent-usage/events/{event_pk}", get(usage_event))
         .route(
             "/v1/agent-usage/attachments/{attachment_id}",
             get(image_attachment),
         )
         .route("/v1/agent-usage/summary", get(usage_summary))
         .route("/v1/agent-usage/search", get(session_search))
+        .route("/v1/agent-usage/sessions", get(list_sessions))
         .route(
             "/v1/agent-usage/sessions/{session_pk}",
             get(session_timeline),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/outline",
+            get(session_outline),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/trajectory",
+            get(session_trajectory),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -142,6 +158,16 @@ async fn session_search(
     Ok(Json(state.storage.session_search(user_id, query).await?))
 }
 
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionListQuery>,
+) -> Result<Json<SessionListResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let query = query.validate()?;
+    Ok(Json(state.storage.list_sessions(user_id, query).await?))
+}
+
 async fn session_timeline(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -150,6 +176,36 @@ async fn session_timeline(
     let user_id = state.identity.authenticate(&headers)?;
     let response = state.storage.session_timeline(user_id, session_pk).await?;
     Ok(Json(response))
+}
+
+async fn session_outline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionOutlineResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state.storage.session_outline(user_id, session_pk).await?,
+    ))
+}
+
+async fn session_trajectory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionTrajectoryResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let timeline = state.storage.session_timeline(user_id, session_pk).await?;
+    Ok(Json(trajectory::build(timeline)))
+}
+
+async fn usage_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(event_pk): Path<Uuid>,
+) -> Result<Json<UsageEventResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(state.storage.usage_event(user_id, event_pk).await?))
 }
 
 async fn image_attachment(
@@ -205,14 +261,18 @@ async fn raw_events(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<RawEventsQuery>,
-) -> Result<Json<RawEventsResponse>, AppError> {
+) -> Result<Response, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
     let default_page_size = state.default_page_size;
+    let includes_content = query.includes_content();
     let response = state
         .storage
         .raw_events(user_id, query, default_page_size)
         .await?;
-    Ok(Json(response))
+    if !includes_content {
+        return Ok(Json(RawEventListResponse::from_events(response)).into_response());
+    }
+    Ok(Json(response).into_response())
 }
 
 #[derive(Serialize)]

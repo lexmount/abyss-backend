@@ -11,11 +11,11 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use diesel::{
     Connection, ExpressionMethods, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
-    dsl::{max, sql},
+    dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
     sql_types::{
-        Array, BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+        Array, BigInt, Bool, Bytea, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
     },
 };
 use uuid::Uuid;
@@ -35,9 +35,10 @@ use crate::{
     },
     error::AppError,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
-        RawEventsResponse, SessionInfo, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        SummaryRow, TurnTimeline, UsageEventResponse,
+        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, OUTLINE_PREVIEW_CHARS,
+        RawEventsQuery, RawEventsResponse, SessionInfo, SessionOutlineResponse,
+        SessionTimelineResponse, SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline,
+        UsageEventOutline, UsageEventResponse,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -45,17 +46,21 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            TurnIdentity, TurnIdentityKind, agent_name_filter_values, canonical_agent_name,
-            choose_turn_index, escape_like_pattern, non_empty, non_negative_count, normalize_limit,
-            normalize_slug, normalize_text, normalized_optional, normalized_tokens, parse_group_by,
-            sha256_bytes, turn_identity, unix_epoch, validate_batch, validate_event_type,
+            SessionTurnAttachment, TurnIdentity, TurnIdentityKind, agent_names_filter,
+            canonical_agent_name, escape_like_pattern, exact_values_filter, non_empty,
+            non_negative_count, normalize_limit, normalize_slug, normalize_text,
+            normalized_optional, normalized_tokens, parse_group_by, providers_filter,
+            session_turn_attachment, sha256_bytes, turn_identity, unix_epoch, validate_batch,
+            validate_event_type,
         },
         session_metadata_from_event,
     },
 };
 
+use super::session_titles;
+
 #[cfg(test)]
-use crate::usage::persistence::{turn_identity_from_metadata, validate_event};
+use crate::usage::persistence::turn_identity_from_metadata;
 
 const SUMMARY_AGGREGATE_SQL: &str = "\
     SELECT \
@@ -100,11 +105,11 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
             )) \
         ) \
         AND ($17 = false OR e.agent_name = ANY($18)) \
-        AND ($19 = false OR e.session_id = $20) \
+        AND ($19 = false OR e.session_id = ANY($20)) \
         AND ($21 = false OR e.session_pk = $22) \
         AND ($23 = false OR e.turn_index = $24) \
-        AND ($25 = false OR e.llm_provider = $26) \
-        AND ($27 = false OR e.llm_model = $28) \
+        AND ($25 = false OR e.llm_provider = ANY($26)) \
+        AND ($27 = false OR e.llm_model = ANY($28)) \
         AND ($29 = false OR e.event_type = $30) \
     GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 \
     ORDER BY total_tokens DESC, agent_name ASC NULLS LAST, user_email ASC NULLS LAST, day ASC NULLS LAST \
@@ -248,12 +253,12 @@ pub fn usage_summary(
             from: query.from,
             to: query.to,
             user_filter: query.user_filter.as_deref(),
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
+            agent_names: &query.agent_name,
+            session_ids: &query.session_id,
             session_pk: None,
             turn_index: None,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
+            llm_providers: &query.llm_provider,
+            llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
             limit,
             offset: 0,
@@ -288,16 +293,16 @@ fn load_filtered_summary_rows(
     let has_user_filter = !user_filter_pattern.is_empty();
     let agent_names = sql_filters.agent_names;
     let has_agent_filter = !agent_names.is_empty();
-    let session_id = sql_filters.session_id.unwrap_or_default();
-    let has_session_id_filter = !session_id.is_empty();
+    let session_ids = sql_filters.session_ids;
+    let has_session_id_filter = !session_ids.is_empty();
     let session_pk = sql_filters.session_pk.unwrap_or_else(Uuid::nil);
     let has_session_pk_filter = session_pk != Uuid::nil();
     let turn_index = sql_filters.turn_index.unwrap_or_default();
     let has_turn_index_filter = turn_index > 0_i32;
-    let provider = sql_filters.provider.unwrap_or_default();
-    let has_provider_filter = !provider.is_empty();
-    let model = sql_filters.model.unwrap_or_default();
-    let has_model_filter = !model.is_empty();
+    let providers = sql_filters.providers;
+    let has_provider_filter = !providers.is_empty();
+    let models = sql_filters.models;
+    let has_model_filter = !models.is_empty();
     let event_type = sql_filters.event_type.unwrap_or_default();
     let has_event_type_filter = !event_type.is_empty();
 
@@ -324,15 +329,15 @@ fn load_filtered_summary_rows(
         .bind::<Bool, _>(has_agent_filter)
         .bind::<Array<Text>, _>(agent_names)
         .bind::<Bool, _>(has_session_id_filter)
-        .bind::<Text, _>(&session_id)
+        .bind::<Array<Text>, _>(session_ids)
         .bind::<Bool, _>(has_session_pk_filter)
         .bind::<SqlUuid, _>(session_pk)
         .bind::<Bool, _>(has_turn_index_filter)
         .bind::<Integer, _>(turn_index)
         .bind::<Bool, _>(has_provider_filter)
-        .bind::<Text, _>(&provider)
+        .bind::<Array<Text>, _>(providers)
         .bind::<Bool, _>(has_model_filter)
-        .bind::<Text, _>(&model)
+        .bind::<Array<Text>, _>(models)
         .bind::<Bool, _>(has_event_type_filter)
         .bind::<Text, _>(&event_type)
         .bind::<BigInt, _>(filters.limit)
@@ -347,20 +352,7 @@ pub fn session_timeline(
     user_id: Uuid,
     session_pk: Uuid,
 ) -> Result<SessionTimelineResponse, AppError> {
-    // Timeline views include prompt/response text, so they are always limited
-    // to the owner.
-    let session = agent_sessions::table
-        .filter(agent_sessions::id.eq(session_pk))
-        .filter(agent_sessions::user_id.eq(user_id))
-        .first::<AgentSession>(connection)
-        .optional()?
-        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
-    touch_session_metadata(&session);
-
-    let turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session.id))
-        .order(agent_turns::turn_index.asc())
-        .load::<AgentTurn>(connection)?;
+    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
 
     let mut events = llm_usage_events::table
         .filter(llm_usage_events::session_pk.eq(session.id))
@@ -386,7 +378,144 @@ pub fn session_timeline(
                 attachments_by_event.remove(&event_pk).unwrap_or_default(),
             ));
     }
+    let mut timeline = assemble_timeline(session, turns, events_by_turn);
+    session_titles::fill(connection, &mut timeline.session)?;
+    Ok(timeline)
+}
 
+type OutlineRow = (
+    Uuid,
+    String,
+    Uuid,
+    i32,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    bool,
+    DateTime<Utc>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Loads one owner-scoped session timeline without event content bodies.
+pub fn session_outline(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<SessionOutlineResponse, AppError> {
+    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
+    // Only fixed-size columns and SQL-computed summaries are selected, so the
+    // outline stays small no matter how large event text or metadata grows.
+    let rows = llm_usage_events::table
+        .filter(llm_usage_events::session_pk.eq(session.id))
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::event_id,
+            llm_usage_events::turn_pk,
+            llm_usage_events::turn_index,
+            llm_usage_events::llm_provider,
+            llm_usage_events::llm_model,
+            llm_usage_events::event_type,
+            llm_usage_events::input_tokens,
+            llm_usage_events::output_tokens,
+            llm_usage_events::cache_read_tokens,
+            llm_usage_events::cache_write_tokens,
+            llm_usage_events::reasoning_tokens,
+            llm_usage_events::total_tokens,
+            sql::<Bool>("coalesce(metadata -> 'token_usage_estimated' = 'true'::jsonb, false)"),
+            llm_usage_events::observed_at,
+            sql::<BigInt>("coalesce(char_length(text), 0)::bigint"),
+            sql::<Nullable<Text>>(&format!(
+                "CASE WHEN event_type = 'request' THEN right(text, {OUTLINE_PREVIEW_CHARS}) \
+                 ELSE left(text, {OUTLINE_PREVIEW_CHARS}) END"
+            )),
+            sql::<Nullable<Text>>(
+                "CASE WHEN jsonb_typeof(metadata -> 'response_id') = 'string' \
+                 THEN metadata ->> 'response_id' END",
+            ),
+            sql::<Nullable<Text>>(
+                "CASE WHEN jsonb_typeof(metadata -> 'previous_response_id') = 'string' \
+                 THEN metadata ->> 'previous_response_id' END",
+            ),
+        ))
+        .load::<OutlineRow>(connection)?;
+    let event_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+    let attachment_counts = llm_usage_event_attachments::table
+        .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
+        .group_by(llm_usage_event_attachments::event_pk)
+        .select((llm_usage_event_attachments::event_pk, count_star()))
+        .load::<(Uuid, i64)>(connection)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let mut events = rows
+        .into_iter()
+        .map(|row| UsageEventOutline {
+            id: row.0,
+            event_id: row.1,
+            turn_pk: row.2,
+            turn_index: row.3,
+            llm_provider: row.4,
+            llm_model: row.5,
+            event_type: row.6,
+            input_tokens: row.7,
+            output_tokens: row.8,
+            cache_read_tokens: row.9,
+            cache_write_tokens: row.10,
+            reasoning_tokens: row.11,
+            total_tokens: row.12,
+            token_usage_estimated: row.13,
+            observed_at: row.14,
+            text_chars: row.15,
+            preview: row.16,
+            attachment_count: attachment_counts.get(&row.0).copied().unwrap_or(0),
+            ordering_metadata: UsageEventOutline::ordering_metadata(row.17, row.18),
+        })
+        .collect::<Vec<_>>();
+    UsageEventTimelineOrder::sort(&mut events);
+    let mut events_by_turn: HashMap<Uuid, Vec<UsageEventOutline>> = HashMap::new();
+    for event in events {
+        events_by_turn.entry(event.turn_pk).or_default().push(event);
+    }
+    let mut timeline = assemble_timeline(session, turns, events_by_turn);
+    session_titles::fill(connection, &mut timeline.session)?;
+    Ok(timeline)
+}
+
+fn load_session_turns(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<(AgentSession, Vec<AgentTurn>), AppError> {
+    // Timeline views include prompt/response text, so they are always limited
+    // to the owner.
+    let session = agent_sessions::table
+        .filter(agent_sessions::id.eq(session_pk))
+        .filter(agent_sessions::user_id.eq(user_id))
+        .first::<AgentSession>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
+    touch_session_metadata(&session);
+
+    let turns = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session.id))
+        .order(agent_turns::turn_index.asc())
+        .load::<AgentTurn>(connection)?;
+    Ok((session, turns))
+}
+
+fn assemble_timeline<E>(
+    session: AgentSession,
+    turns: Vec<AgentTurn>,
+    mut events_by_turn: HashMap<Uuid, Vec<E>>,
+) -> SessionTimelineResponse<E> {
     let turn_timelines = turns
         .into_iter()
         .map(|turn| {
@@ -401,7 +530,7 @@ pub fn session_timeline(
         })
         .collect();
 
-    Ok(SessionTimelineResponse {
+    SessionTimelineResponse {
         session: SessionInfo {
             session_pk: session.id,
             user_id: session.user_id,
@@ -412,9 +541,12 @@ pub fn session_timeline(
             started_at: session.started_at,
             ended_at: session.ended_at,
             metadata: session.metadata,
+            title: None,
+            purpose: None,
+            parent_session_pk: None,
         },
         turns: turn_timelines,
-    })
+    }
 }
 
 /// Returns one newest-first page of raw owner-scoped events.
@@ -437,16 +569,17 @@ pub fn raw_events(
             from: query.from,
             to: query.to,
             user_filter: None,
-            agent_name: query.agent_name.as_deref(),
-            session_id: query.session_id.as_deref(),
+            agent_names: &query.agent_name,
+            session_ids: &query.session_id,
             session_pk: query.session_pk,
             turn_index: query.turn_index,
-            llm_provider: query.llm_provider.as_deref(),
-            llm_model: query.llm_model.as_deref(),
+            llm_providers: &query.llm_provider,
+            llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
             limit: page_size.saturating_add(1_i64),
             offset,
         },
+        query.includes_content(),
     )?;
     // Fetch one sentinel row beyond the requested page so no count query is
     // needed merely to determine whether a next offset exists.
@@ -455,7 +588,11 @@ pub fn raw_events(
         events.truncate(page_size_usize);
     }
     let device_contexts = load_device_contexts_for_events(connection, &events)?;
-    let mut attachments_by_event = load_attachments_for_events(connection, &events)?;
+    let mut attachments_by_event = if query.includes_content() {
+        load_attachments_for_events(connection, &events)?
+    } else {
+        HashMap::new()
+    };
 
     Ok(RawEventsResponse {
         events: events
@@ -472,6 +609,33 @@ pub fn raw_events(
             .collect(),
         next_page_token: has_next_page.then(|| offset.saturating_add(page_size).to_string()),
     })
+}
+
+/// Loads one owner-scoped event with the same shape used by timelines.
+pub fn usage_event(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+) -> Result<UsageEventResponse, AppError> {
+    // Event content can contain sensitive conversation context. Keep this
+    // endpoint scoped to the deployment owner.
+    let event = llm_usage_events::table
+        .filter(llm_usage_events::id.eq(event_pk))
+        .filter(llm_usage_events::user_id.eq(user_id))
+        .first::<UsageEvent>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("usage event not found: {event_pk}")))?;
+    let events = [event];
+    let device_contexts = load_device_contexts_for_events(connection, &events)?;
+    let mut attachments_by_event = load_attachments_for_events(connection, &events)?;
+    let [event] = events;
+    let event_pk = event.id;
+    let device_context_id = event.device_context_id;
+    Ok(event_response(
+        event,
+        device_contexts.get(&device_context_id),
+        attachments_by_event.remove(&event_pk).unwrap_or_default(),
+    ))
 }
 
 /// Loads authorized attachment bytes and verifies persisted size metadata.
@@ -540,7 +704,7 @@ fn ingest_one_event(
             now,
         },
     )?;
-    let turn_index = resolve_turn_index(connection, session.id, event)?;
+    let turn_index = resolve_turn_index(connection, session.id, event, &agent_name, observed_at)?;
     let turn = upsert_turn(
         connection,
         user_id,
@@ -563,7 +727,7 @@ fn ingest_one_event(
             session_pk: session.id,
             turn_pk: turn.id,
             event_id: normalize_text(&event.event_id),
-            agent_name,
+            agent_name: agent_name.clone(),
             agent_version,
             session_id: normalize_text(&event.session_id),
             turn_index,
@@ -589,23 +753,7 @@ fn ingest_one_event(
     // Child rows are written only for a newly inserted event. A replay must not
     // replace the attachments associated with the original idempotency key.
     if inserted == 1 && !attachments.is_empty() {
-        let attachment_rows = attachments
-            .into_iter()
-            .map(|attachment| NewUsageEventAttachment {
-                id: Uuid::now_v7(),
-                user_id,
-                event_pk: usage_event_id,
-                position: attachment.position,
-                media_type: attachment.media_type.as_str().to_owned(),
-                byte_size: attachment.byte_size,
-                sha256: attachment.sha256,
-                content: attachment.content,
-                created_at: now,
-            })
-            .collect::<Vec<_>>();
-        diesel::insert_into(llm_usage_event_attachments::table)
-            .values(&attachment_rows)
-            .execute(connection)?;
+        insert_attachments(connection, user_id, usage_event_id, attachments, now)?;
     }
 
     // The enclosing transaction commits the event and its projection task
@@ -618,9 +766,47 @@ fn ingest_one_event(
                 created_at: now,
             })
             .execute(connection)?;
+        session_titles::capture(
+            connection,
+            &session_titles::CapturedEvent {
+                user_id,
+                session_pk: session.id,
+                event_pk: usage_event_id,
+                event_type: event.event_type.as_str(),
+                metadata: &event.metadata,
+                observed_at,
+            },
+        )?;
     }
 
     Ok(inserted == 1)
+}
+
+fn insert_attachments(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+    attachments: Vec<ValidatedImageAttachment>,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let attachment_rows = attachments
+        .into_iter()
+        .map(|attachment| NewUsageEventAttachment {
+            id: Uuid::now_v7(),
+            user_id,
+            event_pk,
+            position: attachment.position,
+            media_type: attachment.media_type.as_str().to_owned(),
+            byte_size: attachment.byte_size,
+            sha256: attachment.sha256,
+            content: attachment.content,
+            created_at: now,
+        })
+        .collect::<Vec<_>>();
+    diesel::insert_into(llm_usage_event_attachments::table)
+        .values(&attachment_rows)
+        .execute(connection)?;
+    Ok(())
 }
 
 fn upsert_device(
@@ -712,20 +898,76 @@ fn resolve_turn_index(
     connection: &mut PgConnection,
     session_pk: Uuid,
     event: &IngestUsageEvent,
+    agent_name: &str,
+    observed_at: DateTime<Utc>,
 ) -> Result<i32, AppError> {
-    // Older collectors without a stable provider identity retain their supplied
-    // index. Newer evidence lets restarted collectors avoid merging new work
-    // into an already-used local turn number.
-    let Some(identity) = turn_identity(event) else {
-        return Ok(event.turn_index);
-    };
-    let existing_turn_index = existing_turn_index_for_identity(connection, session_pk, &identity)?;
-    let next_turn_index = next_session_turn_index(connection, session_pk)?;
-    Ok(choose_turn_index(
-        event.turn_index,
-        existing_turn_index,
-        next_turn_index,
-    ))
+    if let Some(attachment) = session_turn_attachment(agent_name, &event.metadata)
+        && let Some(turn_index) =
+            attached_turn_index(connection, session_pk, &attachment, observed_at)?
+    {
+        return Ok(turn_index);
+    }
+    // Events of one turn share its identity; an event without any identity
+    // is a turn of its own.
+    if let Some(identity) = turn_identity(event)
+        && let Some(existing) = existing_turn_index_for_identity(connection, session_pk, &identity)?
+    {
+        return Ok(existing);
+    }
+    next_session_turn_index(connection, session_pk)
+}
+
+/// Finds the stored turn a Claude Code side or subagent request belongs to;
+/// `None` only when the session has no turn yet.
+fn attached_turn_index(
+    connection: &mut PgConnection,
+    session_pk: Uuid,
+    attachment: &SessionTurnAttachment,
+    observed_at: DateTime<Utc>,
+) -> Result<Option<i32>, AppError> {
+    if let Some(prompt_id) = &attachment.prompt_id {
+        // Only main-loop events anchor a prompt, and each prompt id belongs to
+        // one turn. Walking the session index from its latest turn usually
+        // stops within the current turn instead of detoasting every megabyte
+        // metadata row of the session.
+        let prompt_turn = sql_query(
+            "SELECT turn_index \
+             FROM llm_usage_events \
+             WHERE session_pk = $1 \
+               AND metadata->'claude_code_billing'->>'cc_prompt_id' = $2 \
+               AND metadata->>'claude_turn_id' IS NOT NULL \
+             ORDER BY turn_index DESC, observed_at DESC \
+             LIMIT 1",
+        )
+        .bind::<SqlUuid, _>(session_pk)
+        .bind::<Text, _>(prompt_id)
+        .get_result::<TurnIndexRow>(connection)
+        .optional()?;
+        if let Some(row) = prompt_turn {
+            return Ok(Some(row.turn_index));
+        }
+    }
+    // Events may arrive out of order, so the observation time picks the turn.
+    let preceding = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session_pk))
+        .filter(agent_turns::started_at.le(observed_at))
+        .order_by((
+            agent_turns::started_at.desc(),
+            agent_turns::turn_index.desc(),
+        ))
+        .select(agent_turns::turn_index)
+        .first::<i32>(connection)
+        .optional()?;
+    if preceding.is_some() {
+        return Ok(preceding);
+    }
+    agent_turns::table
+        .filter(agent_turns::session_pk.eq(session_pk))
+        .order_by((agent_turns::started_at.asc(), agent_turns::turn_index.asc()))
+        .select(agent_turns::turn_index)
+        .first::<i32>(connection)
+        .optional()
+        .map_err(AppError::from)
 }
 
 fn existing_turn_index_for_identity(
@@ -748,6 +990,16 @@ fn existing_turn_index_for_identity(
             "SELECT turn_index \
              FROM llm_usage_events \
              WHERE session_pk = $1 AND metadata->>'claude_turn_id' = $2 \
+             ORDER BY observed_at ASC \
+             LIMIT 1",
+        )
+        .bind::<SqlUuid, _>(session_pk)
+        .bind::<Text, _>(&identity.value)
+        .get_result::<TurnIndexRow>(connection),
+        TurnIdentityKind::TurnId => sql_query(
+            "SELECT turn_index \
+             FROM llm_usage_events \
+             WHERE session_pk = $1 AND metadata->>'turn_id' = $2 \
              ORDER BY observed_at ASC \
              LIMIT 1",
         )
@@ -836,9 +1088,12 @@ fn upsert_turn(
         .map_err(AppError::from)
 }
 
+/// Loads matching events newest first. Without content, text and metadata are
+/// not read: they hold whole request bodies, and an event list never shows them.
 fn load_filtered_events(
     connection: &mut PgConnection,
     filters: &EventFilters<'_>,
+    include_content: bool,
 ) -> Result<Vec<UsageEvent>, AppError> {
     let event_type = filters
         .event_type
@@ -856,12 +1111,13 @@ fn load_filtered_events(
     if let Some(to) = filters.to {
         query = query.filter(llm_usage_events::observed_at.lt(to));
     }
-    if let Some(agent_name) = filters.agent_name.and_then(non_empty) {
-        let normalized = agent_name_filter_values(agent_name);
-        query = query.filter(llm_usage_events::agent_name.eq_any(normalized));
+    let agent_names = agent_names_filter(filters.agent_names);
+    if !agent_names.is_empty() {
+        query = query.filter(llm_usage_events::agent_name.eq_any(agent_names));
     }
-    if let Some(session_id) = filters.session_id.and_then(non_empty) {
-        query = query.filter(llm_usage_events::session_id.eq(session_id));
+    let session_ids = exact_values_filter(filters.session_ids);
+    if !session_ids.is_empty() {
+        query = query.filter(llm_usage_events::session_id.eq_any(session_ids));
     }
     if let Some(session_pk) = filters.session_pk {
         query = query.filter(llm_usage_events::session_pk.eq(session_pk));
@@ -869,21 +1125,52 @@ fn load_filtered_events(
     if let Some(turn_index) = filters.turn_index {
         query = query.filter(llm_usage_events::turn_index.eq(turn_index));
     }
-    if let Some(provider) = filters.llm_provider.and_then(non_empty) {
-        let normalized = normalize_slug(provider);
-        query = query.filter(llm_usage_events::llm_provider.eq(normalized));
+    let providers = providers_filter(filters.llm_providers);
+    if !providers.is_empty() {
+        query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
     }
-    if let Some(model) = filters.llm_model.and_then(non_empty) {
-        query = query.filter(llm_usage_events::llm_model.eq(model.trim()));
+    let models = exact_values_filter(filters.llm_models);
+    if !models.is_empty() {
+        query = query.filter(llm_usage_events::llm_model.eq_any(models));
     }
     if let Some(event_type) = event_type {
         query = query.filter(llm_usage_events::event_type.eq(event_type));
     }
 
-    query
+    let query = query
         .order(llm_usage_events::observed_at.desc())
         .limit(filters.limit)
-        .offset(filters.offset)
+        .offset(filters.offset);
+    if include_content {
+        return query.load::<UsageEvent>(connection).map_err(AppError::from);
+    }
+    query
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::user_id,
+            llm_usage_events::device_context_id,
+            llm_usage_events::session_pk,
+            llm_usage_events::turn_pk,
+            llm_usage_events::event_id,
+            llm_usage_events::agent_name,
+            llm_usage_events::agent_version,
+            llm_usage_events::session_id,
+            llm_usage_events::turn_index,
+            llm_usage_events::llm_provider,
+            llm_usage_events::llm_model,
+            llm_usage_events::event_type,
+            sql::<Nullable<Text>>("NULL"),
+            sql::<Nullable<Bytea>>("NULL"),
+            llm_usage_events::input_tokens,
+            llm_usage_events::output_tokens,
+            llm_usage_events::cache_read_tokens,
+            llm_usage_events::cache_write_tokens,
+            llm_usage_events::reasoning_tokens,
+            llm_usage_events::total_tokens,
+            llm_usage_events::observed_at,
+            sql::<Jsonb>("'{}'::jsonb"),
+            llm_usage_events::created_at,
+        ))
         .load::<UsageEvent>(connection)
         .map_err(AppError::from)
 }
@@ -1029,12 +1316,13 @@ struct EventFilters<'a> {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
     user_filter: Option<&'a str>,
-    agent_name: Option<&'a str>,
-    session_id: Option<&'a str>,
+    /// Each list matches any of its values; an empty list matches everything.
+    agent_names: &'a [String],
+    session_ids: &'a [String],
     session_pk: Option<Uuid>,
     turn_index: Option<i32>,
-    llm_provider: Option<&'a str>,
-    llm_model: Option<&'a str>,
+    llm_providers: &'a [String],
+    llm_models: &'a [String],
     event_type: Option<&'a str>,
     limit: i64,
     offset: i64,
@@ -1095,11 +1383,11 @@ struct SummarySqlFilters {
     user_filter_id: Option<Uuid>,
     user_filter_pattern: Option<String>,
     agent_names: Vec<String>,
-    session_id: Option<String>,
+    session_ids: Vec<String>,
     session_pk: Option<Uuid>,
     turn_index: Option<i32>,
-    provider: Option<String>,
-    model: Option<String>,
+    providers: Vec<String>,
+    models: Vec<String>,
     event_type: Option<String>,
 }
 
@@ -1109,20 +1397,10 @@ impl SummarySqlFilters {
         let user_filter_id = user_filter.and_then(|value| Uuid::parse_str(value).ok());
         let user_filter_pattern =
             user_filter.map(|value| format!("%{}%", escape_like_pattern(value)));
-        let agent_names = filters
-            .agent_name
-            .and_then(non_empty)
-            .map(agent_name_filter_values)
-            .unwrap_or_default();
-        let session_id = filters
-            .session_id
-            .and_then(non_empty)
-            .map(|value| value.trim().to_owned());
-        let provider = filters.llm_provider.and_then(non_empty).map(normalize_slug);
-        let model = filters
-            .llm_model
-            .and_then(non_empty)
-            .map(|value| value.trim().to_owned());
+        let agent_names = agent_names_filter(filters.agent_names);
+        let session_ids = exact_values_filter(filters.session_ids);
+        let providers = providers_filter(filters.llm_providers);
+        let models = exact_values_filter(filters.llm_models);
         let event_type = filters.event_type.map(validate_event_type).transpose()?;
 
         Ok(Self {
@@ -1132,11 +1410,11 @@ impl SummarySqlFilters {
             user_filter_id,
             user_filter_pattern,
             agent_names,
-            session_id,
+            session_ids,
             session_pk: filters.session_pk,
             turn_index: filters.turn_index,
-            provider,
-            model,
+            providers,
+            models,
             event_type,
         })
     }
@@ -1238,9 +1516,9 @@ mod tests {
 
     use super::{
         EventFilters, SummaryDimension, SummaryDimensions, SummarySqlFilters, TurnIdentityKind,
-        agent_name_filter_values, canonical_agent_name, choose_turn_index, event_response,
-        latest_optional, normalize_limit, normalize_slug, normalized_tokens, parse_group_by,
-        turn_identity_from_metadata, validate_batch, validate_event, validate_event_type,
+        canonical_agent_name, event_response, latest_optional, normalize_limit, normalize_slug,
+        normalized_tokens, parse_group_by, turn_identity_from_metadata, validate_batch,
+        validate_event_type,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::json;
@@ -1251,7 +1529,7 @@ mod tests {
         error::AppError,
         usage::{
             AgentPayload, DevicePayload, IngestEventsRequest, IngestUsageEvent, LlmPayload,
-            SummaryRow, TokenUsagePayload, UsageEventType,
+            SummaryRow, TokenUsagePayload, UsageEventType, persistence::agent_name_filter_values,
         },
     };
 
@@ -1490,12 +1768,16 @@ mod tests {
             from: Some(timestamp(2_u32, 0_u32, 0_u32)),
             to: None,
             user_filter: Some(" Alice_% "),
-            agent_name: Some("Claude Desktop"),
-            session_id: Some(" session-1 "),
+            agent_names: &["Claude Desktop".to_owned(), "codex".to_owned()],
+            session_ids: &[" session-1 ".to_owned(), "session-2".to_owned()],
             session_pk: None,
             turn_index: None,
-            llm_provider: Some("OpenAI"),
-            llm_model: Some(" gpt-5.5 "),
+            llm_providers: &["OpenAI".to_owned(), " ".to_owned()],
+            llm_models: &[
+                " gpt-5.5 ".to_owned(),
+                "gpt-5.5".to_owned(),
+                "o3".to_owned(),
+            ],
             event_type: Some(" Response "),
             limit: 50_i64,
             offset: 0_i64,
@@ -1514,30 +1796,14 @@ mod tests {
         );
         assert_eq!(
             sql_filters.agent_names,
-            vec![
-                "claude-code".to_owned(),
-                "claude".to_owned(),
-                "claude-desktop".to_owned(),
-            ]
+            ["claude", "claude-code", "claude-desktop", "codex"]
         );
-        assert_eq!(sql_filters.session_id.as_deref(), Some("session-1"));
+        assert_eq!(sql_filters.session_ids, ["session-1", "session-2"]);
         assert_eq!(sql_filters.session_pk, None);
         assert_eq!(sql_filters.turn_index, None);
-        assert_eq!(sql_filters.provider.as_deref(), Some("openai"));
-        assert_eq!(sql_filters.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(sql_filters.providers, ["openai"]);
+        assert_eq!(sql_filters.models, ["gpt-5.5", "o3"]);
         assert_eq!(sql_filters.event_type.as_deref(), Some("response"));
-    }
-
-    #[test]
-    fn validate_event_rejects_zero_turn_index() {
-        let mut event = sample_event();
-        event.turn_index = 0_i32;
-
-        let error = validate_event(&event).expect_err("zero turn_index should be invalid");
-        assert!(
-            matches!(&error, AppError::Validation(message) if message.contains("turn_index")),
-            "zero turn_index should return a validation error"
-        );
     }
 
     #[test]
@@ -1569,8 +1835,8 @@ mod tests {
 
         let tokens = normalized_tokens(&event).expect("token usage should normalize");
         assert_eq!(
-            tokens.total, 34_i64,
-            "missing total_tokens should be derived from all token components"
+            tokens.total, 29_i64,
+            "missing total_tokens should sum disjoint counters without adding reasoning twice"
         );
     }
 
@@ -1612,42 +1878,6 @@ mod tests {
         assert!(
             matches!(&error, AppError::Validation(message) if message.contains("request or response")),
             "unknown event_type should return a validation error"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_reuses_existing_provider_identity() {
-        assert_eq!(
-            choose_turn_index(9_i32, Some(1_i32), 5_i32),
-            1_i32,
-            "request and response events for the same provider response should share one turn"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_allocates_after_conflicting_restarted_counter() {
-        assert_eq!(
-            choose_turn_index(1_i32, None, 5_i32),
-            5_i32,
-            "a restarted collector must not merge a new provider response into an old turn"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_allocates_after_restarted_counter_gap() {
-        assert_eq!(
-            choose_turn_index(2_i32, None, 5_i32),
-            5_i32,
-            "a restarted collector should append even if earlier filtered turns left a gap"
-        );
-    }
-
-    #[test]
-    fn choose_turn_index_keeps_requested_gap_when_there_is_no_collision() {
-        assert_eq!(
-            choose_turn_index(4_i32, None, 2_i32),
-            4_i32,
-            "non-conflicting collector indexes should remain stable"
         );
     }
 
@@ -1867,7 +2097,6 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
             },
             session_id: "session-001".to_owned(),
-            turn_index: 1_i32,
             llm: LlmPayload {
                 provider: "OpenAI".to_owned(),
                 model: "gpt-5.5".to_owned(),

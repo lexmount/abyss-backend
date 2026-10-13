@@ -2,6 +2,8 @@
 
 mod repository;
 mod search;
+mod session_list;
+mod session_titles;
 
 use std::time::Duration;
 
@@ -17,7 +19,10 @@ use crate::{
     storage::{BoxedFuture, StorageBackend},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionTimelineResponse, SummaryQuery, SummaryResponse, attachments::StoredImageAttachment,
+        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
+        UsageEventResponse,
+        attachments::StoredImageAttachment,
+        session_list::{SessionListResponse, ValidatedSessionListQuery},
     },
 };
 
@@ -42,6 +47,8 @@ impl PostgresEsBackend {
             db::run_migrations(&pool).map_err(|error| {
                 AppError::internal(format!("run PostgreSQL migrations: {error}"))
             })?;
+            let mut connection = pool.get()?;
+            session_titles::backfill(&mut connection)?;
         }
 
         let search = config.search.as_ref().map(SearchService::new).transpose()?;
@@ -113,6 +120,17 @@ impl StorageBackend for PostgresEsBackend {
         })
     }
 
+    fn usage_event(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| repository::usage_event(connection, user_id, event_pk))
+                .await
+        })
+    }
+
     fn usage_summary(
         &self,
         user_id: Uuid,
@@ -137,6 +155,30 @@ impl StorageBackend for PostgresEsBackend {
                 repository::session_timeline(connection, user_id, session_pk)
             })
             .await
+        })
+    }
+
+    fn session_outline(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::session_outline(connection, user_id, session_pk)
+            })
+            .await
+        })
+    }
+
+    fn list_sessions(
+        &self,
+        user_id: Uuid,
+        query: ValidatedSessionListQuery,
+    ) -> BoxedFuture<'_, Result<SessionListResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| session_list::list_sessions(connection, user_id, &query))
+                .await
         })
     }
 

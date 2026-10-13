@@ -60,18 +60,11 @@ pub fn validate_event(event: &IngestUsageEvent) -> Result<(), AppError> {
     require_non_empty(&event.session_id, "session_id")?;
     require_non_empty(&event.llm.provider, "llm.provider")?;
     require_non_empty(&event.llm.model, "llm.model")?;
-    if event.turn_index < 1_i32 {
-        return Err(AppError::validation("turn_index must be >= 1".to_owned()));
-    }
     let tokens = normalized_tokens(event)?;
     if tokens.total == 0 {
         return Ok(());
     }
-    let visible_tokens = tokens
-        .input
-        .saturating_add(tokens.output)
-        .saturating_add(tokens.reasoning);
-    if tokens.total < visible_tokens {
+    if tokens.total < tokens.component_total() {
         tracing::debug!(
             event_id = %event.event_id,
             "provider total_tokens is lower than visible token components"
@@ -96,31 +89,41 @@ pub struct NormalizedTokens {
     pub total: i64,
 }
 
+impl NormalizedTokens {
+    /// Sum of the disjoint input, cache read, cache write, and output counters.
+    ///
+    /// Reasoning is a breakdown of output and is never added again.
+    pub const fn component_total(&self) -> i64 {
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.output)
+    }
+}
+
 pub fn normalized_tokens(event: &IngestUsageEvent) -> Result<NormalizedTokens, AppError> {
     let input = normalize_token(event.token_usage.input_tokens, "input_tokens")?;
     let output = normalize_token(event.token_usage.output_tokens, "output_tokens")?;
     let cache_read = normalize_token(event.token_usage.cache_read_tokens, "cache_read_tokens")?;
     let cache_write = normalize_token(event.token_usage.cache_write_tokens, "cache_write_tokens")?;
     let reasoning = normalize_token(event.token_usage.reasoning_tokens, "reasoning_tokens")?;
-    // Preserve an explicit provider total because provider accounting may not
-    // equal the visible component sum; derive only when the field is absent.
-    let total = match event.token_usage.total_tokens {
-        Some(value) => normalize_token(Some(value), "total_tokens")?,
-        None => input
-            .saturating_add(output)
-            .saturating_add(cache_read)
-            .saturating_add(cache_write)
-            .saturating_add(reasoning),
-    };
-
-    Ok(NormalizedTokens {
+    let explicit_total = event
+        .token_usage
+        .total_tokens
+        .map(|value| normalize_token(Some(value), "total_tokens"))
+        .transpose()?;
+    let mut tokens = NormalizedTokens {
         input,
         output,
         cache_read,
         cache_write,
         reasoning,
-        total,
-    })
+        total: 0,
+    };
+    // Preserve an explicit producer total; derive it from the disjoint
+    // counters only when the field is absent.
+    tokens.total = explicit_total.unwrap_or_else(|| tokens.component_total());
+    Ok(tokens)
 }
 
 fn normalize_token(value: Option<i64>, field: &str) -> Result<i64, AppError> {
@@ -206,6 +209,44 @@ pub fn agent_name_filter_values(value: &str) -> Vec<String> {
     }
 }
 
+/// Stored Agent names matching any requested Agent; empty matches every Agent.
+pub fn agent_names_filter(values: &[String]) -> Vec<String> {
+    distinct(
+        values
+            .iter()
+            .filter_map(|value| non_empty(value))
+            .flat_map(agent_name_filter_values),
+    )
+}
+
+/// Provider slugs matching any requested provider; empty matches every provider.
+pub fn providers_filter(values: &[String]) -> Vec<String> {
+    distinct(
+        values
+            .iter()
+            .filter_map(|value| non_empty(value))
+            .map(normalize_slug),
+    )
+}
+
+/// Trimmed values compared exactly, such as models or session identifiers;
+/// empty matches every value.
+pub fn exact_values_filter(values: &[String]) -> Vec<String> {
+    distinct(
+        values
+            .iter()
+            .filter_map(|value| non_empty(value))
+            .map(normalize_text),
+    )
+}
+
+fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
+    let mut values: Vec<String> = values.collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
 pub fn normalize_text(value: &str) -> String {
     value.trim().to_owned()
 }
@@ -260,6 +301,7 @@ pub struct TurnIdentity {
 pub enum TurnIdentityKind {
     CodexTurnId,
     ClaudeTurnId,
+    TurnId,
     ResponseId,
     MessageId,
     RequestHash,
@@ -270,6 +312,7 @@ impl TurnIdentityKind {
         match self {
             Self::CodexTurnId => "codex_turn_id",
             Self::ClaudeTurnId => "claude_turn_id",
+            Self::TurnId => "turn_id",
             Self::ResponseId => "response_id",
             Self::MessageId => "message_id",
             Self::RequestHash => "request_hash",
@@ -287,6 +330,7 @@ pub fn turn_identity_from_metadata(metadata: &serde_json::Value) -> Option<TurnI
     [
         TurnIdentityKind::CodexTurnId,
         TurnIdentityKind::ClaudeTurnId,
+        TurnIdentityKind::TurnId,
         TurnIdentityKind::ResponseId,
         TurnIdentityKind::MessageId,
         TurnIdentityKind::RequestHash,
@@ -294,6 +338,39 @@ pub fn turn_identity_from_metadata(metadata: &serde_json::Value) -> Option<TurnI
     .into_iter()
     .find_map(|kind| {
         metadata_string(metadata, kind.metadata_key()).map(|value| TurnIdentity { kind, value })
+    })
+}
+
+/// A Claude Code event outside the main loop: a side request (recap, title,
+/// suggestion, compaction, ...) or a subagent request. It carries no
+/// `claude_turn_id` and belongs to the session turn it occurs in.
+pub struct SessionTurnAttachment {
+    /// `cc_prompt_id` of the Claude Code billing header, shared with the
+    /// main-loop requests of the prompt a subagent works for.
+    pub prompt_id: Option<String>,
+}
+
+/// Billing-header field naming the user prompt a Claude Code request serves.
+const CLAUDE_CODE_PROMPT_ID_KEY: &str = "cc_prompt_id";
+const CLAUDE_CODE_BILLING_KEY: &str = "claude_code_billing";
+
+/// Storage resolves an attachment in order: the turn of a main-loop event with
+/// the same prompt id, the latest turn started at or before the event, the
+/// earliest turn, and only for a session without turns a turn of its own.
+/// Other Agents and Claude Code main-loop events keep their turn identity.
+pub fn session_turn_attachment(
+    agent_name: &str,
+    metadata: &serde_json::Value,
+) -> Option<SessionTurnAttachment> {
+    if agent_name != "claude-code"
+        || metadata_string(metadata, TurnIdentityKind::ClaudeTurnId.metadata_key()).is_some()
+    {
+        return None;
+    }
+    Some(SessionTurnAttachment {
+        prompt_id: metadata
+            .get(CLAUDE_CODE_BILLING_KEY)
+            .and_then(|billing| metadata_string(billing, CLAUDE_CODE_PROMPT_ID_KEY)),
     })
 }
 
@@ -306,28 +383,13 @@ fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub const fn choose_turn_index(
-    requested_turn_index: i32,
-    existing_turn_index: Option<i32>,
-    next_turn_index: i32,
-) -> i32 {
-    if let Some(existing_turn_index) = existing_turn_index {
-        return existing_turn_index;
-    }
-    if requested_turn_index < next_turn_index {
-        next_turn_index
-    } else {
-        requested_turn_index
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        TurnIdentityKind, canonical_agent_name, choose_turn_index, escape_like_pattern,
-        parse_group_by, turn_identity_from_metadata,
+        TurnIdentityKind, canonical_agent_name, escape_like_pattern, parse_group_by,
+        session_turn_attachment, turn_identity_from_metadata,
     };
 
     #[test]
@@ -338,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_identity_and_restart_resolution_are_stable() {
+    fn agent_turn_identity_wins_over_provider_identities() {
         let identity = turn_identity_from_metadata(&json!({
             "response_id": "response",
             "codex_turn_id": "turn"
@@ -346,7 +408,30 @@ mod tests {
         .expect("turn identity should be extracted");
         assert!(matches!(identity.kind, TurnIdentityKind::CodexTurnId));
         assert_eq!(identity.value, "turn");
-        assert_eq!(choose_turn_index(1_i32, None, 4_i32), 4_i32);
-        assert_eq!(choose_turn_index(1_i32, Some(2_i32), 4_i32), 2_i32);
+        let identity = turn_identity_from_metadata(&json!({
+            "response_id": "response",
+            "turn_id": "resp_1"
+        }))
+        .expect("turn identity should be extracted");
+        assert!(matches!(identity.kind, TurnIdentityKind::TurnId));
+    }
+
+    #[test]
+    fn only_claude_code_events_without_turn_id_attach_to_a_session_turn() {
+        let billing = json!({"claude_code_billing": {"cc_prompt_id": " prompt "}});
+        let attachment = session_turn_attachment("claude-code", &billing)
+            .expect("a Claude Code side request should attach");
+        assert_eq!(attachment.prompt_id.as_deref(), Some("prompt"));
+        let side = session_turn_attachment("claude-code", &json!({"message_id": "msg"}))
+            .expect("a request without billing header should attach");
+        assert_eq!(side.prompt_id, None);
+        assert!(
+            session_turn_attachment(
+                "claude-code",
+                &json!({"claude_turn_id": "cc_turn:3", "claude_code_billing": {"cc_prompt_id": "p"}})
+            )
+            .is_none()
+        );
+        assert!(session_turn_attachment("codex", &billing).is_none());
     }
 }

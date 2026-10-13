@@ -6,6 +6,8 @@ mod models;
 mod repository;
 mod schema;
 mod search;
+mod session_list;
+mod session_titles;
 
 use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
 use uuid::Uuid;
@@ -17,7 +19,10 @@ use crate::{
     storage::{BoxedFuture, StorageBackend},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionTimelineResponse, SummaryQuery, SummaryResponse, attachments::StoredImageAttachment,
+        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
+        UsageEventResponse,
+        attachments::StoredImageAttachment,
+        session_list::{SessionListResponse, ValidatedSessionListQuery},
     },
 };
 
@@ -36,6 +41,7 @@ impl SqliteFtsBackend {
             connection::configure_database(&mut database)?;
             if config.run_migrations {
                 migrations::run(&mut database)?;
+                session_titles::backfill(&mut database)?;
             }
         }
         Ok(Self { pool })
@@ -97,6 +103,17 @@ impl StorageBackend for SqliteFtsBackend {
         })
     }
 
+    fn usage_event(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| repository::usage_event(connection, user_id, event_pk))
+                .await
+        })
+    }
+
     fn usage_summary(
         &self,
         user_id: Uuid,
@@ -121,6 +138,30 @@ impl StorageBackend for SqliteFtsBackend {
                 repository::session_timeline(connection, user_id, session_pk)
             })
             .await
+        })
+    }
+
+    fn session_outline(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::session_outline(connection, user_id, session_pk)
+            })
+            .await
+        })
+    }
+
+    fn list_sessions(
+        &self,
+        user_id: Uuid,
+        query: ValidatedSessionListQuery,
+    ) -> BoxedFuture<'_, Result<SessionListResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| session_list::list_sessions(connection, user_id, &query))
+                .await
         })
     }
 
