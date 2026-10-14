@@ -10,9 +10,11 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::{
-    ExpressionMethods, PgConnection, QueryDsl, QueryableByName, RunQueryDsl, SelectableHelper,
+    ExpressionMethods, IntoSql, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
+    SelectableHelper,
+    dsl::{exists, not},
     sql_query,
-    sql_types::{BigInt, Bool, Integer, Text, Uuid as SqlUuid},
+    sql_types::{BigInt, Integer, Text, Uuid as SqlUuid},
 };
 use uuid::Uuid;
 
@@ -68,42 +70,45 @@ impl SearchOutboxRepository {
         connection: &mut PgConnection,
         batch_size: i64,
     ) -> Result<bool, AppError> {
+        let queued_upsert = search_outbox::table
+            .filter(search_outbox::event_pk.eq(llm_usage_events::id))
+            .filter(search_outbox::operation.eq("upsert"))
+            .select(search_outbox::id);
         // The unique (event_pk, operation) constraint makes every backfill pass
         // idempotent and allows startup by multiple replicas.
-        let queued = sql_query(
-            "INSERT INTO search_outbox (event_pk, user_id, operation, created_at) \
-             SELECT source.id, source.user_id, 'upsert', source.created_at \
-             FROM llm_usage_events AS source \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM search_outbox AS queued \
-                 WHERE queued.event_pk = source.id \
-                   AND queued.operation = 'upsert'\
-             ) \
-             ORDER BY source.id \
-             LIMIT $1 \
-             ON CONFLICT (event_pk, operation) DO NOTHING",
-        )
-        .bind::<BigInt, _>(batch_size)
-        .execute(connection)?;
+        let queued = diesel::insert_into(search_outbox::table)
+            .values(
+                llm_usage_events::table
+                    .filter(not(exists(queued_upsert)))
+                    .order(llm_usage_events::id)
+                    .limit(batch_size)
+                    .select((
+                        llm_usage_events::id,
+                        llm_usage_events::user_id,
+                        "upsert".into_sql::<Text>(),
+                        llm_usage_events::created_at,
+                    )),
+            )
+            .into_columns((
+                search_outbox::event_pk,
+                search_outbox::user_id,
+                search_outbox::operation,
+                search_outbox::created_at,
+            ))
+            .on_conflict((search_outbox::event_pk, search_outbox::operation))
+            .do_nothing()
+            .execute(connection)?;
         if i64::try_from(queued).unwrap_or(i64::MAX) >= batch_size {
             return Ok(false);
         }
 
-        let state = sql_query(
-            "SELECT NOT EXISTS (\
-                 SELECT 1 \
-                 FROM llm_usage_events AS source \
-                 WHERE NOT EXISTS (\
-                     SELECT 1 \
-                     FROM search_outbox AS queued \
-                     WHERE queued.event_pk = source.id \
-                       AND queued.operation = 'upsert'\
-                 )\
-             ) AS complete",
-        )
-        .get_result::<RawBackfillState>(connection)?;
-        Ok(state.complete)
+        diesel::select(not(exists(
+            llm_usage_events::table
+                .filter(not(exists(queued_upsert)))
+                .select(llm_usage_events::id),
+        )))
+        .get_result::<bool>(connection)
+        .map_err(AppError::from)
     }
 
     /// Leases pending rows and resolves their source events into bulk operations.
@@ -311,12 +316,6 @@ struct RawClaimedOutboxTask {
     operation: String,
     #[diesel(sql_type = Integer)]
     attempt_count: i32,
-}
-
-#[derive(QueryableByName)]
-struct RawBackfillState {
-    #[diesel(sql_type = Bool)]
-    complete: bool,
 }
 
 fn retry_delay(attempt_count: i32) -> i64 {
