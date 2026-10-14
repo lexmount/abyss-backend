@@ -7,15 +7,12 @@ use super::{HIGHLIGHT_END, HIGHLIGHT_START};
 pub const MAX_CONTENT_CHARACTERS: usize = 1_000_000;
 const MAX_METADATA_FIELD_CHARACTERS: usize = 100_000;
 const MAX_EXTRACTED_VALUES: usize = 64;
-const MAX_JSON_DEPTH: usize = 8;
 
 /// Searchable values derived from one source usage event.
 pub struct SearchProjection {
     pub content: Option<String>,
     pub tool_names: Vec<String>,
     pub tool_content: Vec<String>,
-    pub commands: Vec<String>,
-    pub file_paths: Vec<String>,
 }
 
 impl SearchProjection {
@@ -27,8 +24,6 @@ impl SearchProjection {
                 .map(|value| truncate_characters(value, MAX_CONTENT_CHARACTERS)),
             tool_names: extracted.tool_names,
             tool_content: extracted.tool_content,
-            commands: extracted.commands,
-            file_paths: extracted.file_paths,
         }
     }
 }
@@ -36,8 +31,6 @@ impl SearchProjection {
 struct SearchableMetadata {
     tool_names: Vec<String>,
     tool_content: Vec<String>,
-    commands: Vec<String>,
-    file_paths: Vec<String>,
 }
 
 impl SearchableMetadata {
@@ -45,13 +38,7 @@ impl SearchableMetadata {
         let mut extracted = Self {
             tool_names: Vec::new(),
             tool_content: Vec::new(),
-            commands: Vec::new(),
-            file_paths: Vec::new(),
         };
-
-        if let Some(working_directory) = metadata.get("working_directory").and_then(Value::as_str) {
-            extracted.push_file_path(working_directory);
-        }
 
         // Ignore every other top-level key so headers, credentials, and image
         // data never enter a derived full-text index.
@@ -69,9 +56,6 @@ impl SearchableMetadata {
                     }
                     if let Some(input) = object.get("input").and_then(Value::as_str) {
                         push_bounded(&mut extracted.tool_content, input);
-                        if let Ok(value) = serde_json::from_str::<Value>(input) {
-                            extracted.extract_structured_input(&value, MAX_JSON_DEPTH);
-                        }
                     }
                 }
                 Some("tool_result") => {
@@ -83,36 +67,6 @@ impl SearchableMetadata {
             }
         }
         extracted
-    }
-
-    fn extract_structured_input(&mut self, value: &Value, remaining_depth: usize) {
-        if remaining_depth == 0 {
-            return;
-        }
-        match value {
-            Value::Object(object) => {
-                for (key, child) in object.iter().take(MAX_EXTRACTED_VALUES) {
-                    if let Some(text) = child.as_str() {
-                        match key.as_str() {
-                            "command" | "cmd" => push_bounded(&mut self.commands, text),
-                            "file" | "file_path" | "path" => self.push_file_path(text),
-                            _ => {}
-                        }
-                    }
-                    self.extract_structured_input(child, remaining_depth.saturating_sub(1));
-                }
-            }
-            Value::Array(items) => {
-                for item in items.iter().take(MAX_EXTRACTED_VALUES) {
-                    self.extract_structured_input(item, remaining_depth.saturating_sub(1));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn push_file_path(&mut self, value: &str) {
-        push_bounded(&mut self.file_paths, value);
     }
 }
 

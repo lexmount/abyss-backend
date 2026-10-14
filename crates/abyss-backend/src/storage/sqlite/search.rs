@@ -18,7 +18,6 @@ use crate::{
         HIGHLIGHT_END, HIGHLIGHT_START, SearchFragment, SessionSearchMatch, SessionSearchQuery,
         SessionSearchResponse, SessionSearchResult, ValidatedSearchQuery,
     },
-    usage::persistence::canonical_agent_name,
 };
 
 use super::{
@@ -75,7 +74,7 @@ fn search(
             Some(SessionSearchResult {
                 session_pk,
                 session_id: details.session_id,
-                agent_name: canonical_agent_name(&details.agent_name),
+                agent_name: details.agent_name,
                 agent_version: details.agent_version,
                 host_name: details.host_name,
                 platform: details.platform,
@@ -381,10 +380,6 @@ fn load_matches(
              top.observed_at AS observed_at,
              snippet(usage_events_fts, 4, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
                  AS content_fragment,
-             snippet(usage_events_fts, 7, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
-                 AS command_fragment,
-             snippet(usage_events_fts, 8, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
-                 AS path_fragment,
              snippet(usage_events_fts, 5, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
                  AS tool_name_fragment,
              snippet(usage_events_fts, 6, '{HIGHLIGHT_START}', '{HIGHLIGHT_END}', '…', 32)
@@ -429,10 +424,6 @@ struct MatchedEventRow {
     #[diesel(sql_type = Nullable<Text>)]
     content_fragment: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
-    command_fragment: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    path_fragment: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
     tool_name_fragment: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     tool_content_fragment: Option<String>,
@@ -442,8 +433,6 @@ impl MatchedEventRow {
     fn into_matched(self) -> Result<MatchedEvent, AppError> {
         let fragments = [
             self.content_fragment,
-            self.command_fragment,
-            self.path_fragment,
             self.tool_name_fragment,
             self.tool_content_fragment,
         ]
@@ -615,7 +604,7 @@ mod tests {
             "llm": {"provider": "openai", "model": "gpt-5"},
             "event_type": "response",
             "text": text,
-            "token_usage": {"output_tokens": 1},
+            "token_usage": {"input_tokens": 0_i64, "output_tokens": 1_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 1_i64},
             "metadata": {}
         })
     }

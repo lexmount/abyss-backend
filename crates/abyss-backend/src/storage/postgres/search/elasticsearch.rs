@@ -246,7 +246,7 @@ pub struct MatchedEvent {
     pub turn_index: i32,
     /// Request or response side.
     pub event_type: String,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -300,9 +300,7 @@ fn index_definition() -> Value {
                 "observed_at": {"type": "date"},
                 "content": {"type": "text"},
                 "tool_names": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
-                "tool_content": {"type": "text"},
-                "commands": {"type": "text"},
-                "file_paths": {"type": "text"}
+                "tool_content": {"type": "text"}
             }
         }
     })
@@ -341,8 +339,6 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
                         "fields": [
                             "content^4",
                             "session_id^3",
-                            "commands^3",
-                            "file_paths^3",
                             "tool_names^2",
                             "tool_content"
                         ],
@@ -375,8 +371,6 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
                     "number_of_fragments": 2,
                     "fields": {
                         "content": {},
-                        "commands": {},
-                        "file_paths": {},
                         "tool_names": {},
                         "tool_content": {}
                     }
@@ -603,17 +597,11 @@ impl TryFrom<RawSearchResponse> for SearchMatchPage {
 }
 
 fn ordered_fragments(highlights: &HashMap<String, Vec<String>>) -> Vec<String> {
-    [
-        "content",
-        "commands",
-        "file_paths",
-        "tool_names",
-        "tool_content",
-    ]
-    .into_iter()
-    .flat_map(|field| highlights.get(field).into_iter().flatten().cloned())
-    .take(2)
-    .collect()
+    ["content", "tool_names", "tool_content"]
+        .into_iter()
+        .flat_map(|field| highlights.get(field).into_iter().flatten().cloned())
+        .take(2)
+        .collect()
 }
 
 #[cfg(test)]
