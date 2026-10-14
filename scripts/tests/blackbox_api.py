@@ -69,6 +69,24 @@ def require_status(response: HttpResponse, expected: int, context: str) -> None:
     )
 
 
+def token_usage(
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    reasoning_tokens: int = 0,
+) -> dict[str, int]:
+    """AgentEvent token counters; the total is the sum of the disjoint four."""
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": input_tokens + output_tokens + cache_read_tokens + cache_write_tokens,
+    }
+
+
 def event(
     event_id: str,
     session_id: str,
@@ -85,19 +103,15 @@ def event(
             "platform": "linux",
             "os_version": "blackbox",
         },
-        "agent": {"name": "Codex", "version": "blackbox"},
+        "agent": {"name": "codex", "version": "blackbox"},
         "session_id": session_id,
-        "turn_index": 1,
-        "llm": {"provider": "OpenAI", "model": "gpt-5.5"},
+        "stream_id": f"stream-{run_id}",
+        "response_id": f"response-{run_id}",
+        "llm": {"provider": "openai", "model": "gpt-5.5"},
         "event_type": event_type,
         "text": text,
         "token_usage": token_usage,
-        "metadata": {
-            "test_run": run_id,
-            "response_id": f"response-{run_id}",
-            "previous_response_id": None,
-            "provider_call_index": 1,
-        },
+        "metadata": {"test_run": run_id},
     }
     if event_type == "request":
         value["attachments"] = [
@@ -136,7 +150,7 @@ def run(base_url: str, token: str, run_id: str) -> None:
                 session_id,
                 "request",
                 "blackbox request",
-                {"input_tokens": 12, "cache_read_tokens": 3},
+                token_usage(input_tokens=12, cache_read_tokens=3),
                 run_id,
             ),
             event(
@@ -144,7 +158,7 @@ def run(base_url: str, token: str, run_id: str) -> None:
                 session_id,
                 "response",
                 "blackbox response",
-                {"output_tokens": 21, "reasoning_tokens": 4, "total_tokens": 25},
+                token_usage(output_tokens=21, reasoning_tokens=4),
                 run_id,
             ),
         ],
@@ -215,6 +229,15 @@ def run(base_url: str, token: str, run_id: str) -> None:
         IMAGE_BASE64.encode() not in raw_response.body,
         "raw event responses must not expose attachment content",
     )
+    require(
+        all(
+            item.get("stream_id") == f"stream-{run_id}"
+            and item.get("response_id") == f"response-{run_id}"
+            and item.get("previous_response_id") is None
+            for item in raw_events
+        ),
+        "events must return the exchange identities they were ingested with",
+    )
 
     # The list projection carries what an event list shows and no content.
     list_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
@@ -273,10 +296,10 @@ def run(base_url: str, token: str, run_id: str) -> None:
     require(len(rows) == 1, "usage summary must contain one aggregate row")
     summary = rows[0]
     require(summary["user_id"] == OWNER_ID, "summary must belong to the owner")
-    require(summary["agent_name"] == "codex", "summary must normalize Agent names")
-    require(summary["llm_provider"] == "openai", "summary must normalize providers")
+    require(summary["agent_name"] == "codex", "summary must report the Agent name as received")
+    require(summary["llm_provider"] == "openai", "summary must report the provider as received")
     require(summary["requests"] == 1 and summary["responses"] == 1, "summary event counts are incorrect")
-    require(summary["total_tokens"] == 40, "summary token total is incorrect")
+    require(summary["total_tokens"] == 36, "summary token total is incorrect")
 
     # Repeating a filter key matches any of its values; filters still combine
     # with each other.
@@ -286,9 +309,9 @@ def run(base_url: str, token: str, run_id: str) -> None:
             ("session_id", other_session_id),
             ("session_id", session_id),
             ("agent_name", "claude-code"),
-            ("agent_name", "Codex"),
+            ("agent_name", "codex"),
             ("llm_provider", "anthropic"),
-            ("llm_provider", "OpenAI"),
+            ("llm_provider", "openai"),
             ("llm_model", "gpt-5.5"),
             ("llm_model", "absent-model"),
             ("limit", 10),
@@ -299,6 +322,27 @@ def run(base_url: str, token: str, run_id: str) -> None:
     require(
         len(any_of_response.json()["events"]) == 2,
         "repeated filter values must match any of the values",
+    )
+    # Agent names match exactly as reported: no case folding or aliases.
+    for agent in ["Codex", "claude-desktop"]:
+        exact_agent_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
+            [("session_id", session_id), ("agent_name", agent)]
+        )
+        exact_agent_response = request(base_url, "GET", exact_agent_path, token=token)
+        require_status(exact_agent_response, 200, "raw event query with another Agent")
+        require(
+            exact_agent_response.json()["events"] == [],
+            f"agent_name={agent} must not match codex events",
+        )
+    # Providers also match exactly as reported.
+    folded_provider_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
+        [("session_id", session_id), ("llm_provider", "OpenAI")]
+    )
+    folded_provider_response = request(base_url, "GET", folded_provider_path, token=token)
+    require_status(folded_provider_response, 200, "raw event query with a case-folded provider")
+    require(
+        folded_provider_response.json()["events"] == [],
+        "llm_provider=OpenAI must not match the reported openai",
     )
     none_of_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
         [("session_id", session_id), ("llm_model", "absent-model"), ("llm_model", "other-model")]
@@ -322,7 +366,7 @@ def run(base_url: str, token: str, run_id: str) -> None:
     require_status(any_of_summary, 200, "usage summary with repeated filters")
     any_of_rows = any_of_summary.json()["rows"]
     require(
-        [(row["llm_model"], row["total_tokens"]) for row in any_of_rows] == [("gpt-5.5", 40)],
+        [(row["llm_model"], row["total_tokens"]) for row in any_of_rows] == [("gpt-5.5", 36)],
         "summary must aggregate every repeated filter value",
     )
     any_of_sessions_path = "/v1/agent-usage/sessions?" + urllib.parse.urlencode(
@@ -492,9 +536,9 @@ def run(base_url: str, token: str, run_id: str) -> None:
 
     run_title_contract(base_url, token, run_id)
 
-    from claude_turns_api import run_claude_turn_contract
+    from turns_api import run_turn_contract
 
-    run_claude_turn_contract(base_url, token, run_id)
+    run_turn_contract(base_url, token, run_id)
     print(f"blackbox API contract passed for {session_id}")
 
 

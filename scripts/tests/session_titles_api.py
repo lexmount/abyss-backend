@@ -4,7 +4,7 @@ import json
 import urllib.parse
 import uuid
 
-from blackbox_api import event, request, require, require_status
+from blackbox_api import event, request, require, require_status, token_usage
 
 
 PROMPT = "Draw a pelican riding a bicycle"
@@ -12,17 +12,18 @@ CODEX_NAMING = "Generate a concise, single-line task title\nUser prompt:\n" + PR
 
 
 def run_title_contract(base_url: str, token: str, run_id: str) -> None:
-    def make(session, kind, text, *, source="user", agent="codex", metadata=None):
-        value = event(str(uuid.uuid4()), f"{run_id}-{session}", kind, text, {}, run_id)
+    def make(session, kind, text, *, naming_thread=False, agent="codex", metadata=None):
+        value = event(str(uuid.uuid4()), f"{run_id}-{session}", kind, text, token_usage(), run_id)
         value.pop("attachments", None)
         value["agent"]["name"] = agent
         value["device"]["host_name"] = f"title-contract-{run_id}"
         value["observed_at"] = "2026-09-30T00:00:01Z" if kind == "request" else "2026-09-30T00:00:02Z"
         value["metadata"] = dict(metadata or {})
+        if naming_thread:
+            value["naming_thread"] = True
         if kind == "request":
             value["metadata"]["conversation"] = {
-                "messages": [{"role": "user", "text": text}],
-                "thread_source": source, "completeness": "complete",
+                "messages": [{"role": "user", "text": text}], "completeness": "complete",
             }
         return value
 
@@ -57,12 +58,13 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
         require(value["title"] == "Build fix", f"{name}: the collector title names the session")
         require(value["purpose"] is None, f"{name}: a session naming itself is not a title thread")
 
-    # Codex: the naming thread is marked; its task keeps its first user input.
-    ingest(make("naming", "request", CODEX_NAMING, source="thread_title"),
-           make("naming", "response", '{"title":"Draw a pelican"}', source="thread_title"))
+    # A thread opened only to name another session is marked; the task keeps
+    # its first user input.
+    ingest(make("naming", "request", CODEX_NAMING, naming_thread=True),
+           make("naming", "response", '{"title":"Draw a pelican"}', naming_thread=True))
     value = session("naming")
-    require(value["purpose"] == "title_generation", "Codex naming threads are marked")
-    require(value["title"] is None and value["parent_session_pk"] is None, "Codex naming threads are not linked")
+    require(value["purpose"] == "title_generation", "naming threads are marked")
+    require(value["title"] is None and value["parent_session_pk"] is None, "naming threads are not linked")
     ingest(make("task", "request", PROMPT))
     require(session("task")["title"] == PROMPT, "Codex tasks keep their first user input")
 

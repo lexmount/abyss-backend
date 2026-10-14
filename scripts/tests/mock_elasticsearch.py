@@ -17,8 +17,6 @@ HIGHLIGHT_START = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]"
 HIGHLIGHT_END = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]"
 SEARCHABLE_FIELDS = (
     "content",
-    "commands",
-    "file_paths",
     "tool_names",
     "tool_content",
     "session_id",
