@@ -7,7 +7,7 @@
 
 mod conversation;
 
-use conversation::ConversationProjection;
+use conversation::{ConversationProjection, Placement};
 
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
@@ -21,15 +21,9 @@ use uuid::Uuid;
 
 use super::{SessionInfo, SessionTimelineResponse, UsageEventResponse};
 
-/// Collectors join request fragments with this separator.
-const PARAGRAPH_SEPARATOR: &str = "\n\n";
-/// Codex opens the request that asks the model for a context handoff summary
-/// with this prompt when it compacts its context.
-const COMPACTION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION.";
-/// Codex opens the compacted history it sends afterwards with this sentence,
-/// followed by the handoff summary.
-const COMPACTION_HANDOFF: &str = "Another language model started to solve this problem and \
-                                  produced a summary of its thinking process.";
+/// Purpose the collector declares on both events of a call that asks the
+/// model to summarize the conversation so far.
+const COMPACTION_PURPOSE: &str = "compaction";
 
 #[derive(Debug, Serialize)]
 /// Session information and its merged, de-duplicated trajectory items.
@@ -67,20 +61,12 @@ pub struct TrajectoryEvent {
     pub reasoning_tokens: i64,
     /// Authoritative total for this event, counted once.
     pub total_tokens: i64,
-    /// Whether counters were reported or estimated rather than absent or hidden.
+    /// Whether any token counter is non-zero.
     pub token_usage_available: bool,
-    /// Whether the collector estimated token usage.
-    pub token_usage_estimated: bool,
 }
 
 impl From<&UsageEventResponse> for TrajectoryEvent {
     fn from(event: &UsageEventResponse) -> Self {
-        let source = event
-            .metadata
-            .get("token_usage_source")
-            .and_then(Value::as_str);
-        let hidden =
-            event.metadata.pointer("/content_policy/token_usage") == Some(&Value::Bool(false));
         let has_usage = event.input_tokens != 0
             || event.output_tokens != 0
             || event.cache_read_tokens != 0
@@ -99,11 +85,7 @@ impl From<&UsageEventResponse> for TrajectoryEvent {
             cache_write_tokens: event.cache_write_tokens,
             reasoning_tokens: event.reasoning_tokens,
             total_tokens: event.total_tokens,
-            token_usage_available: !hidden
-                && source != Some("absent")
-                && (has_usage || source.is_some()),
-            token_usage_estimated: event.metadata.get("token_usage_estimated")
-                == Some(&Value::Bool(true)),
+            token_usage_available: has_usage,
         }
     }
 }
@@ -112,20 +94,17 @@ impl From<&UsageEventResponse> for TrajectoryEvent {
 #[serde(rename_all = "snake_case")]
 /// Kind of one trajectory item.
 pub enum TrajectoryItemKind {
-    /// Request content whose message role is unavailable.
-    Request,
-    /// Explicit system or developer message.
-    Context,
-    /// Explicit user message not seen earlier in the session.
-    User,
-    /// Response text.
-    Assistant,
+    /// A conversation message not seen earlier in its stream, with the role
+    /// the collector reported.
+    Message,
+    /// Event text of an event whose conversation could not be read.
+    Text,
     /// Response tool call, with its result once one arrives.
     ToolCall,
     /// Request tool result whose call was not observed.
     ToolResult,
-    /// Context compaction: the summary prompt as `input` and the handoff
-    /// summary that replaced the earlier history as `output`.
+    /// Context compaction: the new user input of the compaction request as
+    /// `input` and the summary its response returned as `output`.
     Compaction,
 }
 
@@ -134,8 +113,10 @@ pub enum TrajectoryItemKind {
 pub struct TrajectoryItem {
     /// Item kind.
     pub kind: TrajectoryItemKind,
-    /// Zero-based request stream, keyed by system prompt. Side requests such
-    /// as classifiers or subagents form their own streams.
+    /// Role of a message item, exactly as the collector reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Zero-based stream, placed by the identities the collector declares.
     pub stream: usize,
     /// Backend-normalized turn number.
     pub turn_index: i32,
@@ -145,7 +126,7 @@ pub struct TrajectoryItem {
     pub observed_at: DateTime<Utc>,
     /// Model of that event.
     pub llm_model: String,
-    /// Text of context, user, and assistant items.
+    /// Text of message and text items.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// Whether `text` is only the new tail of a paragraph that grew.
@@ -172,30 +153,12 @@ impl TrajectoryItem {
     fn new(kind: TrajectoryItemKind, stream: usize, event: &UsageEventResponse) -> Self {
         Self {
             kind,
+            role: None,
             stream,
             turn_index: event.turn_index,
             event_pk: event.id,
             observed_at: event.observed_at,
             llm_model: event.llm_model.clone(),
-            text: None,
-            continued: false,
-            name: None,
-            call_id: None,
-            input: None,
-            output: None,
-            output_event_pk: None,
-        }
-    }
-
-    /// An empty item of another kind contributed by the same event.
-    fn sibling(&self, kind: TrajectoryItemKind) -> Self {
-        Self {
-            kind,
-            stream: self.stream,
-            turn_index: self.turn_index,
-            event_pk: self.event_pk,
-            observed_at: self.observed_at,
-            llm_model: self.llm_model.clone(),
             text: None,
             continued: false,
             name: None,
@@ -233,45 +196,37 @@ struct Merger {
     conversation: ConversationProjection,
     items: Vec<TrajectoryItem>,
     seen_results: HashSet<String>,
-    streams: HashMap<u64, usize>,
     /// Tool call item index by call identifier.
     calls: HashMap<String, usize>,
-    /// Stream of the most recent request; responses belong to it.
-    current_stream: usize,
-    /// Compaction item whose summary the next response carries.
-    pending_compaction: Option<usize>,
-    /// Handoff summaries already shown, so their replay is not shown again.
-    summaries: Vec<String>,
+    /// Compaction item index by the response id of its exchange, until the
+    /// response carrying the summary arrives.
+    compactions: HashMap<String, usize>,
 }
 
 impl Merger {
     fn request(&mut self, event: &UsageEventResponse) {
-        self.pending_compaction = None;
         let first_new = self.items.len();
-        if let Some(items) =
-            self.conversation
-                .project(event, &mut self.current_stream, &mut self.streams)
-        {
+        let placement = self.conversation.place(event);
+        if let Some(items) = self.conversation.project(event, placement) {
             self.items.extend(items);
         } else {
-            self.unclassified_request(event);
+            self.unclassified_request(event, placement);
         }
-        self.mark_compaction(first_new);
-        self.request_tools(event);
+        if is_compaction(event) {
+            self.compaction(event, placement.stream, first_new);
+        }
+        self.request_tools(event, placement.stream);
     }
 
-    fn unclassified_request(&mut self, event: &UsageEventResponse) {
+    fn unclassified_request(&mut self, event: &UsageEventResponse, placement: Placement) {
         if let Some(text) = event.text.as_ref().filter(|text| !text.is_empty()) {
-            let mut item =
-                TrajectoryItem::new(TrajectoryItemKind::Request, self.current_stream, event);
+            let mut item = TrajectoryItem::new(TrajectoryItemKind::Text, placement.stream, event);
             item.text = Some(text.clone());
             self.items.push(item);
         }
     }
 
-    fn request_tools(&mut self, event: &UsageEventResponse) {
-        let stream = self.current_stream;
-
+    fn request_tools(&mut self, event: &UsageEventResponse, stream: usize) {
         for segment in content_segments(&event.metadata) {
             if segment_str(segment, "type") != Some("tool_result") {
                 continue;
@@ -301,84 +256,50 @@ impl Merger {
         }
     }
 
-    /// Turns the compaction prompt into a compaction item and hides the
-    /// handoff summary when the compacted history replays it.
-    fn mark_compaction(&mut self, first_new: usize) {
-        for mut item in self.items.split_off(first_new) {
-            let Some(text) = item
-                .text
-                .clone()
-                .filter(|_| item.kind == TrajectoryItemKind::User)
-            else {
+    /// Merges the new user input of a compaction request into one compaction
+    /// item, which the response of the same exchange completes with its
+    /// summary.
+    fn compaction(&mut self, event: &UsageEventResponse, stream: usize, first_new: usize) {
+        let mut compaction = TrajectoryItem::new(TrajectoryItemKind::Compaction, stream, event);
+        let mut index = None;
+        let mut input = Vec::new();
+        for item in self.items.split_off(first_new) {
+            if item.role.as_deref() != Some("user") {
                 self.items.push(item);
-                continue;
-            };
-            // Legacy projections join all new paragraphs of a request, so the
-            // prompt may follow other new input in the same item.
-            if let Some(start) = paragraph_start(&text, COMPACTION_PROMPT) {
-                let (before, prompt) = text.split_at(start);
-                let mut compaction = item.sibling(TrajectoryItemKind::Compaction);
-                compaction.input = Some(prompt.trim().to_owned());
-                let before = before.trim_end();
-                if !before.is_empty() {
-                    item.text = Some(before.to_owned());
-                    self.items.push(item);
-                }
-                self.pending_compaction = Some(self.items.len());
-                self.items.push(compaction);
                 continue;
             }
-            let Some(start) = paragraph_start(&text, COMPACTION_HANDOFF) else {
-                self.items.push(item);
-                continue;
-            };
-            let (before, handoff) = text.split_at(start);
-            let before = before.trim_end();
-            let replayed = self
-                .summaries
-                .iter()
-                .any(|summary| handoff.trim_end().ends_with(summary.as_str()));
-            // Without the summary request, the handoff is the only record of
-            // the compaction.
-            let recovered = (!replayed).then(|| {
-                let summary = handoff
-                    .split_once('\n')
-                    .map_or(handoff, |(_, rest)| rest)
-                    .trim()
-                    .to_owned();
-                let mut compaction = item.sibling(TrajectoryItemKind::Compaction);
-                compaction.output = Some(summary.clone());
-                compaction.output_event_pk = Some(item.event_pk);
-                self.summaries.push(summary);
-                compaction
-            });
-            if !before.is_empty() {
-                item.text = Some(before.to_owned());
-                self.items.push(item);
-            }
-            self.items.extend(recovered);
+            index.get_or_insert(self.items.len());
+            input.extend(item.text);
+        }
+        compaction.input = (!input.is_empty()).then(|| input.join("\n\n"));
+        let index = index.unwrap_or(self.items.len());
+        self.items.insert(index, compaction);
+        if let Some(id) = &event.response_id {
+            self.compactions.insert(id.clone(), index);
         }
     }
 
     fn response(&mut self, event: &UsageEventResponse) {
-        let stream = self.current_stream;
-        let projected =
-            self.conversation
-                .project(event, &mut self.current_stream, &mut self.streams);
-        if let Some(index) = self.pending_compaction.take() {
-            // The response to the compaction prompt is the handoff summary.
+        let placement = self.conversation.place(event);
+        let stream = placement.stream;
+        let projected = self.conversation.project(event, placement);
+        let compaction = event
+            .response_id
+            .as_ref()
+            .and_then(|id| self.compactions.remove(id));
+        if let Some(index) = compaction {
+            // The response of a compaction exchange is the summary.
             if let Some(summary) = event.text.as_deref().map(str::trim)
                 && !summary.is_empty()
                 && let Some(item) = self.items.get_mut(index)
             {
                 item.output = Some(summary.to_owned());
                 item.output_event_pk = Some(event.id);
-                self.summaries.push(summary.to_owned());
             }
         } else if let Some(items) = projected {
             self.items.extend(items);
         } else if let Some(text) = event.text.as_deref().filter(|text| !text.trim().is_empty()) {
-            let mut item = TrajectoryItem::new(TrajectoryItemKind::Assistant, stream, event);
+            let mut item = TrajectoryItem::new(TrajectoryItemKind::Text, stream, event);
             item.text = Some(text.to_owned());
             self.items.push(item);
         }
@@ -398,16 +319,8 @@ impl Merger {
     }
 }
 
-/// Byte offset of the paragraph that contains `marker`.
-fn paragraph_start(text: &str, marker: &str) -> Option<usize> {
-    let position = text.find(marker)?;
-    Some(
-        text[..position]
-            .rfind(PARAGRAPH_SEPARATOR)
-            .map_or(0, |separator| {
-                separator.saturating_add(PARAGRAPH_SEPARATOR.len())
-            }),
-    )
+fn is_compaction(event: &UsageEventResponse) -> bool {
+    event.metadata.get("purpose").and_then(Value::as_str) == Some(COMPACTION_PURPOSE)
 }
 
 fn hash_str(value: &str) -> u64 {
@@ -429,16 +342,28 @@ fn segment_str<'a>(segment: &'a Value, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The role of a message item, else the item kind, as the API reports it.
+    fn shown(item: &TrajectoryItem) -> &str {
+        item.role.as_deref().unwrap_or(match item.kind {
+            TrajectoryItemKind::Message => "message",
+            TrajectoryItemKind::Text => "text",
+            TrajectoryItemKind::ToolCall => "tool_call",
+            TrajectoryItemKind::ToolResult => "tool_result",
+            TrajectoryItemKind::Compaction => "compaction",
+        })
+    }
+
     #[test]
     fn usage_retains_events_without_new_content_and_counts_each_event_once() {
-        let body = r#"{"messages":[{"id":null,"role":"user","text":"hello"}],"instructions_present":false,"previous_response_id":null}"#;
+        let body = r#"{"messages":[{"id":null,"role":"user","text":"hello"}],"instructions_present":false}"#;
         let mut request = structured_event("request", body);
         request.input_tokens = 2;
         request.cache_read_tokens = 77_000;
         request.cache_write_tokens = 400;
         request.total_tokens = 77_402;
         let repeated = structured_event("request", body);
-        let mut response = event("response", "", json!({"token_usage_estimated": true}));
+        let mut response = event("response", "", json!({}));
         response.llm_model = "other-model".to_owned();
         response.output_tokens = 150;
         response.reasoning_tokens = 40;
@@ -463,32 +388,23 @@ mod tests {
         assert_eq!(trajectory.events[2].llm_model, "other-model");
         assert_eq!(trajectory.events[2].output_tokens, 150);
         assert_eq!(trajectory.events[2].reasoning_tokens, 40);
-        assert!(trajectory.events[2].token_usage_estimated);
+        assert!(trajectory.events[2].token_usage_available);
         let serialized = serde_json::to_value(&trajectory.events).unwrap();
         assert!(serialized[0].get("text").is_none());
         assert!(serialized[0].get("metadata").is_none());
     }
 
     #[test]
-    fn usage_distinguishes_reported_zero_from_absent_and_hidden_counts() {
-        let reported = event(
-            "response",
-            "",
-            json!({"token_usage_source": "provider_reported"}),
-        );
-        let absent = event("request", "", json!({"token_usage_source": "absent"}));
-        let mut hidden = event(
-            "request",
-            "",
-            json!({"content_policy": {"token_usage": false}}),
-        );
-        hidden.input_tokens = 10;
-        hidden.total_tokens = 10;
-        let trajectory = build(timeline(vec![reported, absent, hidden]));
-        assert_eq!(trajectory.events.len(), 3);
-        assert!(trajectory.events[0].token_usage_available);
-        assert!(!trajectory.events[1].token_usage_available);
-        assert!(!trajectory.events[2].token_usage_available);
+    fn usage_is_available_when_any_counter_is_non_zero() {
+        let zero = event("response", "", json!({}));
+        let mut cached = event("request", "", json!({}));
+        cached.cache_read_tokens = 10;
+        let trajectory = build(timeline(vec![zero, cached]));
+        assert_eq!(trajectory.events.len(), 2);
+        assert!(!trajectory.events[0].token_usage_available);
+        assert!(trajectory.events[1].token_usage_available);
+        let serialized = serde_json::to_value(&trajectory.events).unwrap();
+        assert!(serialized[0].get("token_usage_estimated").is_none());
     }
 
     use serde_json::json;
@@ -527,17 +443,8 @@ mod tests {
 
         let items = build(timeline(events)).items;
 
-        let kinds = items.iter().map(|item| item.kind).collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            [
-                TrajectoryItemKind::Request,
-                TrajectoryItemKind::ToolCall,
-                TrajectoryItemKind::Request,
-                TrajectoryItemKind::Assistant,
-                TrajectoryItemKind::Request,
-            ]
-        );
+        let kinds = items.iter().map(shown).collect::<Vec<_>>();
+        assert_eq!(kinds, ["text", "tool_call", "text", "text", "text",]);
         assert_eq!(items[1].output.as_deref(), Some("README.md"));
         assert_eq!(
             items[4].text.as_deref(),
@@ -566,11 +473,7 @@ mod tests {
         let items = build(timeline(events)).items;
 
         assert_eq!(items.len(), 3);
-        assert!(
-            items
-                .iter()
-                .all(|i| i.kind == TrajectoryItemKind::Request && !i.continued)
-        );
+        assert!(items.iter().all(|i| shown(i) == "text" && !i.continued));
         assert_eq!(
             items[2].text,
             Some(format!(
@@ -591,27 +494,23 @@ mod tests {
             json!({"conversation":{"completeness":"partial","messages":[]}}),
             json!({"conversation":{"messages":"invalid"}}),
             json!({"conversation":{"messages":[],"completeness":"complete"}}),
-            // Older collectors stored messages without completeness.
+            // Without completeness the conversation is outside the contract.
             json!({"conversation":{"messages":[{"role":"user","text":"用户内容"}]}}),
         ] {
             let items = build(timeline(vec![event("request", text, metadata)])).items;
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].kind, TrajectoryItemKind::Request);
+            assert_eq!(shown(&items[0]), "text");
             assert_eq!(items[0].text.as_deref(), Some(text));
             assert!(!items[0].continued);
         }
-        let items = build(timeline(vec![structured_event("request", r#"{"messages":[{"id":null,"role":"unknown","text":"system: unknown"},{"id":null,"role":"unrecognized","text":"hello"},{"id":null,"role":"user","text":"system: quoted text"}],"instructions_present":false,"previous_response_id":null}"#)])).items;
+        let items = build(timeline(vec![structured_event("request", r#"{"messages":[{"id":null,"role":"unknown","text":"system: unknown"},{"id":null,"role":"unrecognized","text":"hello"},{"id":null,"role":"user","text":"system: quoted text"}],"instructions_present":false}"#)])).items;
         assert_eq!(
-            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
-            [
-                TrajectoryItemKind::Request,
-                TrajectoryItemKind::Request,
-                TrajectoryItemKind::User
-            ]
+            items.iter().map(shown).collect::<Vec<_>>(),
+            ["unknown", "unrecognized", "user"]
         );
     }
 
-    /// A current collector always declares completeness; default it to complete.
+    /// Every conversation in the contract declares completeness; default it to complete.
     fn structured_event(side: &str, body: &str) -> UsageEventResponse {
         let mut conversation = serde_json::from_str::<Value>(body).unwrap();
         conversation
@@ -621,16 +520,16 @@ mod tests {
             .or_insert_with(|| json!("complete"));
         event(
             side,
-            "legacy fallback",
+            "flattened text",
             json!({"conversation": conversation}),
         )
     }
 
     #[test]
     fn structured_projection_keeps_roles_and_repeated_user_occurrences() {
-        let first = r#"{"messages":[{"role":"developer","text":"system instructions"},{"id":null,"role":"user","text":"继续"}],"instructions_present":true,"previous_response_id":null}"#;
-        let response = r#"{"messages":[{"id":"a1","role":"assistant","text":"working"}],"instructions_present":false,"previous_response_id":null}"#;
-        let replay = r#"{"messages":[{"role":"developer","text":"system instructions"},{"id":null,"role":"user","text":"继续"},{"id":"a1","role":"assistant","text":"working"},{"id":null,"role":"user","text":"继续"}],"instructions_present":true,"previous_response_id":null}"#;
+        let first = r#"{"messages":[{"role":"developer","text":"system instructions"},{"id":null,"role":"user","text":"继续"}],"instructions_present":true}"#;
+        let response = r#"{"messages":[{"id":"a1","role":"assistant","text":"working"}],"instructions_present":false}"#;
+        let replay = r#"{"messages":[{"role":"developer","text":"system instructions"},{"id":null,"role":"user","text":"继续"},{"id":"a1","role":"assistant","text":"working"},{"id":null,"role":"user","text":"继续"}],"instructions_present":true}"#;
         let events = vec![
             structured_event("request", first),
             structured_event("response", response),
@@ -650,13 +549,8 @@ mod tests {
             }
         }
         assert_eq!(
-            merger.items.iter().map(|i| i.kind).collect::<Vec<_>>(),
-            [
-                TrajectoryItemKind::Context,
-                TrajectoryItemKind::User,
-                TrajectoryItemKind::Assistant,
-                TrajectoryItemKind::User
-            ]
+            merger.items.iter().map(shown).collect::<Vec<_>>(),
+            ["developer", "user", "assistant", "user"]
         );
         assert_eq!(merger.items[1].text.as_deref(), Some("继续"));
         assert_eq!(merger.items[3].text.as_deref(), Some("继续"));
@@ -673,27 +567,22 @@ mod tests {
     fn streamed_anthropic_response_is_not_replayed_as_user_input() {
         let response = r#"{"messages":[{"role":"assistant","text":"hi"}]}"#;
         let items = build(timeline(vec![
-            structured_event("request", r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null}"#),
+            structured_event("request", r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true}"#),
             structured_event("response", response),
-            structured_event("request", r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null}"#),
+            structured_event("request", r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true}"#),
         ])).items;
         assert_eq!(
-            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
-            [
-                TrajectoryItemKind::Context,
-                TrajectoryItemKind::User,
-                TrajectoryItemKind::Assistant,
-                TrajectoryItemKind::User
-            ]
+            items.iter().map(shown).collect::<Vec<_>>(),
+            ["system", "user", "assistant", "user"]
         );
         assert_eq!(items[2].text.as_deref(), Some("hi"));
     }
 
     #[test]
     fn anthropic_reasoning_is_shown_once_with_its_assistant_message() {
-        let first = r#"{"messages":[{"id":null,"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null,"completeness":"complete"}"#;
-        let response = r#"{"messages":[{"id":"msg_1","role":"reasoning","text":"thinking it over"},{"id":"msg_1","role":"assistant","text":"hi"}],"instructions_present":false,"previous_response_id":null,"completeness":"complete"}"#;
-        let replay = r#"{"messages":[{"id":null,"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"reasoning","text":"thinking it over"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"next"}],"instructions_present":true,"previous_response_id":null,"completeness":"complete"}"#;
+        let first = r#"{"messages":[{"id":null,"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"completeness":"complete"}"#;
+        let response = r#"{"messages":[{"id":"msg_1","role":"reasoning","text":"thinking it over"},{"id":"msg_1","role":"assistant","text":"hi"}],"instructions_present":false,"completeness":"complete"}"#;
+        let replay = r#"{"messages":[{"id":null,"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"reasoning","text":"thinking it over"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"next"}],"instructions_present":true,"completeness":"complete"}"#;
         let items = build(timeline(vec![
             structured_event("request", first),
             structured_event("response", response),
@@ -703,14 +592,14 @@ mod tests {
         assert_eq!(
             items
                 .iter()
-                .map(|i| (i.kind, i.text.as_deref().unwrap_or_default()))
+                .map(|i| (shown(i), i.text.as_deref().unwrap_or_default()))
                 .collect::<Vec<_>>(),
             [
-                (TrajectoryItemKind::Context, "instructions"),
-                (TrajectoryItemKind::User, "hello"),
-                (TrajectoryItemKind::Assistant, "thinking it over"),
-                (TrajectoryItemKind::Assistant, "hi"),
-                (TrajectoryItemKind::User, "next"),
+                ("system", "instructions"),
+                ("user", "hello"),
+                ("reasoning", "thinking it over"),
+                ("assistant", "hi"),
+                ("user", "next"),
             ]
         );
         assert!(items.iter().all(|i| i.stream == 0));
@@ -718,96 +607,85 @@ mod tests {
 
     #[test]
     fn incremental_requests_keep_identical_new_user_messages() {
-        let items = build(timeline(vec![
-            structured_event(
-                "request",
-                r#"{"messages":[{"role":"developer","text":"instructions"},{"id":null,"role":"user","text":"continue"}],"instructions_present":true,"previous_response_id":null}"#,
-            ),
-            structured_event("response", r#"{"messages":[{"id":null,"role":"assistant","text":"working"}],"instructions_present":false,"previous_response_id":null}"#),
-            structured_event(
-                "request",
-                r#"{"messages":[{"id":null,"role":"user","text":"continue"}],"instructions_present":false,"previous_response_id":"r1"}"#,
-            ),
-        ]))
-        .items;
+        let mut first = structured_event(
+            "request",
+            r#"{"messages":[{"role":"developer","text":"instructions"},{"id":null,"role":"user","text":"continue"}]}"#,
+        );
+        first.response_id = Some("r1".to_owned());
+        let mut response = structured_event(
+            "response",
+            r#"{"messages":[{"id":null,"role":"assistant","text":"working"}]}"#,
+        );
+        response.response_id = Some("r1".to_owned());
+        let mut next = structured_event(
+            "request",
+            r#"{"messages":[{"id":null,"role":"user","text":"continue"}]}"#,
+        );
+        next.previous_response_id = Some("r1".to_owned());
+        let items = build(timeline(vec![first, response, next])).items;
         assert_eq!(
-            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
-            [
-                TrajectoryItemKind::Context,
-                TrajectoryItemKind::User,
-                TrajectoryItemKind::Assistant,
-                TrajectoryItemKind::User
-            ]
+            items.iter().map(shown).collect::<Vec<_>>(),
+            ["developer", "user", "assistant", "user"]
         );
         assert!(items.iter().all(|i| i.stream == 0));
+    }
+
+    #[test]
+    fn a_continuation_shows_new_developer_messages_but_not_its_instructions() {
+        let mut first = structured_event(
+            "request",
+            r#"{"messages":[{"role":"developer","text":"instructions"},{"role":"user","text":"start"}],"instructions_present":true}"#,
+        );
+        first.response_id = Some("r1".to_owned());
+        let mut response = structured_event(
+            "response",
+            r#"{"messages":[{"role":"assistant","text":"working"}]}"#,
+        );
+        response.response_id = Some("r1".to_owned());
+        // The continuation repeats its instructions, then adds a developer
+        // notice and the next user input.
+        let mut next = structured_event(
+            "request",
+            r#"{"messages":[{"role":"developer","text":"instructions"},{"role":"developer","text":"permissions changed"},{"role":"user","text":"go on"}],"instructions_present":true}"#,
+        );
+        next.previous_response_id = Some("r1".to_owned());
+        let items = build(timeline(vec![first, response, next])).items;
+        assert_eq!(
+            texts(&items),
+            [
+                ("developer", 0, "instructions"),
+                ("user", 0, "start"),
+                ("assistant", 0, "working"),
+                ("developer", 0, "permissions changed"),
+                ("user", 0, "go on"),
+            ]
+        );
     }
 
     #[test]
     fn structured_request_retains_system_and_assistant_roles() {
-        let body = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true,"previous_response_id":null}"#;
+        let body = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"user","text":"hello"}],"instructions_present":true}"#;
         let items = build(timeline(vec![
             structured_event("request", body),
             structured_event("request", body),
         ]))
         .items;
         assert_eq!(
-            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
-            [
-                TrajectoryItemKind::Context,
-                TrajectoryItemKind::User,
-                TrajectoryItemKind::Assistant,
-                TrajectoryItemKind::User
-            ]
+            items.iter().map(shown).collect::<Vec<_>>(),
+            ["system", "user", "assistant", "user"]
         );
     }
 
-    #[test]
-    fn changing_billing_headers_and_token_budgets_keep_one_stream() {
-        let request = |hash: &str, left: u32, messages: &str| {
-            let mut messages: Vec<Value> = serde_json::from_str(messages).unwrap();
-            messages.insert(0, json!({"role":"system", "text": format!("x-anthropic-billing-header: cc_version=2.1.288; cch={hash}; cc_prev_req=req_{hash};\ninstructions\n\n<total_tokens>{left} tokens left</total_tokens>")}));
-            json!({"messages": messages, "instructions_present": true}).to_string()
-        };
-        let items = build(timeline(vec![
-            structured_event(
-                "request",
-                &request("a1", 900, r#"[{"role":"user","text":"hello"}]"#),
-            ),
-            structured_event("response", r#"{"messages":[{"id":null,"role":"assistant","text":"hi"}],"instructions_present":false,"previous_response_id":null}"#),
-            structured_event(
-                "request",
-                &request(
-                    "b2",
-                    850,
-                    r#"[{"role":"user","text":"hello"},{"role":"assistant","text":"hi"},{"role":"user","text":"next"}]"#,
-                ),
-            ),
-        ]))
-        .items;
-
-        assert_eq!(
-            items
-                .iter()
-                .map(|i| (i.kind, i.text.as_deref().unwrap_or_default()))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    TrajectoryItemKind::Context,
-                    "x-anthropic-billing-header: cc_version=2.1.288; cch=a1; cc_prev_req=req_a1;\ninstructions\n\n<total_tokens>900 tokens left</total_tokens>"
-                ),
-                (TrajectoryItemKind::User, "hello"),
-                (TrajectoryItemKind::Assistant, "hi"),
-                (TrajectoryItemKind::User, "next"),
-            ]
-        );
-        assert!(items.iter().all(|i| i.stream == 0));
-    }
-
-    /// Claude Code thread requests as the collector projects them: a
-    /// `create` carries the whole system prompt and history, a `continue`
-    /// only the billing header and the messages added since
-    /// `previous_message_id`.
-    fn claude_request(thread: Value, system: &[&str], messages: Value) -> UsageEventResponse {
+    /// Claude Code requests as the collector projects them: a `create`
+    /// carries the whole system prompt and history, a `continue` only the
+    /// billing header and the messages added since the response it names.
+    fn claude_request(
+        stream: Option<&str>,
+        previous: Option<&str>,
+        response: Option<&str>,
+        system: &[&str],
+        messages: Value,
+    ) -> UsageEventResponse {
         let system = std::iter::once(
             "x-anthropic-billing-header: cc_version=2.1.293.af3; cc_entrypoint=cli; cch=3ceb5;",
         )
@@ -817,33 +695,37 @@ mod tests {
         let mut conversation = json!({
             "messages": [{"id": null, "role": "system", "text": system}],
             "instructions_present": true,
-            "previous_response_id": null,
         });
         conversation["messages"]
             .as_array_mut()
             .unwrap()
             .extend(serde_json::from_value::<Vec<Value>>(messages).unwrap());
         let mut request = structured_event("request", &conversation.to_string());
-        if !thread.is_null() {
-            request.metadata["claude_thread"] = thread;
-        }
+        request.stream_id = stream.map(str::to_owned);
+        request.previous_response_id = previous.map(str::to_owned);
+        request.response_id = response.map(str::to_owned);
         request
     }
 
-    fn create(messages: Value) -> UsageEventResponse {
+    /// A main-loop request with its whole history; `response` names the
+    /// response its exchange produced.
+    fn create(response: &str, messages: Value) -> UsageEventResponse {
         claude_request(
-            json!({"type": "create"}),
+            Some("main"),
+            None,
+            Some(response),
             &["You are Claude Code.", "Main loop instructions."],
             messages,
         )
     }
 
-    fn continue_from(previous: &str, messages: Value) -> UsageEventResponse {
-        claude_request(
-            json!({"type": "continue", "previous_message_id": previous}),
-            &[],
-            messages,
-        )
+    /// A main-loop request continuing after `previous`.
+    fn continue_from(
+        previous: &str,
+        response: Option<&str>,
+        messages: Value,
+    ) -> UsageEventResponse {
+        claude_request(Some("main"), Some(previous), response, &[], messages)
     }
 
     fn user(text: &str) -> Value {
@@ -867,6 +749,7 @@ mod tests {
         ]
     }
 
+    /// A response found only by the response id its exchange declares.
     fn streamed(id: &str, text: &str) -> UsageEventResponse {
         let conversation = json!({
             "messages": [
@@ -874,26 +757,28 @@ mod tests {
                 {"id": id, "role": "assistant", "text": text},
                 {"id": null, "role": "tool", "text": ""},
             ],
-            "instructions_present": false,
-            "previous_response_id": null,
         });
-        structured_event("response", &conversation.to_string())
+        let mut response = structured_event("response", &conversation.to_string());
+        response.stream_id = None;
+        response.response_id = Some(id.to_owned());
+        response
     }
 
-    /// A `thread_not_found` error carries no messages.
+    /// A `thread_not_found` error carries no messages and no response id.
     fn thread_not_found() -> UsageEventResponse {
         let mut response = structured_event(
             "response",
-            r#"{"messages":[],"instructions_present":false,"previous_response_id":null,"completeness":"unsupported"}"#,
+            r#"{"messages":[],"completeness":"unsupported"}"#,
         );
+        response.stream_id = None;
         response.text = None;
         response
     }
 
-    fn texts(items: &[TrajectoryItem]) -> Vec<(TrajectoryItemKind, usize, &str)> {
+    fn texts(items: &[TrajectoryItem]) -> Vec<(&str, usize, &str)> {
         items
             .iter()
-            .map(|i| (i.kind, i.stream, i.text.as_deref().unwrap_or_default()))
+            .map(|i| (shown(i), i.stream, i.text.as_deref().unwrap_or_default()))
             .collect()
     }
 
@@ -902,9 +787,11 @@ mod tests {
                                 instructions.";
 
     #[test]
-    fn thread_continue_appends_new_messages_in_the_stream_it_continues() {
+    fn a_continuation_appends_new_messages_in_the_stream_of_its_response() {
         let search = claude_request(
-            Value::Null,
+            None,
+            None,
+            Some("msg_side"),
             &[
                 "You are Claude Code.",
                 "You are an assistant for performing a web search tool use",
@@ -912,44 +799,58 @@ mod tests {
             json!([user("search the web")]),
         );
         let events = vec![
-            create(json!([user("hello"), budget()])),
+            create("msg_1", json!([user("hello"), budget()])),
             streamed("msg_1", "looking"),
             search,
             streamed("msg_side", "results"),
-            continue_from("msg_1", json!([tool_result(), budget()])),
+            continue_from("msg_1", Some("msg_2"), json!([tool_result(), budget()])),
             streamed("msg_2", "found it"),
-            continue_from("msg_2", json!([tool_result(), user("thanks"), budget()])),
+            continue_from(
+                "msg_2",
+                Some("msg_3"),
+                json!([tool_result(), user("thanks"), budget()]),
+            ),
         ];
         let items = build(timeline(events)).items;
 
         assert_eq!(
             texts(&items),
             [
-                (TrajectoryItemKind::Context, 0, MAIN_CONTEXT),
-                (TrajectoryItemKind::User, 0, "hello"),
+                ("system", 0, MAIN_CONTEXT),
+                ("user", 0, "hello"),
                 (
-                    TrajectoryItemKind::Context,
+                    "system",
                     0,
                     "<total_tokens>15000000 tokens left</total_tokens>"
                 ),
-                (TrajectoryItemKind::Assistant, 0, "looking"),
+                ("assistant", 0, "looking"),
                 (
-                    TrajectoryItemKind::Context,
+                    "system",
                     1,
                     "x-anthropic-billing-header: cc_version=2.1.293.af3; cc_entrypoint=cli; \
                      cch=3ceb5;\nYou are Claude Code.\nYou are an assistant for performing a web \
                      search tool use"
                 ),
-                (TrajectoryItemKind::User, 1, "search the web"),
-                (TrajectoryItemKind::Assistant, 1, "results"),
-                (TrajectoryItemKind::Assistant, 0, "found it"),
-                (TrajectoryItemKind::User, 0, "thanks"),
+                ("user", 1, "search the web"),
+                ("assistant", 1, "results"),
+                (
+                    "system",
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
+                ("assistant", 0, "found it"),
+                ("user", 0, "thanks"),
+                (
+                    "system",
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
             ]
         );
     }
 
     #[test]
-    fn thread_replay_after_a_failed_continue_adds_no_duplicates() {
+    fn a_replay_after_a_failed_continuation_adds_no_duplicates() {
         let first = user("hello");
         let retry = user("try the wire");
         let [looking_thinking, looking, looking_tool] = replayed("looking");
@@ -969,15 +870,15 @@ mod tests {
             budget(),
         ]);
         let events = vec![
-            create(json!([first, budget()])),
+            create("msg_1", json!([first, budget()])),
             streamed("msg_1", "looking"),
-            continue_from("msg_1", json!([tool_result(), budget()])),
+            continue_from("msg_1", Some("msg_2"), json!([tool_result(), budget()])),
             streamed("msg_2", "found it"),
-            continue_from("msg_2", json!([retry, budget()])),
+            continue_from("msg_2", None, json!([retry, budget()])),
             thread_not_found(),
-            create(replay),
+            create("msg_3", replay),
             streamed("msg_3", "no wire port"),
-            continue_from("msg_3", json!([tool_result(), budget()])),
+            continue_from("msg_3", Some("msg_4"), json!([tool_result(), budget()])),
             streamed("msg_4", "compressed"),
         ];
         let trajectory = build(timeline(events));
@@ -985,68 +886,217 @@ mod tests {
         assert_eq!(
             texts(&trajectory.items),
             [
-                (TrajectoryItemKind::Context, 0, MAIN_CONTEXT),
-                (TrajectoryItemKind::User, 0, "hello"),
+                ("system", 0, MAIN_CONTEXT),
+                ("user", 0, "hello"),
                 (
-                    TrajectoryItemKind::Context,
+                    "system",
                     0,
                     "<total_tokens>15000000 tokens left</total_tokens>"
                 ),
-                (TrajectoryItemKind::Assistant, 0, "looking"),
-                (TrajectoryItemKind::Assistant, 0, "found it"),
-                (TrajectoryItemKind::User, 0, "try the wire"),
-                (TrajectoryItemKind::Assistant, 0, "no wire port"),
-                (TrajectoryItemKind::Assistant, 0, "compressed"),
+                ("assistant", 0, "looking"),
+                (
+                    "system",
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
+                ("assistant", 0, "found it"),
+                ("user", 0, "try the wire"),
+                (
+                    "system",
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
+                ("assistant", 0, "no wire port"),
+                (
+                    "system",
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
+                ("assistant", 0, "compressed"),
             ]
         );
         assert_eq!(trajectory.events.len(), 10);
     }
 
     #[test]
-    fn thread_continue_of_an_unknown_message_follows_the_latest_thread() {
-        let events = vec![
-            create(json!([user("hello"), budget()])),
+    fn a_continuation_of_an_unseen_response_uses_its_stream_id_or_opens_a_stream() {
+        let title = || {
             claude_request(
-                Value::Null,
+                None,
+                None,
+                Some("msg_title"),
                 &["You are a title generator."],
                 json!([user("name it")]),
-            ),
-            continue_from("msg_uncaptured", json!([user("next"), budget()])),
+            )
+        };
+        let events = vec![
+            create("msg_1", json!([user("hello"), budget()])),
+            title(),
+            continue_from("msg_uncaptured", None, json!([user("next"), budget()])),
         ];
         let items = build(timeline(events)).items;
         assert_eq!(
-            items.last().map(|i| (i.kind, i.stream, i.text.as_deref())),
-            Some((TrajectoryItemKind::User, 0, Some("next")))
+            texts(&items)[items.len() - 2..],
+            [
+                ("user", 0, "next"),
+                (
+                    "system",
+                    0,
+                    "<total_tokens>15000000 tokens left</total_tokens>"
+                ),
+            ]
         );
 
-        // Without any earlier thread request the continue keeps its own stream.
+        // Without a stream id the continuation opens a stream of its own and
+        // shows only the messages it carries.
+        let mut orphan = continue_from("msg_uncaptured", None, json!([user("next")]));
+        orphan.stream_id = None;
+        let items = build(timeline(vec![title(), orphan])).items;
+        assert_eq!(texts(&items)[2..], [("user", 1, "next")]);
+    }
+
+    #[test]
+    fn declared_stream_ids_keep_each_thread_apart() {
+        let request = |stream: &str, messages: &str| {
+            let mut event = structured_event(
+                "request",
+                &format!(
+                    r#"{{"messages":[{{"role":"developer","text":"{stream} rules"}},{messages}]}}"#
+                ),
+            );
+            event.stream_id = Some(stream.to_owned());
+            event
+        };
         let items = build(timeline(vec![
-            claude_request(
-                Value::Null,
-                &["You are a title generator."],
-                json!([user("name it")]),
+            request("main", r#"{"role":"user","text":"fix it"}"#),
+            request("guardian", r#"{"role":"user","text":"review the action"}"#),
+            request(
+                "main",
+                r#"{"role":"user","text":"fix it"},{"role":"user","text":"and test"}"#,
             ),
-            continue_from("msg_uncaptured", json!([user("next")])),
+            request(
+                "guardian",
+                r#"{"role":"user","text":"review the action"},{"role":"user","text":"next action"}"#,
+            ),
         ]))
         .items;
+
+        assert_eq!(
+            texts(&items),
+            [
+                ("developer", 0, "main rules"),
+                ("user", 0, "fix it"),
+                ("developer", 1, "guardian rules"),
+                ("user", 1, "review the action"),
+                ("user", 0, "and test"),
+                ("user", 1, "next action"),
+            ]
+        );
+    }
+
+    #[test]
+    fn requests_without_a_stream_id_each_open_a_stream_and_repeat_their_history() {
+        let recap = || {
+            let mut event = structured_event(
+                "request",
+                r#"{"messages":[{"role":"system","text":"rules"},{"role":"user","text":"hello"},{"role":"user","text":"recap"}]}"#,
+            );
+            event.stream_id = None;
+            event
+        };
+        let items = build(timeline(vec![recap(), recap()])).items;
+
+        assert_eq!(
+            texts(&items),
+            [
+                ("system", 0, "rules"),
+                ("user", 0, "hello"),
+                ("user", 0, "recap"),
+                ("system", 1, "rules"),
+                ("user", 1, "hello"),
+                ("user", 1, "recap"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_response_joins_the_stream_of_the_request_with_its_response_id() {
+        let mut main = create("msg_main", json!([user("hello")]));
+        main.stream_id = Some("main".to_owned());
+        let side = claude_request(
+            None,
+            None,
+            Some("msg_side"),
+            &["You are a summarizer."],
+            json!([user("summarize")]),
+        );
+        // The main exchange answers after the side request was observed.
+        let items = build(timeline(vec![
+            main,
+            side,
+            streamed("msg_main", "hi"),
+            streamed("msg_side", "summary"),
+            streamed("msg_unpaired", "orphan"),
+        ]))
+        .items;
+
         assert_eq!(
             texts(&items)[2..],
             [
                 (
-                    TrajectoryItemKind::Context,
+                    "system",
                     1,
                     "x-anthropic-billing-header: cc_version=2.1.293.af3; cc_entrypoint=cli; \
-                     cch=3ceb5;"
+                     cch=3ceb5;\nYou are a summarizer."
                 ),
-                (TrajectoryItemKind::User, 1, "next"),
+                ("user", 1, "summarize"),
+                ("assistant", 0, "hi"),
+                ("assistant", 1, "summary"),
+                ("assistant", 2, "orphan"),
+            ]
+        );
+    }
+
+    #[test]
+    fn opening_instructions_show_only_where_they_change() {
+        let request = |rules: &str, messages: &str| {
+            structured_event(
+                "request",
+                &format!(
+                    r#"{{"messages":[{{"role":"system","text":"base"}},{{"role":"developer","text":"{rules}"}},{messages}],"instructions_present":true}}"#
+                ),
+            )
+        };
+        let items = build(timeline(vec![
+            request("rules v1", r#"{"role":"user","text":"hello"}"#),
+            request(
+                "rules v1",
+                r#"{"role":"user","text":"hello"},{"role":"user","text":"again"}"#,
+            ),
+            request(
+                "rules v2",
+                r#"{"role":"user","text":"hello"},{"role":"user","text":"again"},{"role":"user","text":"more"}"#,
+            ),
+        ]))
+        .items;
+
+        assert_eq!(
+            texts(&items),
+            [
+                ("system", 0, "base"),
+                ("developer", 0, "rules v1"),
+                ("user", 0, "hello"),
+                ("user", 0, "again"),
+                ("developer", 0, "rules v2"),
+                ("user", 0, "more"),
             ]
         );
     }
 
     #[test]
     fn system_messages_inside_the_conversation_keep_one_stream() {
-        let first = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"system","text":"reminder one"}],"instructions_present":true,"previous_response_id":null}"#;
-        let second = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"system","text":"reminder one"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"system","text":"reminder two"},{"id":null,"role":"user","text":"next"}],"instructions_present":true,"previous_response_id":null}"#;
+        let first = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"system","text":"reminder one"}],"instructions_present":true}"#;
+        let second = r#"{"messages":[{"role":"system","text":"instructions"},{"id":null,"role":"user","text":"hello"},{"id":null,"role":"system","text":"reminder one"},{"id":null,"role":"assistant","text":"hi"},{"id":null,"role":"system","text":"reminder two"},{"id":null,"role":"user","text":"next"}],"instructions_present":true}"#;
         let items = build(timeline(vec![
             structured_event("request", first),
             structured_event("request", second),
@@ -1056,111 +1106,86 @@ mod tests {
         assert_eq!(
             items
                 .iter()
-                .map(|i| (i.kind, i.text.as_deref().unwrap_or_default()))
+                .map(|i| (shown(i), i.text.as_deref().unwrap_or_default()))
                 .collect::<Vec<_>>(),
             [
-                (TrajectoryItemKind::Context, "instructions"),
-                (TrajectoryItemKind::User, "hello"),
-                (TrajectoryItemKind::Context, "reminder one"),
-                (TrajectoryItemKind::Assistant, "hi"),
-                (TrajectoryItemKind::Context, "reminder two"),
-                (TrajectoryItemKind::User, "next"),
+                ("system", "instructions"),
+                ("user", "hello"),
+                ("system", "reminder one"),
+                ("assistant", "hi"),
+                ("system", "reminder two"),
+                ("user", "next"),
             ]
         );
         assert!(items.iter().all(|i| i.stream == 0));
-    }
-
-    #[test]
-    fn structured_compaction_keeps_existing_summary_presentation() {
-        let request = json!({"messages": [{"role": "user", "text": "write report"}, {"role": "user", "text": PROMPT}]}).to_string();
-        let replay = json!({"messages": [{"role": "user", "text": "write report"}, {"role": "user", "text": handoff()}]}).to_string();
-        let items = build(timeline(vec![
-            structured_event("request", &request),
-            event("response", SUMMARY, json!({})),
-            structured_event("request", &replay),
-        ]))
-        .items;
-        assert_eq!(
-            items.iter().map(|i| i.kind).collect::<Vec<_>>(),
-            [TrajectoryItemKind::User, TrajectoryItemKind::Compaction]
-        );
-        assert_eq!(items[1].output.as_deref(), Some(SUMMARY));
     }
 
     const PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a \
                           handoff summary for another LLM that will resume the task.";
     const SUMMARY: &str = "## Goal\n\nFinish the report.";
 
-    fn handoff() -> String {
-        format!(
-            "Another language model started to solve this problem and produced a summary \
-             of its thinking process. Here is the summary produced by the other language \
-             model, use the information in this summary to assist with your own \
-             analysis:\n{SUMMARY}"
-        )
+    /// One exchange of a call the collector declares as a compaction.
+    fn compaction(texts: &[&str], response_id: &str) -> [UsageEventResponse; 2] {
+        let mut request = user_request(texts);
+        request.metadata["purpose"] = json!(COMPACTION_PURPOSE);
+        request.response_id = Some(response_id.to_owned());
+        let mut response = event("response", SUMMARY, json!({"purpose": COMPACTION_PURPOSE}));
+        response.response_id = Some(response_id.to_owned());
+        [request, response]
     }
 
     #[test]
-    fn compaction_prompt_and_summary_form_one_item_and_the_replay_is_hidden() {
-        let events = vec![
-            user_request(&["write the report"]),
-            event("response", "working", json!({})),
-            user_request(&[
+    fn a_compaction_exchange_forms_one_item_and_its_replay_is_ordinary_input() {
+        let [request, response] = compaction(
+            &[
                 "write the report",
                 "<environment_context>date</environment_context>",
                 PROMPT,
-            ]),
-            event("response", SUMMARY, json!({})),
-            user_request(&["<environment_context>cwd</environment_context>", &handoff()]),
+            ],
+            "resp_compact",
+        );
+        let replay = format!("Here is the summary of the earlier conversation:\n{SUMMARY}");
+        let events = vec![
+            user_request(&["write the report"]),
+            event("response", "working", json!({})),
+            request,
+            response,
+            user_request(&["<environment_context>cwd</environment_context>", &replay]),
             event("response", "continuing", json!({})),
         ];
 
         let items = build(timeline(events)).items;
 
-        let kinds = items.iter().map(|item| item.kind).collect::<Vec<_>>();
         assert_eq!(
-            kinds,
-            [
-                TrajectoryItemKind::User,
-                TrajectoryItemKind::Assistant,
-                TrajectoryItemKind::User,
-                TrajectoryItemKind::Compaction,
-                TrajectoryItemKind::User,
-                TrajectoryItemKind::Assistant,
-            ]
+            items.iter().map(shown).collect::<Vec<_>>(),
+            ["user", "text", "compaction", "user", "user", "text",]
         );
-        // New input sent along with the prompt stays user input.
+        // The new input of the compaction request is the item's input.
         assert_eq!(
-            items[2].text.as_deref(),
-            Some("<environment_context>date</environment_context>")
+            items[2].input.as_deref(),
+            Some(&*format!(
+                "<environment_context>date</environment_context>\n\n{PROMPT}"
+            ))
         );
-        assert_eq!(items[3].input.as_deref(), Some(PROMPT));
-        assert_eq!(items[3].output.as_deref(), Some(SUMMARY));
-        // The summary comes from the response, not from the prompt's request.
-        assert!(items[3].output_event_pk.is_some());
-        assert_ne!(items[3].output_event_pk, Some(items[3].event_pk));
-        assert_eq!(
-            items[4].text.as_deref(),
-            Some("<environment_context>cwd</environment_context>")
-        );
+        // The summary comes from the response of the same exchange.
+        assert_eq!(items[2].output.as_deref(), Some(SUMMARY));
+        assert!(items[2].output_event_pk.is_some());
+        assert_ne!(items[2].output_event_pk, Some(items[2].event_pk));
+        // The replayed summary is shown like any other new input.
+        assert_eq!(items[4].text.as_deref(), Some(&*replay));
     }
 
     #[test]
-    fn unobserved_compaction_is_recovered_from_its_handoff() {
-        let events = vec![
-            user_request(&[&format!("resume\n\n{}", handoff())]),
-            event("response", "continuing", json!({})),
-        ];
-
-        let items = build(timeline(events)).items;
-
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].kind, TrajectoryItemKind::User);
-        assert_eq!(items[0].text.as_deref(), Some("resume"));
-        assert_eq!(items[1].kind, TrajectoryItemKind::Compaction);
-        assert_eq!(items[1].input, None);
-        assert_eq!(items[1].output.as_deref(), Some(SUMMARY));
-        assert_eq!(items[2].kind, TrajectoryItemKind::Assistant);
+    fn compaction_prompt_text_alone_is_ordinary_input() {
+        let items = build(timeline(vec![
+            user_request(&[PROMPT]),
+            event("response", SUMMARY, json!({})),
+        ]))
+        .items;
+        assert_eq!(
+            items.iter().map(shown).collect::<Vec<_>>(),
+            ["user", "text"]
+        );
     }
 
     fn timeline(events: Vec<UsageEventResponse>) -> SessionTimelineResponse {
@@ -1216,6 +1241,9 @@ mod tests {
             reasoning_tokens: 0,
             total_tokens: 0,
             observed_at: Utc::now(),
+            stream_id: Some("main".to_owned()),
+            response_id: None,
+            previous_response_id: None,
             metadata,
             attachments: Vec::new(),
         }

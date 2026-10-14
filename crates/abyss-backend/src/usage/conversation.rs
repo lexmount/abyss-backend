@@ -6,12 +6,11 @@ use serde_json::Value;
 #[derive(Deserialize)]
 pub struct Conversation {
     pub messages: Vec<Message>,
-    #[serde(default)]
-    pub previous_response_id: Option<String>,
+    /// Whether the first message is the request's own instructions, such as
+    /// a system prompt or OpenAI `instructions`; absent means none.
     #[serde(default)]
     pub instructions_present: bool,
-    #[serde(default)]
-    completeness: Option<Completeness>,
+    completeness: Completeness,
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -22,68 +21,22 @@ enum Completeness {
     Unsupported,
 }
 
-/// Message roles the collector emits. Roles outside this set, including the
-/// placeholder `request` from older collectors, read as [`Role::Unknown`].
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    System,
-    Developer,
-    User,
-    Assistant,
-    Reasoning,
-    Tool,
-    #[serde(other)]
-    Unknown,
-}
-
-impl Role {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Developer => "developer",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Reasoning => "reasoning",
-            Self::Tool => "tool",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
+/// One message as the collector reports it; its role is kept as reported.
 #[derive(Clone, Deserialize)]
 pub struct Message {
     #[serde(default)]
     pub id: Option<String>,
-    pub role: Role,
+    pub role: String,
     pub text: String,
 }
 
 impl Conversation {
-    /// Whether the event carries a conversation from a collector that reports
-    /// completeness. Older collectors stored messages without it; their
-    /// requests keep using the flattened text where they did before.
-    pub fn declared(metadata: &Value) -> bool {
-        metadata.pointer("/conversation/completeness").is_some()
-    }
-
-    /// Thread source the Agent declared for the request, read without
-    /// decoding its messages.
-    pub fn thread_source(metadata: &Value) -> Option<&str> {
-        metadata.get("conversation")?.get("thread_source")?.as_str()
-    }
-
+    /// The completely decoded conversation of an event, as the `AgentEvent`
+    /// contract defines it.
     pub fn read(metadata: &Value) -> Option<Self> {
         let value = metadata.get("conversation")?;
         let conversation: Self = Self::deserialize(value).ok()?;
-        if conversation
-            .completeness
-            .as_ref()
-            .is_some_and(|state| *state != Completeness::Complete)
-        {
-            return None;
-        }
-        Some(conversation)
+        (conversation.completeness == Completeness::Complete).then_some(conversation)
     }
 }
 
@@ -92,20 +45,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_conversations_read_with_unknown_roles() {
-        let metadata = serde_json::json!({"conversation": {"messages": [
-            {"role": "request", "text": "placeholder"},
-            {"role": "function", "text": "legacy"},
-            {"role": "user", "text": "hello"}
-        ]}});
-        let conversation = Conversation::read(&metadata).expect("legacy shape");
+    fn roles_are_kept_as_reported() {
+        let metadata = serde_json::json!({"conversation": {
+            "messages": [
+                {"role": "reasoning", "text": "plan"},
+                {"role": "some_new_role", "text": "other"},
+                {"role": "user", "text": "hello"}
+            ],
+            "instructions_present": false,
+            "completeness": "complete"
+        }});
+        let conversation = Conversation::read(&metadata).expect("complete conversation");
         assert_eq!(
             conversation
                 .messages
                 .iter()
-                .map(|message| message.role)
+                .map(|message| message.role.as_str())
                 .collect::<Vec<_>>(),
-            [Role::Unknown, Role::Unknown, Role::User]
+            ["reasoning", "some_new_role", "user"]
         );
+    }
+
+    #[test]
+    fn conversations_outside_the_contract_are_not_read() {
+        let messages = serde_json::json!([{"role": "user", "text": "hello"}]);
+        for conversation in [
+            serde_json::json!({"messages": messages, "instructions_present": false}),
+            serde_json::json!({
+                "messages": messages,
+                "instructions_present": false,
+                "completeness": "partial"
+            }),
+        ] {
+            let metadata = serde_json::json!({"conversation": conversation});
+            assert!(Conversation::read(&metadata).is_none());
+        }
     }
 }

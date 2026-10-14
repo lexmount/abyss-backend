@@ -5,18 +5,17 @@
 //! `purpose`, and the response carries the `session_title` it produced for its
 //! own session. Titles are therefore read without interpreting message text.
 //!
-//! Codex names a task from a separate thread whose requests do not say which
-//! session they name, so its task sessions keep their first user input and the
-//! naming threads are only marked, from the protocol's `thread_source`.
+//! An Agent may instead name a task from a separate thread whose requests do
+//! not say which session they name. The collector marks those requests with
+//! `naming_thread`; their sessions are only marked, and the task sessions keep
+//! their first user input.
 
 use serde_json::Value;
 
-use super::conversation::{Conversation, Role};
+use super::conversation::Conversation;
 
 /// Session purpose stored for threads that name another session.
 pub const TITLE_GENERATION_PURPOSE: &str = "title_generation";
-/// Thread source Codex declares on its naming threads.
-const TITLE_THREAD_SOURCE: &str = "thread_title";
 /// Longest default title, in characters.
 const DEFAULT_TITLE_CHARS: usize = 80;
 
@@ -35,14 +34,14 @@ impl<'a> TitleContribution<'a> {
     /// Classifies an event from collector fields without reading its messages.
     /// Requests the Agent made for its own purposes, such as naming calls, are
     /// not user input.
-    pub fn of(event_type: &str, metadata: &'a Value) -> Option<Self> {
+    pub fn of(event_type: &str, metadata: &'a Value, naming_thread: bool) -> Option<Self> {
         if let Some(title) = metadata.get("session_title").and_then(Value::as_str) {
             return Some(Self::Agent(title));
         }
         if event_type != "request" || metadata.get("purpose").is_some() {
             return None;
         }
-        if Conversation::thread_source(metadata) == Some(TITLE_THREAD_SOURCE) {
+        if naming_thread {
             return Some(Self::TitleThread);
         }
         Some(Self::UserInput)
@@ -54,7 +53,7 @@ pub fn default_title(metadata: &Value) -> Option<String> {
     let input = Conversation::read(metadata)?
         .messages
         .into_iter()
-        .find(|message| message.role == Role::User && !message.text.trim().is_empty())?
+        .find(|message| message.role == "user" && !message.text.trim().is_empty())?
         .text;
     let input = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = input.chars();
@@ -133,7 +132,8 @@ mod tests {
         assert_eq!(
             TitleContribution::of(
                 "response",
-                &json!({"purpose":"session_title","session_title":"登录修复"})
+                &json!({"purpose":"session_title","session_title":"登录修复"}),
+                false
             ),
             Some(TitleContribution::Agent("登录修复"))
         );
@@ -143,7 +143,8 @@ mod tests {
                 "response",
                 &request(&json!({"messages":[
                     {"role":"assistant","text":"{\"title\":\"Quoted\"}"}
-                ]}))
+                ]})),
+                false
             ),
             None
         );
@@ -153,24 +154,19 @@ mod tests {
     fn naming_requests_are_not_user_input() {
         let mut metadata = request(&json!({"messages":[{"role":"user","text":"<session>…"}]}));
         metadata["purpose"] = json!("session_title");
-        assert_eq!(TitleContribution::of("request", &metadata), None);
+        assert_eq!(TitleContribution::of("request", &metadata, false), None);
     }
 
     #[test]
-    fn codex_naming_threads_are_marked_from_their_thread_source() {
-        let messages = json!([{"role":"user","text":"Generate a concise title"}]);
+    fn naming_threads_are_marked_from_the_collector_flag() {
+        let metadata =
+            request(&json!({"messages":[{"role":"user","text":"Generate a concise title"}]}));
         assert_eq!(
-            TitleContribution::of(
-                "request",
-                &request(&json!({"messages":messages,"thread_source":"thread_title"}))
-            ),
+            TitleContribution::of("request", &metadata, true),
             Some(TitleContribution::TitleThread)
         );
         assert_eq!(
-            TitleContribution::of(
-                "request",
-                &request(&json!({"messages":messages,"thread_source":"user"}))
-            ),
+            TitleContribution::of("request", &metadata, false),
             Some(TitleContribution::UserInput)
         );
     }

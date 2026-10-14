@@ -1,11 +1,15 @@
 //! Session trajectory projection from collector-produced structured messages.
+//!
+//! Each exchange is placed in a stream by the identities the collector
+//! declares, compared only for equality: a request continuing a known
+//! response joins that response's stream, else a request naming a stream
+//! joins it, and any other request opens a stream of its own. A response
+//! joins the stream of the request that produced it.
 
-use std::collections::{HashMap, HashSet};
-
-use serde_json::Value;
+use std::collections::HashMap;
 
 use super::{TrajectoryItem, TrajectoryItemKind, UsageEventResponse};
-use crate::usage::conversation::{Conversation, Message, Role};
+use crate::usage::conversation::{Conversation, Message};
 
 impl Message {
     fn matches(&self, other: &Self) -> bool {
@@ -16,214 +20,139 @@ impl Message {
                 _ => true,
             }
     }
+}
 
-    const fn kind(&self) -> TrajectoryItemKind {
-        match self.role {
-            Role::System | Role::Developer => TrajectoryItemKind::Context,
-            Role::User => TrajectoryItemKind::User,
-            Role::Assistant | Role::Reasoning => TrajectoryItemKind::Assistant,
-            Role::Tool | Role::Unknown => TrajectoryItemKind::Request,
-        }
-    }
+/// The stream an event belongs to.
+#[derive(Clone, Copy)]
+pub(super) struct Placement {
+    pub(super) stream: usize,
+    /// The request carries only the messages added since the response it
+    /// continues.
+    incremental: bool,
 }
 
 #[derive(Default)]
 pub(super) struct ConversationProjection {
-    streams: HashMap<usize, StreamHistory>,
-    /// Stream of each response by its provider message id, so an Anthropic
-    /// thread `continue` naming that message joins the stream it continues.
-    messages: HashMap<String, usize>,
-    /// Stream of the latest Anthropic thread request.
-    thread: Option<usize>,
+    streams: Vec<StreamHistory>,
+    /// Stream of each declared stream id.
+    keys: HashMap<String, usize>,
+    /// Stream of each exchange by the response id it declares.
+    responses: HashMap<String, usize>,
 }
 
 #[derive(Default)]
 struct StreamHistory {
+    /// Instructions the latest full request opened with.
+    opening: Vec<Message>,
+    /// Messages after the opening, as the stream has seen them so far.
     history: Vec<Message>,
-    contexts: HashSet<(Role, String)>,
 }
 
 impl ConversationProjection {
+    /// Places an event by the identities its exchange declares.
+    pub(super) fn place(&mut self, event: &UsageEventResponse) -> Placement {
+        let request = event.event_type == "request";
+        let continued = if request {
+            event
+                .previous_response_id
+                .as_ref()
+                .and_then(|id| self.responses.get(id).copied())
+        } else {
+            // The request of the same exchange registered the response id.
+            event
+                .response_id
+                .as_ref()
+                .and_then(|id| self.responses.get(id).copied())
+        };
+        let stream = match (continued, &event.stream_id) {
+            (Some(stream), _) => stream,
+            (None, Some(key)) => {
+                if let Some(&stream) = self.keys.get(key) {
+                    stream
+                } else {
+                    let stream = self.open();
+                    self.keys.insert(key.clone(), stream);
+                    stream
+                }
+            }
+            (None, None) => self.open(),
+        };
+        if let Some(id) = &event.response_id {
+            self.responses.entry(id.clone()).or_insert(stream);
+        }
+        Placement {
+            stream,
+            incremental: request && event.previous_response_id.is_some(),
+        }
+    }
+
+    fn open(&mut self) -> usize {
+        self.streams.push(StreamHistory::default());
+        self.streams.len().saturating_sub(1)
+    }
+
     pub(super) fn project(
         &mut self,
         event: &UsageEventResponse,
-        stream: &mut usize,
-        stream_ids: &mut HashMap<u64, usize>,
+        placement: Placement,
     ) -> Option<Vec<TrajectoryItem>> {
-        // Older collectors stored messages without completeness; their events keep
-        // the flattened-text presentation they had before structured conversations.
-        if !Conversation::declared(&event.metadata) {
-            return None;
-        }
         let conversation = Conversation::read(&event.metadata)?;
         let request = event.event_type == "request";
-        let (messages, incremental) = if request {
-            let messages = conversation
-                .messages
-                .into_iter()
-                .filter(|m| m.role != Role::Tool)
-                .collect::<Vec<_>>();
-            if messages.is_empty() {
-                return None;
-            }
-            let incremental = self.request_stream(
-                event,
-                conversation.previous_response_id.is_some(),
-                conversation.instructions_present,
-                &messages,
-                stream,
-                stream_ids,
-            );
-            (messages, incremental)
-        } else {
-            if let Some(id) = conversation.messages.iter().find_map(|m| m.id.as_deref()) {
-                self.messages.insert(id.to_owned(), *stream);
-            }
-            let mut messages = conversation
-                .messages
-                .into_iter()
-                .filter(|m| m.role != Role::Tool)
-                .collect::<Vec<_>>();
-            if messages.is_empty()
-                && let Some(text) = event.text.as_ref().filter(|v| !v.is_empty())
-            {
-                messages.push(Message {
-                    id: None,
-                    role: Role::Assistant,
-                    text: text.clone(),
-                });
-            }
-            (messages, false)
-        };
-        // Legacy response text remains available when no message was projected.
-        if !request && messages.is_empty() {
+        // A request that declares its own instructions carries them as its
+        // first message. Messages without text, such as tool items whose
+        // content the tool fields carry, take no part in the trajectory.
+        let mut messages = conversation.messages;
+        let opening_len = usize::from(request && conversation.instructions_present);
+        let rest = messages
+            .split_off(opening_len.min(messages.len()))
+            .into_iter()
+            .filter(|message| !message.text.is_empty())
+            .collect::<Vec<_>>();
+        let (opening, messages) = (messages, rest);
+        if opening.is_empty() && messages.is_empty() {
             return None;
         }
-        let state = self.streams.entry(*stream).or_default();
-        let mut cursor = 0;
-        let mut next = Vec::new();
+        let stream = placement.stream;
+        let state = self.streams.get_mut(stream)?;
+        let item = |message: &Message| {
+            let mut item = TrajectoryItem::new(TrajectoryItemKind::Message, stream, event);
+            item.role = Some(message.role.clone());
+            item.text = Some(message.text.clone());
+            item
+        };
         let mut added = Vec::new();
-        for message in messages {
-            let context = message.kind() == TrajectoryItemKind::Context;
-            let known = if context {
-                !state
-                    .contexts
-                    .insert((message.role, stable_context(&message.text)))
-            } else if request && !incremental {
-                let found = state.history[cursor..]
-                    .iter()
-                    .position(|old| old.matches(&message));
-                if let Some(offset) = found {
-                    cursor = cursor.saturating_add(offset).saturating_add(1);
-                }
-                found.is_some()
-            } else if request {
-                state.history.iter().any(|old| {
-                    old.matches(&message) && (message.id.is_some() || message.role != Role::User)
-                })
-            } else {
-                false
-            };
-            if !context {
-                if request && !incremental {
-                    next.push(message.clone());
-                } else if !known {
-                    state.history.push(message.clone());
-                }
+        // A response and a continuation carry only messages added since the
+        // response they continue, so each one is new; the history keeps them
+        // for a later full request that replays them. A continuation does not
+        // repeat the conversation's instructions.
+        if !request || placement.incremental {
+            for message in messages {
+                added.push(item(&message));
+                state.history.push(message);
             }
-            if !known && !message.text.is_empty() {
-                let mut item = TrajectoryItem::new(message.kind(), *stream, event);
-                item.text = Some(message.text);
-                added.push(item);
+            return Some(added);
+        }
+
+        // A full request shows its instructions only where they changed, and
+        // of its history only what the stream has not seen in that order.
+        for message in &opening {
+            if !message.text.is_empty() && !state.opening.iter().any(|old| old.matches(message)) {
+                added.push(item(message));
             }
         }
-        if request && !incremental {
-            state.history = next;
+        state.opening = opening;
+
+        let mut cursor = 0;
+        for message in &messages {
+            let found = state.history[cursor..]
+                .iter()
+                .position(|old| old.matches(message));
+            match found {
+                Some(offset) => cursor = cursor.saturating_add(offset).saturating_add(1),
+                None => added.push(item(message)),
+            }
         }
+        state.history = messages;
         Some(added)
     }
-
-    /// Points `stream` at the stream this request belongs to and tells
-    /// whether the request sends only messages added since an earlier one.
-    fn request_stream(
-        &mut self,
-        event: &UsageEventResponse,
-        responds_to_previous: bool,
-        instructions_present: bool,
-        messages: &[Message],
-        stream: &mut usize,
-        stream_ids: &mut HashMap<u64, usize>,
-    ) -> bool {
-        // An Anthropic thread `continue` sends only the messages added
-        // since the response it names, and a system prompt that is only
-        // the billing header, so it neither repeats nor names its stream.
-        let thread = event.metadata.get("claude_thread");
-        let continued = thread
-            .and_then(|thread| thread.get("type"))
-            .and_then(Value::as_str)
-            == Some("continue");
-        let incremental = continued || responds_to_previous;
-        let continued_stream = continued
-            .then(|| {
-                thread
-                    .and_then(|thread| thread.get("previous_message_id"))
-                    .and_then(Value::as_str)
-                    .and_then(|id| self.messages.get(id).copied())
-                    // The named response was not captured: thread
-                    // requests of a session follow one another.
-                    .or(self.thread)
-            })
-            .flatten();
-        if let Some(continued) = continued_stream {
-            *stream = continued;
-        } else if !incremental || instructions_present {
-            // A stream is named by the prompt the conversation opens with.
-            // System messages later in the conversation are part of it:
-            // counting them made each new one start another stream.
-            let context = messages
-                .iter()
-                .take_while(|message| message.kind() == TrajectoryItemKind::Context)
-                .map(|message| {
-                    format!(
-                        "{}: {}",
-                        message.role.as_str(),
-                        stable_context(&message.text)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let next = stream_ids.len();
-            *stream = *stream_ids.entry(super::hash_str(&context)).or_insert(next);
-        }
-        if thread.is_some() {
-            self.thread = Some(*stream);
-        }
-        incremental
-    }
-}
-
-/// Claude Code adds two lines to its system prompt that change on every
-/// request: a leading billing header whose request hash and previous-request
-/// id differ each time, for example `x-anthropic-billing-header:
-/// cc_version=2.1.288.9e5; cc_entrypoint=cli; cch=e4f32; cc_is_subagent=true;
-/// cc_prev_req=req_…; cc_prompt_id=…;`, and a trailing context budget such as
-/// `<total_tokens>14964936 tokens left</total_tokens>`. Counting them made
-/// every request a new stream that replayed the whole conversation, so
-/// streams and system prompts are told apart without them. The stored conversation
-/// keeps both, so they can still be counted for billing.
-const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
-const TOKEN_BUDGET_OPEN: &str = "<total_tokens>";
-const TOKEN_BUDGET_CLOSE: &str = "</total_tokens>";
-
-/// A system prompt without the lines that change on every request.
-fn stable_context(text: &str) -> String {
-    text.lines()
-        .filter(|line| !changes_every_request(line.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn changes_every_request(line: &str) -> bool {
-    line.starts_with(BILLING_HEADER_PREFIX)
-        || (line.starts_with(TOKEN_BUDGET_OPEN) && line.ends_with(TOKEN_BUDGET_CLOSE))
 }
