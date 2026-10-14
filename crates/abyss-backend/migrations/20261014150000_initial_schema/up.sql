@@ -33,7 +33,7 @@ CREATE TABLE devices (
 CREATE INDEX devices_user_seen_idx
     ON devices (user_id, last_seen_at DESC);
 
--- Sessions use the Agent-native session ID plus canonical Agent name. The
+-- Sessions use the Agent-native session ID plus the reported Agent name. The
 -- device reference follows the most recently observed device for that session.
 CREATE TABLE agent_sessions (
     id uuid PRIMARY KEY,
@@ -53,18 +53,21 @@ CREATE TABLE agent_sessions (
 CREATE INDEX agent_sessions_user_time_idx
     ON agent_sessions (user_id, started_at DESC);
 
--- Turn indexes are backend-normalized during ingest when stable provider or
--- Agent metadata reveals that a collector restarted its local counter.
+-- turn_key is the turn the Agent named for its requests, unique within the
+-- session; it is NULL for the turn opened by requests naming none. turn_index
+-- is the turn's position in the session by start time.
 CREATE TABLE agent_turns (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
     session_pk uuid NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
     turn_index integer NOT NULL CHECK (turn_index >= 1),
+    turn_key text,
     started_at timestamptz NOT NULL,
     ended_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (session_pk, turn_index)
+    UNIQUE (session_pk, turn_index),
+    UNIQUE (session_pk, turn_key)
 );
 
 CREATE INDEX agent_turns_user_session_idx
@@ -95,6 +98,12 @@ CREATE TABLE llm_usage_events (
     reasoning_tokens bigint NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
     total_tokens bigint NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
     observed_at timestamptz NOT NULL,
+    -- Agent-declared thread of the exchange; equal values continue one conversation.
+    stream_id text,
+    -- Provider identity of the response the exchange produced.
+    response_id text,
+    -- Response whose conversation the exchange's request continues.
+    previous_response_id text,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -186,3 +195,19 @@ CREATE TABLE search_outbox (
 CREATE INDEX search_outbox_pending_idx
     ON search_outbox (available_at, id)
     WHERE processed_at IS NULL AND dead_lettered_at IS NULL;
+
+
+-- Session names read back from the Agents' own title-generation calls, kept
+-- apart from agent_sessions so session rows keep their shape. purpose marks
+-- sessions that exist only to generate a title, such as Codex naming threads,
+-- and parent_session_pk the task session such a thread was matched to.
+CREATE TABLE session_titles (
+    session_pk uuid PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+    title text,
+    title_event_pk uuid REFERENCES llm_usage_events(id) ON DELETE SET NULL,
+    title_observed_at timestamptz,
+    purpose text,
+    parent_session_pk uuid REFERENCES agent_sessions(id) ON DELETE SET NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);

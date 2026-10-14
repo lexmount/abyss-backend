@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::{
     models::parse_uuid,
-    schema::{agent_sessions, llm_usage_events, schema_backfills, session_titles},
+    schema::{llm_usage_events, session_titles},
 };
 use crate::{
     error::AppError,
@@ -16,9 +16,6 @@ use crate::{
         session_title::{TITLE_GENERATION_PURPOSE, TitleContribution, default_title},
     },
 };
-
-/// Names existing sessions using their first user input.
-const DEFAULT_BACKFILL_NAME: &str = "first_user_titles_v1";
 
 /// Stored title, purpose, and matched task session of one session.
 type StoredTitle = (Option<String>, Option<String>, Option<Uuid>);
@@ -30,6 +27,7 @@ pub(super) struct CapturedEvent<'a> {
     pub(super) event_pk: Uuid,
     pub(super) event_type: &'a str,
     pub(super) metadata: &'a Value,
+    pub(super) naming_thread: bool,
     pub(super) observed_at: i64,
 }
 
@@ -43,14 +41,15 @@ pub(super) fn capture(
     event: &CapturedEvent<'_>,
 ) -> Result<(), AppError> {
     let session = event.session_pk.to_string();
-    let agent_title = match TitleContribution::of(event.event_type, event.metadata) {
-        None => return Ok(()),
-        Some(TitleContribution::TitleThread) => {
-            return mark_title_thread(connection, &session, event.user_id);
-        }
-        Some(TitleContribution::Agent(title)) => Some(title),
-        Some(TitleContribution::UserInput) => None,
-    };
+    let agent_title =
+        match TitleContribution::of(event.event_type, event.metadata, event.naming_thread) {
+            None => return Ok(()),
+            Some(TitleContribution::TitleThread) => {
+                return mark_title_thread(connection, &session, event.user_id);
+            }
+            Some(TitleContribution::Agent(title)) => Some(title),
+            Some(TitleContribution::UserInput) => None,
+        };
     let stored = session_titles::table
         .find(&session)
         .select((
@@ -135,88 +134,6 @@ fn mark_title_thread(
     Ok(())
 }
 
-/// Runs the one-time scan that names sessions stored before titles existed.
-pub(super) fn backfill(connection: &mut SqliteConnection) -> Result<(), AppError> {
-    let done = schema_backfills::table
-        .find(DEFAULT_BACKFILL_NAME)
-        .select(schema_backfills::name)
-        .first::<String>(connection)
-        .optional()?
-        .is_some();
-    if done {
-        return Ok(());
-    }
-    connection.immediate_transaction(|transaction| {
-        backfill_defaults(transaction)?;
-        diesel::insert_into(schema_backfills::table)
-            .values((
-                schema_backfills::name.eq(DEFAULT_BACKFILL_NAME),
-                schema_backfills::completed_at.eq(Utc::now().timestamp_micros()),
-            ))
-            .execute(transaction)?;
-        Ok::<_, AppError>(())
-    })
-}
-
-/// Visit requests in time order until the first readable user input is found.
-fn backfill_defaults(connection: &mut SqliteConnection) -> Result<(), AppError> {
-    let sessions = agent_sessions::table
-        .select((agent_sessions::id, agent_sessions::user_id))
-        .load::<(String, String)>(connection)?;
-    for (session, user_id) in sessions {
-        let mut offset = 0_i64;
-        loop {
-            let requests = llm_usage_events::table
-                .filter(llm_usage_events::session_pk.eq(&session))
-                .filter(llm_usage_events::event_type.eq("request"))
-                .order_by((
-                    llm_usage_events::observed_at.asc(),
-                    llm_usage_events::id.asc(),
-                ))
-                .offset(offset)
-                .limit(16)
-                .select((
-                    llm_usage_events::id,
-                    llm_usage_events::observed_at,
-                    llm_usage_events::metadata,
-                ))
-                .load::<(String, i64, String)>(connection)?;
-            if requests.is_empty() {
-                break;
-            }
-            let mut found = false;
-            for (event_pk, observed_at, metadata) in requests {
-                let metadata = serde_json::from_str::<Value>(&metadata).unwrap_or(Value::Null);
-                let user_input = matches!(
-                    TitleContribution::of("request", &metadata),
-                    Some(TitleContribution::UserInput)
-                );
-                if !user_input || default_title(&metadata).is_none() {
-                    continue;
-                }
-                capture(
-                    connection,
-                    &CapturedEvent {
-                        user_id: parse_uuid(&user_id, "user id")?,
-                        session_pk: parse_uuid(&session, "session id")?,
-                        event_pk: parse_uuid(&event_pk, "event id")?,
-                        event_type: "request",
-                        metadata: &metadata,
-                        observed_at,
-                    },
-                )?;
-                found = true;
-                break;
-            }
-            if found {
-                break;
-            }
-            offset = offset.saturating_add(16);
-        }
-    }
-    Ok(())
-}
-
 /// Adds the stored title, purpose, and matched task session to a session.
 pub(super) fn fill(
     connection: &mut SqliteConnection,
@@ -254,12 +171,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        super::{
-            migrations,
-            repository::ingest_events,
-            schema::{agent_sessions, schema_backfills, session_titles},
-        },
-        backfill, load,
+        super::{migrations, repository::ingest_events, schema::agent_sessions},
+        load,
     };
     use crate::usage::IngestEventsRequest;
 
@@ -307,7 +220,7 @@ mod tests {
             "session_id": session,
             "llm": {"provider": "anthropic", "model": "claude-haiku"},
             "event_type": kind,
-            "token_usage": {"output_tokens": 1_i32}
+            "token_usage": {"input_tokens": 0_i64, "output_tokens": 1_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 1_i64}
         });
         event["metadata"] = metadata;
         event
@@ -486,15 +399,14 @@ mod tests {
             "2026-09-30T00:00:01Z",
             "Generate a concise, single-line task title.\nUser prompt:\n画一只鹈鹕",
         );
-        naming["metadata"]["conversation"]["thread_source"] = json!("thread_title");
-        let mut task = request(
+        naming["naming_thread"] = json!(true);
+        let task = request(
             "codex",
             "task",
             "t1",
             "2026-09-30T00:00:00Z",
             "<environment_context>…",
         );
-        task["metadata"]["conversation"]["thread_source"] = json!("user");
         ingest(
             &mut database,
             &[
@@ -518,52 +430,6 @@ mod tests {
         assert_eq!(
             session_title(&mut database, "title-thread"),
             (None, Some("title_generation".to_owned()))
-        );
-    }
-
-    #[test]
-    fn backfills_default_titles_past_empty_requests_once() {
-        let mut database = database();
-        let mut values: Vec<_> = (0_i32..17_i32)
-            .map(|index| {
-                event(
-                    "cursor",
-                    "default",
-                    &format!("empty-{index}"),
-                    "2026-09-30T00:00:00Z",
-                    "request",
-                    json!({}),
-                )
-            })
-            .collect();
-        values.push(request(
-            "cursor",
-            "default",
-            "first",
-            "2026-09-30T00:00:01Z",
-            "First request",
-        ));
-        ingest(&mut database, &values);
-        diesel::delete(session_titles::table)
-            .execute(&mut database)
-            .expect("clear titles");
-
-        backfill(&mut database).expect("backfill");
-        assert_eq!(
-            session_title(&mut database, "default").0.as_deref(),
-            Some("First request")
-        );
-        diesel::delete(session_titles::table)
-            .execute(&mut database)
-            .expect("clear titles");
-        backfill(&mut database).expect("second backfill");
-        assert_eq!(session_title(&mut database, "default"), (None, None));
-        assert_eq!(
-            schema_backfills::table
-                .count()
-                .get_result::<i64>(&mut database)
-                .expect("count"),
-            1
         );
     }
 }

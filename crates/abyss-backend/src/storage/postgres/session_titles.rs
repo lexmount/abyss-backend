@@ -1,23 +1,18 @@
 //! PostgreSQL persistence of session names reported by the collector.
 
 use chrono::{DateTime, Utc};
-use diesel::{
-    Connection, ExpressionMethods, OptionalExtension, PgConnection, QueryDsl, RunQueryDsl,
-};
+use diesel::{ExpressionMethods, OptionalExtension, PgConnection, QueryDsl, RunQueryDsl};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    db::schema::{agent_sessions, llm_usage_events, schema_backfills, session_titles},
+    db::schema::{llm_usage_events, session_titles},
     error::AppError,
     usage::{
         SessionInfo,
         session_title::{TITLE_GENERATION_PURPOSE, TitleContribution, default_title},
     },
 };
-
-/// Names existing sessions using their first user input.
-const DEFAULT_BACKFILL_NAME: &str = "first_user_titles_v1";
 
 /// Stored title, purpose, and matched task session of one session.
 type StoredTitle = (Option<String>, Option<String>, Option<Uuid>);
@@ -29,6 +24,7 @@ pub(super) struct CapturedEvent<'a> {
     pub(super) event_pk: Uuid,
     pub(super) event_type: &'a str,
     pub(super) metadata: &'a Value,
+    pub(super) naming_thread: bool,
     pub(super) observed_at: DateTime<Utc>,
 }
 
@@ -42,14 +38,15 @@ pub(super) fn capture(
     event: &CapturedEvent<'_>,
 ) -> Result<(), AppError> {
     let session = event.session_pk;
-    let agent_title = match TitleContribution::of(event.event_type, event.metadata) {
-        None => return Ok(()),
-        Some(TitleContribution::TitleThread) => {
-            return mark_title_thread(connection, session, event.user_id);
-        }
-        Some(TitleContribution::Agent(title)) => Some(title),
-        Some(TitleContribution::UserInput) => None,
-    };
+    let agent_title =
+        match TitleContribution::of(event.event_type, event.metadata, event.naming_thread) {
+            None => return Ok(()),
+            Some(TitleContribution::TitleThread) => {
+                return mark_title_thread(connection, session, event.user_id);
+            }
+            Some(TitleContribution::Agent(title)) => Some(title),
+            Some(TitleContribution::UserInput) => None,
+        };
     let stored = session_titles::table
         .find(session)
         .select((
@@ -131,87 +128,6 @@ fn mark_title_thread(
             session_titles::updated_at.eq(now),
         ))
         .execute(connection)?;
-    Ok(())
-}
-
-/// Runs the one-time scan that names sessions stored before titles existed.
-pub(super) fn backfill(connection: &mut PgConnection) -> Result<(), AppError> {
-    let done = schema_backfills::table
-        .find(DEFAULT_BACKFILL_NAME)
-        .select(schema_backfills::name)
-        .first::<String>(connection)
-        .optional()?
-        .is_some();
-    if done {
-        return Ok(());
-    }
-    connection.transaction(|transaction| {
-        backfill_defaults(transaction)?;
-        diesel::insert_into(schema_backfills::table)
-            .values((
-                schema_backfills::name.eq(DEFAULT_BACKFILL_NAME),
-                schema_backfills::completed_at.eq(Utc::now()),
-            ))
-            .execute(transaction)?;
-        Ok::<_, AppError>(())
-    })
-}
-
-/// Visit requests in time order until the first readable user input is found.
-fn backfill_defaults(connection: &mut PgConnection) -> Result<(), AppError> {
-    let sessions = agent_sessions::table
-        .select((agent_sessions::id, agent_sessions::user_id))
-        .load::<(Uuid, Uuid)>(connection)?;
-    for (session, user_id) in sessions {
-        let mut offset = 0_i64;
-        loop {
-            let requests = llm_usage_events::table
-                .filter(llm_usage_events::session_pk.eq(session))
-                .filter(llm_usage_events::event_type.eq("request"))
-                .order_by((
-                    llm_usage_events::observed_at.asc(),
-                    llm_usage_events::id.asc(),
-                ))
-                .offset(offset)
-                .limit(16)
-                .select((
-                    llm_usage_events::id,
-                    llm_usage_events::observed_at,
-                    llm_usage_events::metadata,
-                ))
-                .load::<(Uuid, DateTime<Utc>, Value)>(connection)?;
-            if requests.is_empty() {
-                break;
-            }
-            let mut found = false;
-            for (event_pk, observed_at, metadata) in requests {
-                let user_input = matches!(
-                    TitleContribution::of("request", &metadata),
-                    Some(TitleContribution::UserInput)
-                );
-                if !user_input || default_title(&metadata).is_none() {
-                    continue;
-                }
-                capture(
-                    connection,
-                    &CapturedEvent {
-                        user_id,
-                        session_pk: session,
-                        event_pk,
-                        event_type: "request",
-                        metadata: &metadata,
-                        observed_at,
-                    },
-                )?;
-                found = true;
-                break;
-            }
-            if found {
-                break;
-            }
-            offset = offset.saturating_add(16);
-        }
-    }
     Ok(())
 }
 

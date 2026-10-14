@@ -46,13 +46,14 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::{Integer, Nullable, Timestamptz, Uuid};
+    use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid};
 
     agent_turns (id) {
         id -> Uuid,
         user_id -> Uuid,
         session_pk -> Uuid,
         turn_index -> Integer,
+        turn_key -> Nullable<Text>,
         started_at -> Timestamptz,
         ended_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
@@ -88,6 +89,9 @@ diesel::table! {
         observed_at -> Timestamptz,
         metadata -> Jsonb,
         created_at -> Timestamptz,
+        stream_id -> Nullable<Text>,
+        response_id -> Nullable<Text>,
+        previous_response_id -> Nullable<Text>,
     }
 }
 
@@ -163,18 +167,7 @@ diesel::table! {
         title_observed_at -> Nullable<Timestamptz>,
         purpose -> Nullable<Text>,
         updated_at -> Timestamptz,
-        naming_turn_id -> Nullable<Text>,
-        naming_prompt -> Nullable<Text>,
         parent_session_pk -> Nullable<Uuid>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::{Text, Timestamptz};
-
-    schema_backfills (name) {
-        name -> Text,
-        completed_at -> Timestamptz,
     }
 }
 
@@ -205,7 +198,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     devices,
     llm_usage_events,
     llm_usage_event_attachments,
-    schema_backfills,
     search_outbox,
     session_titles,
 );

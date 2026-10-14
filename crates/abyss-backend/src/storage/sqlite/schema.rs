@@ -53,6 +53,7 @@ diesel::table! {
         user_id -> Text,
         session_pk -> Text,
         turn_index -> Integer,
+        turn_key -> Nullable<Text>,
         started_at -> BigInt,
         ended_at -> Nullable<BigInt>,
         created_at -> BigInt,
@@ -88,6 +89,9 @@ diesel::table! {
         observed_at -> BigInt,
         metadata -> Text,
         created_at -> BigInt,
+        stream_id -> Nullable<Text>,
+        response_id -> Nullable<Text>,
+        previous_response_id -> Nullable<Text>,
     }
 }
 
@@ -144,18 +148,7 @@ diesel::table! {
         title_observed_at -> Nullable<BigInt>,
         purpose -> Nullable<Text>,
         updated_at -> BigInt,
-        naming_turn_id -> Nullable<Text>,
-        naming_prompt -> Nullable<Text>,
         parent_session_pk -> Nullable<Text>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::{BigInt, Text};
-
-    schema_backfills (name) {
-        name -> Text,
-        completed_at -> BigInt,
     }
 }
 
@@ -186,6 +179,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     devices,
     llm_usage_events,
     llm_usage_event_attachments,
-    schema_backfills,
     session_titles,
 );

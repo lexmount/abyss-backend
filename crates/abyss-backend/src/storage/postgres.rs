@@ -47,8 +47,6 @@ impl PostgresEsBackend {
             db::run_migrations(&pool).map_err(|error| {
                 AppError::internal(format!("run PostgreSQL migrations: {error}"))
             })?;
-            let mut connection = pool.get()?;
-            session_titles::backfill(&mut connection)?;
         }
 
         let search = config.search.as_ref().map(SearchService::new).transpose()?;

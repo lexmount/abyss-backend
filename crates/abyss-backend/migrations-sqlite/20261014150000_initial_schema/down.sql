@@ -1,3 +1,4 @@
+DROP TABLE session_titles;
 DROP TABLE usage_events_fts;
 DROP TABLE agent_diagnostic_capture_events;
 DROP TABLE agent_diagnostic_captures;

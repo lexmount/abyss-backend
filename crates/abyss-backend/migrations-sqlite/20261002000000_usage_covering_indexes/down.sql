@@ -1,2 +1,0 @@
-DROP INDEX llm_usage_events_session_activity_idx;
-DROP INDEX llm_usage_events_summary_cover_idx;
