@@ -213,12 +213,12 @@ mod tests {
             "device": {"host_name": "alice-mbp", "platform": "macos"},
             "agent": {"name": agent},
             "session_id": session,
-            "turn_index": turn,
+            "turn_id": format!("{session}-{turn}"),
             "llm": {"provider": "OpenAI", "model": model},
             "event_type": "response",
             "text": "reply",
-            "token_usage": {"output_tokens": 10},
-            "metadata": {"response_id": id}
+            "token_usage": {"input_tokens": 0_i64, "output_tokens": 10_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 10_i64},
+            "metadata": {}
         })
     }
 
@@ -226,10 +226,10 @@ mod tests {
         let mut database = database();
         let request: IngestEventsRequest = serde_json::from_value(json!({
             "events": [
-                event("a1", "alpha", "Codex", "2026-09-01T00:00:00Z", 1),
-                event_with_model("a2", "alpha", "Codex", "2026-09-03T00:00:00Z", 2, "gpt-5-mini"),
+                event("a1", "alpha", "codex", "2026-09-01T00:00:00Z", 1),
+                event_with_model("a2", "alpha", "codex", "2026-09-03T00:00:00Z", 2, "gpt-5-mini"),
                 event("b1", "beta", "claude-desktop", "2026-09-02T00:00:00Z", 1),
-                event("c1", "gamma", "Codex", "2026-08-01T00:00:00Z", 1),
+                event("c1", "gamma", "codex", "2026-08-01T00:00:00Z", 1),
             ]
         }))
         .expect("request should deserialize");
@@ -272,15 +272,23 @@ mod tests {
     }
 
     #[test]
-    fn filters_by_agent_alias_and_activity_window() {
+    fn filters_by_exact_agent_and_activity_window() {
         let mut database = seeded();
-        let claude = SessionListQuery {
-            agent_name: vec!["Claude Code".to_owned()],
+        let desktop = SessionListQuery {
+            agent_name: vec!["claude-desktop".to_owned()],
             ..SessionListQuery::default()
         };
-        assert_eq!(list(&mut database, claude), [("beta".to_owned(), 1, 1)]);
+        assert_eq!(list(&mut database, desktop), [("beta".to_owned(), 1, 1)]);
+        // Claude Desktop is not an alias of Claude Code, and case is not folded.
+        for agent in ["claude-code", "Codex"] {
+            let other = SessionListQuery {
+                agent_name: vec![agent.to_owned()],
+                ..SessionListQuery::default()
+            };
+            assert_eq!(list(&mut database, other), Vec::new(), "{agent}");
+        }
         let either = SessionListQuery {
-            agent_name: vec!["Claude Code".to_owned(), "codex".to_owned()],
+            agent_name: vec!["claude-desktop".to_owned(), "codex".to_owned()],
             ..SessionListQuery::default()
         };
         assert_eq!(list(&mut database, either).len(), 3);

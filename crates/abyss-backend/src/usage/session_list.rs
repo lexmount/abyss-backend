@@ -4,10 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{
-    error::AppError,
-    usage::persistence::{agent_names_filter, exact_values_filter, providers_filter},
-};
+use crate::{error::AppError, usage::persistence::exact_values_filter};
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const MAX_PAGE_SIZE: u32 = 100;
@@ -19,8 +16,8 @@ pub struct SessionListQuery {
     pub from: Option<DateTime<Utc>>,
     /// Keeps sessions that started before this instant.
     pub to: Option<DateTime<Utc>>,
-    /// Agent-name filter; repeat the key for several Agents. Claude aliases
-    /// match together.
+    /// Agent-name filter, matched exactly as reported; repeat the key for
+    /// several Agents.
     #[serde(default)]
     pub agent_name: Vec<String>,
     /// Keeps sessions with at least one event from any of these LLM providers.
@@ -42,7 +39,7 @@ pub struct ValidatedSessionListQuery {
     pub to: Option<DateTime<Utc>>,
     /// Stored agent names to match, or empty for every Agent.
     pub agent_names: Vec<String>,
-    /// Normalized provider slugs; a session must have used one, or empty for any.
+    /// Exact providers; a session must have used one, or empty for any.
     pub llm_providers: Vec<String>,
     /// Exact models; a session must have used one, or empty for any.
     pub llm_models: Vec<String>,
@@ -74,8 +71,8 @@ impl SessionListQuery {
         Ok(ValidatedSessionListQuery {
             from: self.from,
             to: self.to,
-            agent_names: agent_names_filter(&self.agent_name),
-            llm_providers: providers_filter(&self.llm_provider),
+            agent_names: exact_values_filter(&self.agent_name),
+            llm_providers: exact_values_filter(&self.llm_provider),
             llm_models: exact_values_filter(&self.llm_model),
             page,
             page_size,
@@ -151,9 +148,13 @@ mod tests {
     }
 
     #[test]
-    fn expands_claude_aliases_and_computes_the_offset() {
+    fn keeps_agent_names_exact_and_computes_the_offset() {
         let query = SessionListQuery {
-            agent_name: vec![" Claude ".to_owned(), "codex".to_owned()],
+            agent_name: vec![
+                " claude-desktop ".to_owned(),
+                "claude-code".to_owned(),
+                "codex".to_owned(),
+            ],
             page: Some(3),
             page_size: Some(25),
             ..SessionListQuery::default()
@@ -163,12 +164,12 @@ mod tests {
         assert_eq!(query.offset, 50);
         assert_eq!(
             query.agent_names,
-            ["claude", "claude-code", "claude-desktop", "codex"]
+            ["claude-code", "claude-desktop", "codex"]
         );
     }
 
     #[test]
-    fn normalizes_providers_and_keeps_models_verbatim() {
+    fn keeps_providers_and_models_verbatim() {
         let query = SessionListQuery {
             llm_provider: vec![" OpenAI ".to_owned(), "anthropic".to_owned()],
             llm_model: vec![" gpt-5 ".to_owned(), "Claude-Opus".to_owned()],
@@ -176,7 +177,7 @@ mod tests {
         }
         .validate()
         .expect("valid");
-        assert_eq!(query.llm_providers, ["anthropic", "openai"]);
+        assert_eq!(query.llm_providers, ["OpenAI", "anthropic"]);
         assert_eq!(query.llm_models, ["Claude-Opus", "gpt-5"]);
         let blank = SessionListQuery {
             llm_model: vec!["  ".to_owned()],

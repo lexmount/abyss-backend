@@ -82,6 +82,7 @@ pub(super) struct TurnRow {
     pub(super) user_id: String,
     pub(super) session_pk: String,
     pub(super) turn_index: i32,
+    pub(super) turn_key: Option<String>,
     pub(super) started_at: i64,
     pub(super) ended_at: Option<i64>,
     pub(super) created_at: i64,
@@ -95,6 +96,7 @@ pub(super) struct NewTurn {
     pub(super) user_id: String,
     pub(super) session_pk: String,
     pub(super) turn_index: i32,
+    pub(super) turn_key: Option<String>,
     pub(super) started_at: i64,
     pub(super) ended_at: Option<i64>,
     pub(super) created_at: i64,
@@ -129,6 +131,9 @@ pub(super) struct EventRow {
     pub(super) observed_at: i64,
     pub(super) metadata: String,
     pub(super) created_at: i64,
+    pub(super) stream_id: Option<String>,
+    pub(super) response_id: Option<String>,
+    pub(super) previous_response_id: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -158,6 +163,9 @@ pub(super) struct NewEvent {
     pub(super) observed_at: i64,
     pub(super) metadata: String,
     pub(super) created_at: i64,
+    pub(super) stream_id: Option<String>,
+    pub(super) response_id: Option<String>,
+    pub(super) previous_response_id: Option<String>,
 }
 
 #[derive(Queryable, Selectable)]
@@ -261,15 +269,14 @@ pub(super) struct EventRecord {
     pub(super) total_tokens: i64,
     pub(super) observed_at: DateTime<Utc>,
     pub(super) metadata: Value,
+    pub(super) stream_id: Option<String>,
+    pub(super) response_id: Option<String>,
+    pub(super) previous_response_id: Option<String>,
 }
 
 impl TimelineEvent for EventRecord {
     fn turn_index(&self) -> i32 {
         self.turn_index
-    }
-
-    fn metadata(&self) -> &Value {
-        &self.metadata
     }
 
     fn observed_at(&self) -> DateTime<Utc> {
@@ -372,6 +379,9 @@ impl EventRow {
             total_tokens: self.total_tokens,
             observed_at: timestamp_from_micros(self.observed_at)?,
             metadata: parse_json(&self.metadata, "event metadata")?,
+            stream_id: self.stream_id,
+            response_id: self.response_id,
+            previous_response_id: self.previous_response_id,
         })
     }
 }

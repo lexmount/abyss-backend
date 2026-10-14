@@ -10,13 +10,16 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use diesel::{
-    Connection, ExpressionMethods, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
+    Connection, ExpressionMethods, IntoSql, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
+    SelectableHelper, define_sql_function,
     dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
     sql_types::{
-        Array, BigInt, Bool, Bytea, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
+        Array, BigInt, Bool, Bytea, Integer, Jsonb, Nullable, SingleValue, Text, Timestamptz,
+        Uuid as SqlUuid,
     },
+    upsert::excluded,
 };
 use uuid::Uuid;
 
@@ -46,21 +49,18 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            SessionTurnAttachment, TurnIdentity, TurnIdentityKind, agent_names_filter,
-            canonical_agent_name, escape_like_pattern, exact_values_filter, non_empty,
-            non_negative_count, normalize_limit, normalize_slug, normalize_text,
-            normalized_optional, normalized_tokens, parse_group_by, providers_filter,
-            session_turn_attachment, sha256_bytes, turn_identity, unix_epoch, validate_batch,
-            validate_event_type,
+            escape_like_pattern, exact_values_filter, non_empty, non_negative_count,
+            normalize_limit, normalize_text, parse_group_by, sha256_bytes, unix_epoch,
+            validate_batch, validate_event_type,
         },
-        session_metadata_from_event,
     },
 };
 
 use super::session_titles;
 
-#[cfg(test)]
-use crate::usage::persistence::turn_identity_from_metadata;
+define_sql_function!(fn coalesce<ST: SingleValue>(value: Nullable<ST>, fallback: Nullable<ST>) -> Nullable<ST>);
+define_sql_function!(fn least<ST: SingleValue>(left: ST, right: ST) -> ST);
+define_sql_function!(fn greatest<ST: SingleValue>(left: ST, right: ST) -> ST);
 
 const SUMMARY_AGGREGATE_SQL: &str = "\
     SELECT \
@@ -71,12 +71,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         CASE WHEN $3 THEN d.host_name END AS host_name, \
         CASE WHEN $3 THEN d.platform END AS platform, \
         CASE WHEN $3 THEN d.os_version END AS os_version, \
-        CASE \
-            WHEN $4 THEN CASE \
-                WHEN e.agent_name IN ('claude', 'claude-code', 'claude-desktop') THEN 'claude-code' \
-                ELSE e.agent_name \
-            END \
-        END AS agent_name, \
+        CASE WHEN $4 THEN e.agent_name END AS agent_name, \
         CASE WHEN $5 THEN e.llm_provider END AS llm_provider, \
         CASE WHEN $6 THEN e.llm_model END AS llm_model, \
         CASE WHEN $7 THEN e.event_type END AS event_type, \
@@ -397,11 +392,8 @@ type OutlineRow = (
     i64,
     i64,
     i64,
-    bool,
     DateTime<Utc>,
     i64,
-    Option<String>,
-    Option<String>,
     Option<String>,
 );
 
@@ -430,21 +422,12 @@ pub fn session_outline(
             llm_usage_events::cache_write_tokens,
             llm_usage_events::reasoning_tokens,
             llm_usage_events::total_tokens,
-            sql::<Bool>("coalesce(metadata -> 'token_usage_estimated' = 'true'::jsonb, false)"),
             llm_usage_events::observed_at,
             sql::<BigInt>("coalesce(char_length(text), 0)::bigint"),
             sql::<Nullable<Text>>(&format!(
                 "CASE WHEN event_type = 'request' THEN right(text, {OUTLINE_PREVIEW_CHARS}) \
                  ELSE left(text, {OUTLINE_PREVIEW_CHARS}) END"
             )),
-            sql::<Nullable<Text>>(
-                "CASE WHEN jsonb_typeof(metadata -> 'response_id') = 'string' \
-                 THEN metadata ->> 'response_id' END",
-            ),
-            sql::<Nullable<Text>>(
-                "CASE WHEN jsonb_typeof(metadata -> 'previous_response_id') = 'string' \
-                 THEN metadata ->> 'previous_response_id' END",
-            ),
         ))
         .load::<OutlineRow>(connection)?;
     let event_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
@@ -471,12 +454,10 @@ pub fn session_outline(
             cache_write_tokens: row.10,
             reasoning_tokens: row.11,
             total_tokens: row.12,
-            token_usage_estimated: row.13,
-            observed_at: row.14,
-            text_chars: row.15,
-            preview: row.16,
+            observed_at: row.13,
+            text_chars: row.14,
+            preview: row.15,
             attachment_count: attachment_counts.get(&row.0).copied().unwrap_or(0),
-            ordering_metadata: UsageEventOutline::ordering_metadata(row.17, row.18),
         })
         .collect::<Vec<_>>();
     UsageEventTimelineOrder::sort(&mut events);
@@ -535,7 +516,7 @@ fn assemble_timeline<E>(
             session_pk: session.id,
             user_id: session.user_id,
             device_context_id: session.device_context_id,
-            agent_name: canonical_agent_name(&session.agent_name),
+            agent_name: session.agent_name,
             agent_version: session.agent_version,
             session_id: session.session_id,
             started_at: session.started_at,
@@ -686,10 +667,10 @@ fn ingest_one_event(
 ) -> Result<bool, AppError> {
     let observed_at = event.observed_at;
     let now = Utc::now();
-    let agent_name = canonical_agent_name(&event.agent.name);
-    let agent_version = normalized_optional(event.agent.version.as_deref());
-    let provider = normalize_slug(&event.llm.provider);
-    let model = normalize_text(&event.llm.model);
+    let agent_name = event.agent.name.clone();
+    let agent_version = event.agent.version.clone();
+    let provider = event.llm.provider.clone();
+    let model = event.llm.model.clone();
 
     let device = upsert_device(connection, user_id, event, observed_at, now)?;
     let session = upsert_session(
@@ -704,17 +685,16 @@ fn ingest_one_event(
             now,
         },
     )?;
-    let turn_index = resolve_turn_index(connection, session.id, event, &agent_name, observed_at)?;
-    let turn = upsert_turn(
+    let (turn_pk, turn_index) = place_in_turn(
         connection,
         user_id,
         session.id,
-        turn_index,
+        event.turn_id.as_deref(),
         observed_at,
         now,
     )?;
-    let tokens = normalized_tokens(event)?;
-    let text = normalized_optional(event.text.as_deref());
+    let tokens = &event.token_usage;
+    let text = event.text.clone();
 
     // `event_id` is the idempotency key supplied by the collector. Duplicate
     // observations are accepted as no-ops instead of failing the whole batch.
@@ -725,26 +705,29 @@ fn ingest_one_event(
             user_id,
             device_context_id: device.id,
             session_pk: session.id,
-            turn_pk: turn.id,
-            event_id: normalize_text(&event.event_id),
+            turn_pk,
+            event_id: event.event_id.clone(),
             agent_name: agent_name.clone(),
             agent_version,
-            session_id: normalize_text(&event.session_id),
+            session_id: event.session_id.clone(),
             turn_index,
             llm_provider: provider,
             llm_model: model,
             event_type: event.event_type.as_str().to_owned(),
             text_sha256: text.as_deref().map(sha256_bytes),
             text,
-            input_tokens: tokens.input,
-            output_tokens: tokens.output,
-            cache_read_tokens: tokens.cache_read,
-            cache_write_tokens: tokens.cache_write,
-            reasoning_tokens: tokens.reasoning,
-            total_tokens: tokens.total,
+            input_tokens: tokens.input_tokens.unwrap_or_default(),
+            output_tokens: tokens.output_tokens.unwrap_or_default(),
+            cache_read_tokens: tokens.cache_read_tokens.unwrap_or_default(),
+            cache_write_tokens: tokens.cache_write_tokens.unwrap_or_default(),
+            reasoning_tokens: tokens.reasoning_tokens.unwrap_or_default(),
+            total_tokens: tokens.total_tokens.unwrap_or_default(),
             observed_at,
             metadata: event.metadata.clone(),
             created_at: now,
+            stream_id: event.stream_id.clone(),
+            response_id: event.response_id.clone(),
+            previous_response_id: event.previous_response_id.clone(),
         })
         .on_conflict(llm_usage_events::event_id)
         .do_nothing()
@@ -774,6 +757,7 @@ fn ingest_one_event(
                 event_pk: usage_event_id,
                 event_type: event.event_type.as_str(),
                 metadata: &event.metadata,
+                naming_thread: event.naming_thread,
                 observed_at,
             },
         )?;
@@ -823,9 +807,9 @@ fn upsert_device(
         .values(NewDevice {
             id: Uuid::now_v7(),
             user_id,
-            host_name: normalize_text(&event.device.host_name),
-            platform: normalize_slug(&event.device.platform),
-            os_version: normalized_optional(event.device.os_version.as_deref()),
+            host_name: event.device.host_name.clone(),
+            platform: event.device.platform.clone(),
+            os_version: event.device.os_version.clone(),
             first_seen_at: observed_at,
             last_seen_at: observed_at,
             created_at: now,
@@ -834,14 +818,14 @@ fn upsert_device(
         .on_conflict((devices::user_id, devices::host_name, devices::platform))
         .do_update()
         .set((
-            devices::os_version.eq(sql::<Nullable<Text>>(
-                "COALESCE(EXCLUDED.os_version, devices.os_version)",
+            devices::os_version.eq(coalesce(excluded(devices::os_version), devices::os_version)),
+            devices::first_seen_at.eq(least(
+                devices::first_seen_at,
+                excluded(devices::first_seen_at),
             )),
-            devices::first_seen_at.eq(sql::<Timestamptz>(
-                "LEAST(devices.first_seen_at, EXCLUDED.first_seen_at)",
-            )),
-            devices::last_seen_at.eq(sql::<Timestamptz>(
-                "GREATEST(devices.last_seen_at, EXCLUDED.last_seen_at)",
+            devices::last_seen_at.eq(greatest(
+                devices::last_seen_at,
+                excluded(devices::last_seen_at),
             )),
             devices::updated_at.eq(now),
         ))
@@ -853,7 +837,7 @@ fn upsert_session(
     connection: &mut PgConnection,
     input: UpsertSessionInput<'_>,
 ) -> Result<AgentSession, AppError> {
-    let session_id = normalize_text(&input.event.session_id);
+    let session_id = input.event.session_id.clone();
     diesel::insert_into(agent_sessions::table)
         .values(NewAgentSession {
             id: Uuid::now_v7(),
@@ -864,7 +848,7 @@ fn upsert_session(
             session_id,
             started_at: input.observed_at,
             ended_at: Some(input.observed_at),
-            metadata: session_metadata_from_event(&input.event.metadata),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
             created_at: input.now,
             updated_at: input.now,
         })
@@ -875,217 +859,180 @@ fn upsert_session(
         ))
         .do_update()
         .set((
-            agent_sessions::device_context_id
-                .eq(sql::<diesel::sql_types::Uuid>("EXCLUDED.device_context_id")),
-            agent_sessions::agent_version.eq(sql::<Nullable<Text>>(
-                "COALESCE(EXCLUDED.agent_version, agent_sessions.agent_version)",
+            agent_sessions::device_context_id.eq(excluded(agent_sessions::device_context_id)),
+            agent_sessions::agent_version.eq(coalesce(
+                excluded(agent_sessions::agent_version),
+                agent_sessions::agent_version,
             )),
-            agent_sessions::started_at.eq(sql::<Timestamptz>(
-                "LEAST(agent_sessions.started_at, EXCLUDED.started_at)",
+            agent_sessions::started_at.eq(least(
+                agent_sessions::started_at,
+                excluded(agent_sessions::started_at),
             )),
-            agent_sessions::ended_at.eq(sql::<Nullable<Timestamptz>>(
-                "GREATEST(COALESCE(agent_sessions.ended_at, EXCLUDED.ended_at), EXCLUDED.ended_at)",
+            agent_sessions::ended_at.eq(greatest(
+                coalesce(agent_sessions::ended_at, excluded(agent_sessions::ended_at)),
+                excluded(agent_sessions::ended_at),
             )),
-            agent_sessions::metadata
-                .eq(sql::<Jsonb>("agent_sessions.metadata || EXCLUDED.metadata")),
             agent_sessions::updated_at.eq(input.now),
         ))
         .get_result::<AgentSession>(connection)
         .map_err(AppError::from)
 }
 
-fn resolve_turn_index(
+/// Places an event in a turn of its session and returns the turn's id and
+/// position.
+///
+/// Events naming the same turn share it, and an event naming none joins the
+/// turn in progress when it was observed. Turns are numbered by when they
+/// started, so a turn that arrives late moves the turns after it.
+fn place_in_turn(
     connection: &mut PgConnection,
+    user_id: Uuid,
     session_pk: Uuid,
-    event: &IngestUsageEvent,
-    agent_name: &str,
+    turn_id: Option<&str>,
     observed_at: DateTime<Utc>,
-) -> Result<i32, AppError> {
-    if let Some(attachment) = session_turn_attachment(agent_name, &event.metadata)
-        && let Some(turn_index) =
-            attached_turn_index(connection, session_pk, &attachment, observed_at)?
-    {
-        return Ok(turn_index);
-    }
-    // Events of one turn share its identity; an event without any identity
-    // is a turn of its own.
-    if let Some(identity) = turn_identity(event)
-        && let Some(existing) = existing_turn_index_for_identity(connection, session_pk, &identity)?
-    {
-        return Ok(existing);
-    }
-    next_session_turn_index(connection, session_pk)
+    now: DateTime<Utc>,
+) -> Result<(Uuid, i32), AppError> {
+    let found = match turn_id {
+        Some(key) => named_turn(connection, session_pk, key)?,
+        None => turn_in_progress(connection, session_pk, observed_at)?,
+    };
+    let (turn_pk, turn_index, reordered) = if let Some(turn) = found {
+        diesel::update(agent_turns::table.find(turn.id))
+            .set((
+                agent_turns::started_at.eq(turn.started_at.min(observed_at)),
+                agent_turns::ended_at
+                    .eq(Some(turn.ended_at.unwrap_or(observed_at).max(observed_at))),
+                agent_turns::updated_at.eq(now),
+            ))
+            .execute(connection)?;
+        (turn.id, turn.turn_index, observed_at < turn.started_at)
+    } else {
+        let last = agent_turns::table
+            .filter(agent_turns::session_pk.eq(session_pk))
+            .select(max(agent_turns::turn_index))
+            .get_result::<Option<i32>>(connection)?;
+        let id = Uuid::now_v7();
+        let turn_index = last.unwrap_or(0_i32).saturating_add(1_i32);
+        diesel::insert_into(agent_turns::table)
+            .values(NewAgentTurn {
+                id,
+                user_id,
+                session_pk,
+                turn_index,
+                turn_key: turn_id.map(str::to_owned),
+                started_at: observed_at,
+                ended_at: Some(observed_at),
+                created_at: now,
+                updated_at: now,
+            })
+            .execute(connection)?;
+        (id, turn_index, last.is_some())
+    };
+    let turn_index = if reordered && number_turns(connection, session_pk)? {
+        agent_turns::table
+            .find(turn_pk)
+            .select(agent_turns::turn_index)
+            .get_result::<i32>(connection)?
+    } else {
+        turn_index
+    };
+    Ok((turn_pk, turn_index))
 }
 
-/// Finds the stored turn a Claude Code side or subagent request belongs to;
-/// `None` only when the session has no turn yet.
-fn attached_turn_index(
+/// The turn named `key` in a session. The first named turn adopts the turn
+/// that events naming none opened at the start of the session.
+fn named_turn(
     connection: &mut PgConnection,
     session_pk: Uuid,
-    attachment: &SessionTurnAttachment,
-    observed_at: DateTime<Utc>,
-) -> Result<Option<i32>, AppError> {
-    if let Some(prompt_id) = &attachment.prompt_id {
-        // Only main-loop events anchor a prompt, and each prompt id belongs to
-        // one turn. Walking the session index from its latest turn usually
-        // stops within the current turn instead of detoasting every megabyte
-        // metadata row of the session.
-        let prompt_turn = sql_query(
-            "SELECT turn_index \
-             FROM llm_usage_events \
-             WHERE session_pk = $1 \
-               AND metadata->'claude_code_billing'->>'cc_prompt_id' = $2 \
-               AND metadata->>'claude_turn_id' IS NOT NULL \
-             ORDER BY turn_index DESC, observed_at DESC \
-             LIMIT 1",
-        )
-        .bind::<SqlUuid, _>(session_pk)
-        .bind::<Text, _>(prompt_id)
-        .get_result::<TurnIndexRow>(connection)
+    key: &str,
+) -> Result<Option<AgentTurn>, AppError> {
+    let named = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session_pk))
+        .filter(agent_turns::turn_key.eq(key))
+        .select(AgentTurn::as_select())
+        .first::<AgentTurn>(connection)
         .optional()?;
-        if let Some(row) = prompt_turn {
-            return Ok(Some(row.turn_index));
-        }
+    if named.is_some() {
+        return Ok(named);
     }
-    // Events may arrive out of order, so the observation time picks the turn.
-    let preceding = agent_turns::table
+    let mut turns = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session_pk))
+        .select(AgentTurn::as_select())
+        .limit(2_i64)
+        .load::<AgentTurn>(connection)?;
+    let opening = match turns.as_slice() {
+        [turn] if turn.turn_key.is_none() => turns.pop(),
+        _ => None,
+    };
+    if let Some(turn) = &opening {
+        diesel::update(agent_turns::table.find(turn.id))
+            .set(agent_turns::turn_key.eq(key))
+            .execute(connection)?;
+    }
+    Ok(opening)
+}
+
+/// The turn in progress when an event naming no turn was observed: the latest
+/// turn started by then, else the first turn of the session.
+fn turn_in_progress(
+    connection: &mut PgConnection,
+    session_pk: Uuid,
+    observed_at: DateTime<Utc>,
+) -> Result<Option<AgentTurn>, AppError> {
+    let started = agent_turns::table
         .filter(agent_turns::session_pk.eq(session_pk))
         .filter(agent_turns::started_at.le(observed_at))
-        .order_by((
-            agent_turns::started_at.desc(),
-            agent_turns::turn_index.desc(),
-        ))
-        .select(agent_turns::turn_index)
-        .first::<i32>(connection)
+        .order_by((agent_turns::started_at.desc(), agent_turns::id.desc()))
+        .select(AgentTurn::as_select())
+        .first::<AgentTurn>(connection)
         .optional()?;
-    if preceding.is_some() {
-        return Ok(preceding);
+    if started.is_some() {
+        return Ok(started);
     }
     agent_turns::table
         .filter(agent_turns::session_pk.eq(session_pk))
-        .order_by((agent_turns::started_at.asc(), agent_turns::turn_index.asc()))
-        .select(agent_turns::turn_index)
-        .first::<i32>(connection)
+        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
+        .select(AgentTurn::as_select())
+        .first::<AgentTurn>(connection)
         .optional()
         .map_err(AppError::from)
 }
 
-fn existing_turn_index_for_identity(
-    connection: &mut PgConnection,
-    session_pk: Uuid,
-    identity: &TurnIdentity,
-) -> Result<Option<i32>, AppError> {
-    let row = match &identity.kind {
-        TurnIdentityKind::CodexTurnId => sql_query(
-            "SELECT turn_index \
-             FROM llm_usage_events \
-             WHERE session_pk = $1 AND metadata->>'codex_turn_id' = $2 \
-             ORDER BY observed_at ASC \
-             LIMIT 1",
-        )
-        .bind::<SqlUuid, _>(session_pk)
-        .bind::<Text, _>(&identity.value)
-        .get_result::<TurnIndexRow>(connection),
-        TurnIdentityKind::ClaudeTurnId => sql_query(
-            "SELECT turn_index \
-             FROM llm_usage_events \
-             WHERE session_pk = $1 AND metadata->>'claude_turn_id' = $2 \
-             ORDER BY observed_at ASC \
-             LIMIT 1",
-        )
-        .bind::<SqlUuid, _>(session_pk)
-        .bind::<Text, _>(&identity.value)
-        .get_result::<TurnIndexRow>(connection),
-        TurnIdentityKind::TurnId => sql_query(
-            "SELECT turn_index \
-             FROM llm_usage_events \
-             WHERE session_pk = $1 AND metadata->>'turn_id' = $2 \
-             ORDER BY observed_at ASC \
-             LIMIT 1",
-        )
-        .bind::<SqlUuid, _>(session_pk)
-        .bind::<Text, _>(&identity.value)
-        .get_result::<TurnIndexRow>(connection),
-        TurnIdentityKind::ResponseId => sql_query(
-            "SELECT turn_index \
-             FROM llm_usage_events \
-             WHERE session_pk = $1 AND metadata->>'response_id' = $2 \
-             ORDER BY observed_at ASC \
-             LIMIT 1",
-        )
-        .bind::<SqlUuid, _>(session_pk)
-        .bind::<Text, _>(&identity.value)
-        .get_result::<TurnIndexRow>(connection),
-        TurnIdentityKind::MessageId => sql_query(
-            "SELECT turn_index \
-             FROM llm_usage_events \
-             WHERE session_pk = $1 AND metadata->>'message_id' = $2 \
-             ORDER BY observed_at ASC \
-             LIMIT 1",
-        )
-        .bind::<SqlUuid, _>(session_pk)
-        .bind::<Text, _>(&identity.value)
-        .get_result::<TurnIndexRow>(connection),
-        TurnIdentityKind::RequestHash => sql_query(
-            "SELECT turn_index \
-             FROM llm_usage_events \
-             WHERE session_pk = $1 AND metadata->>'request_hash' = $2 \
-             ORDER BY observed_at ASC \
-             LIMIT 1",
-        )
-        .bind::<SqlUuid, _>(session_pk)
-        .bind::<Text, _>(&identity.value)
-        .get_result::<TurnIndexRow>(connection),
-    };
-    row.optional()
-        .map(|row| row.map(|row| row.turn_index))
-        .map_err(AppError::from)
-}
-
-fn next_session_turn_index(
-    connection: &mut PgConnection,
-    session_pk: Uuid,
-) -> Result<i32, AppError> {
-    agent_turns::table
+/// Numbers the turns of a session, and their events, by when the turns
+/// started. Writes nothing and returns `false` while the numbers already
+/// follow that order.
+fn number_turns(connection: &mut PgConnection, session_pk: Uuid) -> Result<bool, AppError> {
+    let turns = agent_turns::table
         .filter(agent_turns::session_pk.eq(session_pk))
-        .select(max(agent_turns::turn_index))
-        .get_result::<Option<i32>>(connection)
-        .map(|value| value.unwrap_or(0_i32).saturating_add(1_i32))
-        .map_err(AppError::from)
-}
-
-fn upsert_turn(
-    connection: &mut PgConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-    turn_index: i32,
-    observed_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Result<AgentTurn, AppError> {
-    diesel::insert_into(agent_turns::table)
-        .values(NewAgentTurn {
-            id: Uuid::now_v7(),
-            user_id,
-            session_pk,
-            turn_index,
-            started_at: observed_at,
-            ended_at: Some(observed_at),
-            created_at: now,
-            updated_at: now,
-        })
-        .on_conflict((agent_turns::session_pk, agent_turns::turn_index))
-        .do_update()
-        .set((
-            agent_turns::started_at.eq(sql::<Timestamptz>(
-                "LEAST(agent_turns.started_at, EXCLUDED.started_at)",
-            )),
-            agent_turns::ended_at.eq(sql::<Nullable<Timestamptz>>(
-                "GREATEST(COALESCE(agent_turns.ended_at, EXCLUDED.ended_at), EXCLUDED.ended_at)",
-            )),
-            agent_turns::updated_at.eq(now),
-        ))
-        .get_result::<AgentTurn>(connection)
-        .map_err(AppError::from)
+        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
+        .select((agent_turns::id, agent_turns::turn_index))
+        .load::<(Uuid, i32)>(connection)?;
+    let moved = turns
+        .iter()
+        .zip(1_i32..)
+        .filter(|((_, index), position)| index != position)
+        .map(|((id, _), position)| (*id, position))
+        .collect::<Vec<_>>();
+    if moved.is_empty() {
+        return Ok(false);
+    }
+    // Moved turns first step above every current number, so no single-row
+    // update collides with another turn's number or goes below one.
+    let above = turns.iter().map(|(_, index)| *index).max().unwrap_or(0_i32);
+    for (id, position) in &moved {
+        diesel::update(agent_turns::table.find(*id))
+            .set(agent_turns::turn_index.eq(above.saturating_add(*position)))
+            .execute(connection)?;
+    }
+    for (id, position) in moved {
+        diesel::update(agent_turns::table.find(id))
+            .set(agent_turns::turn_index.eq(position))
+            .execute(connection)?;
+        diesel::update(llm_usage_events::table.filter(llm_usage_events::turn_pk.eq(id)))
+            .set(llm_usage_events::turn_index.eq(position))
+            .execute(connection)?;
+    }
+    Ok(true)
 }
 
 /// Loads matching events newest first. Without content, text and metadata are
@@ -1111,7 +1058,7 @@ fn load_filtered_events(
     if let Some(to) = filters.to {
         query = query.filter(llm_usage_events::observed_at.lt(to));
     }
-    let agent_names = agent_names_filter(filters.agent_names);
+    let agent_names = exact_values_filter(filters.agent_names);
     if !agent_names.is_empty() {
         query = query.filter(llm_usage_events::agent_name.eq_any(agent_names));
     }
@@ -1125,7 +1072,7 @@ fn load_filtered_events(
     if let Some(turn_index) = filters.turn_index {
         query = query.filter(llm_usage_events::turn_index.eq(turn_index));
     }
-    let providers = providers_filter(filters.llm_providers);
+    let providers = exact_values_filter(filters.llm_providers);
     if !providers.is_empty() {
         query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
     }
@@ -1159,8 +1106,8 @@ fn load_filtered_events(
             llm_usage_events::llm_provider,
             llm_usage_events::llm_model,
             llm_usage_events::event_type,
-            sql::<Nullable<Text>>("NULL"),
-            sql::<Nullable<Bytea>>("NULL"),
+            None::<String>.into_sql::<Nullable<Text>>(),
+            None::<Vec<u8>>.into_sql::<Nullable<Bytea>>(),
             llm_usage_events::input_tokens,
             llm_usage_events::output_tokens,
             llm_usage_events::cache_read_tokens,
@@ -1168,8 +1115,11 @@ fn load_filtered_events(
             llm_usage_events::reasoning_tokens,
             llm_usage_events::total_tokens,
             llm_usage_events::observed_at,
-            sql::<Jsonb>("'{}'::jsonb"),
+            serde_json::json!({}).into_sql::<Jsonb>(),
             llm_usage_events::created_at,
+            llm_usage_events::stream_id,
+            llm_usage_events::response_id,
+            llm_usage_events::previous_response_id,
         ))
         .load::<UsageEvent>(connection)
         .map_err(AppError::from)
@@ -1252,7 +1202,7 @@ fn event_response(
         platform: device.map(|value| value.platform.clone()),
         session_pk: event.session_pk,
         turn_pk: event.turn_pk,
-        agent_name: canonical_agent_name(&event.agent_name),
+        agent_name: event.agent_name,
         agent_version: event.agent_version,
         session_id: event.session_id,
         turn_index: event.turn_index,
@@ -1268,6 +1218,9 @@ fn event_response(
         reasoning_tokens: event.reasoning_tokens,
         total_tokens: event.total_tokens,
         observed_at: event.observed_at,
+        stream_id: event.stream_id,
+        response_id: event.response_id,
+        previous_response_id: event.previous_response_id,
         metadata: event.metadata,
         attachments,
     }
@@ -1397,9 +1350,9 @@ impl SummarySqlFilters {
         let user_filter_id = user_filter.and_then(|value| Uuid::parse_str(value).ok());
         let user_filter_pattern =
             user_filter.map(|value| format!("%{}%", escape_like_pattern(value)));
-        let agent_names = agent_names_filter(filters.agent_names);
+        let agent_names = exact_values_filter(filters.agent_names);
         let session_ids = exact_values_filter(filters.session_ids);
-        let providers = providers_filter(filters.llm_providers);
+        let providers = exact_values_filter(filters.llm_providers);
         let models = exact_values_filter(filters.llm_models);
         let event_type = filters.event_type.map(validate_event_type).transpose()?;
 
@@ -1494,12 +1447,6 @@ impl From<SummaryAggregateRow> for SummaryRow {
     }
 }
 
-#[derive(QueryableByName)]
-struct TurnIndexRow {
-    #[diesel(sql_type = Integer)]
-    turn_index: i32,
-}
-
 struct UpsertSessionInput<'a> {
     device: &'a Device,
     user_id: Uuid,
@@ -1515,10 +1462,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::{
-        EventFilters, SummaryDimension, SummaryDimensions, SummarySqlFilters, TurnIdentityKind,
-        canonical_agent_name, event_response, latest_optional, normalize_limit, normalize_slug,
-        normalized_tokens, parse_group_by, turn_identity_from_metadata, validate_batch,
-        validate_event_type,
+        EventFilters, SummaryDimension, SummaryDimensions, SummarySqlFilters, event_response,
+        latest_optional, normalize_limit, parse_group_by, validate_batch, validate_event_type,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::json;
@@ -1529,7 +1474,7 @@ mod tests {
         error::AppError,
         usage::{
             AgentPayload, DevicePayload, IngestEventsRequest, IngestUsageEvent, LlmPayload,
-            SummaryRow, TokenUsagePayload, UsageEventType, persistence::agent_name_filter_values,
+            SummaryRow, TokenUsagePayload, UsageEventType,
         },
     };
 
@@ -1674,41 +1619,11 @@ mod tests {
             os_version: includes("device")
                 .then(|| device.and_then(|value| value.os_version.clone()))
                 .flatten(),
-            agent_name: includes("agent").then(|| canonical_agent_name(&event.agent_name)),
+            agent_name: includes("agent").then(|| event.agent_name.clone()),
             llm_provider: includes("provider").then(|| event.llm_provider.clone()),
             llm_model: includes("model").then(|| event.llm_model.clone()),
             event_type: includes("event_type").then(|| event.event_type.clone()),
         }
-    }
-
-    #[test]
-    fn normalize_slug_converts_agent_names() {
-        assert_eq!(
-            normalize_slug("Claude Code"),
-            "claude-code",
-            "agent names should be normalized to lowercase kebab-case"
-        );
-    }
-
-    #[test]
-    fn canonical_agent_name_groups_claude_clients() {
-        assert_eq!(canonical_agent_name("Claude"), "claude-code");
-        assert_eq!(canonical_agent_name("Claude Code"), "claude-code");
-        assert_eq!(canonical_agent_name("claude-desktop"), "claude-code");
-        assert_eq!(canonical_agent_name("Codex"), "codex");
-    }
-
-    #[test]
-    fn agent_name_filter_values_include_historical_claude_slugs() {
-        assert_eq!(
-            agent_name_filter_values("Claude Code"),
-            vec![
-                "claude-code".to_owned(),
-                "claude".to_owned(),
-                "claude-desktop".to_owned(),
-            ]
-        );
-        assert_eq!(agent_name_filter_values("Codex"), vec!["codex".to_owned()]);
     }
 
     #[test]
@@ -1762,13 +1677,13 @@ mod tests {
     }
 
     #[test]
-    fn summary_sql_filters_normalize_runtime_filters() {
+    fn summary_sql_filters_trim_and_dedupe_runtime_filters() {
         let filters = EventFilters {
             user_id: fixed_uuid(42_u128),
             from: Some(timestamp(2_u32, 0_u32, 0_u32)),
             to: None,
             user_filter: Some(" Alice_% "),
-            agent_names: &["Claude Desktop".to_owned(), "codex".to_owned()],
+            agent_names: &[" claude-desktop ".to_owned(), "codex".to_owned()],
             session_ids: &[" session-1 ".to_owned(), "session-2".to_owned()],
             session_pk: None,
             turn_index: None,
@@ -1794,14 +1709,11 @@ mod tests {
             sql_filters.user_filter_pattern.as_deref(),
             Some("%Alice\\_\\%%")
         );
-        assert_eq!(
-            sql_filters.agent_names,
-            ["claude", "claude-code", "claude-desktop", "codex"]
-        );
+        assert_eq!(sql_filters.agent_names, ["claude-desktop", "codex"]);
         assert_eq!(sql_filters.session_ids, ["session-1", "session-2"]);
         assert_eq!(sql_filters.session_pk, None);
         assert_eq!(sql_filters.turn_index, None);
-        assert_eq!(sql_filters.providers, ["openai"]);
+        assert_eq!(sql_filters.providers, ["OpenAI"]);
         assert_eq!(sql_filters.models, ["gpt-5.5", "o3"]);
         assert_eq!(sql_filters.event_type.as_deref(), Some("response"));
     }
@@ -1818,42 +1730,6 @@ mod tests {
         assert!(
             matches!(&error, AppError::Validation(message) if message.contains("batch size")),
             "oversized batch should return a validation error"
-        );
-    }
-
-    #[test]
-    fn normalized_tokens_derives_total_from_components() {
-        let mut event = sample_event();
-        event.token_usage = TokenUsagePayload {
-            input_tokens: Some(11_i64),
-            output_tokens: Some(13_i64),
-            cache_read_tokens: Some(2_i64),
-            cache_write_tokens: Some(3_i64),
-            reasoning_tokens: Some(5_i64),
-            total_tokens: None,
-        };
-
-        let tokens = normalized_tokens(&event).expect("token usage should normalize");
-        assert_eq!(
-            tokens.total, 29_i64,
-            "missing total_tokens should sum disjoint counters without adding reasoning twice"
-        );
-    }
-
-    #[test]
-    fn normalized_tokens_rejects_negative_components() {
-        let mut event = sample_event();
-        event.token_usage = TokenUsagePayload {
-            input_tokens: Some(-1_i64),
-            ..TokenUsagePayload::default()
-        };
-
-        let Err(error) = normalized_tokens(&event) else {
-            panic!("negative token usage should be invalid");
-        };
-        assert!(
-            matches!(&error, AppError::Validation(message) if message.contains("input_tokens")),
-            "negative input_tokens should return a validation error"
         );
     }
 
@@ -1879,38 +1755,6 @@ mod tests {
             matches!(&error, AppError::Validation(message) if message.contains("request or response")),
             "unknown event_type should return a validation error"
         );
-    }
-
-    #[test]
-    fn turn_identity_prefers_codex_turn_id_before_provider_response_id() {
-        let identity = turn_identity_from_metadata(&json!({
-            "codex_turn_id": "turn-a",
-            "response_id": "resp-a",
-            "request_hash": "hash-a"
-        }))
-        .expect("codex_turn_id should produce a turn identity");
-
-        assert!(
-            matches!(identity.kind, TurnIdentityKind::CodexTurnId),
-            "one Codex turn can span multiple provider response ids"
-        );
-        assert_eq!(identity.value, "turn-a");
-    }
-
-    #[test]
-    fn turn_identity_uses_claude_turn_id_before_provider_message_id() {
-        let identity = turn_identity_from_metadata(&json!({
-            "claude_turn_id": "claude-turn-a",
-            "message_id": "msg-a",
-            "request_hash": "hash-a"
-        }))
-        .expect("claude_turn_id should produce a turn identity");
-
-        assert!(
-            matches!(identity.kind, TurnIdentityKind::ClaudeTurnId),
-            "one Claude user turn can span multiple provider message ids"
-        );
-        assert_eq!(identity.value, "claude-turn-a");
     }
 
     #[test]
@@ -2003,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_summary_groups_historical_claude_agent_slugs() {
+    fn aggregate_summary_keeps_claude_desktop_apart_from_claude_code() {
         let device_context_id = fixed_uuid(1_u128);
         let mut desktop_event = usage_event(
             "evt-claude-desktop-request",
@@ -2037,16 +1881,25 @@ mod tests {
             &group_by,
         );
 
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.agent_name.as_deref(),
+                    row.requests,
+                    row.responses,
+                    row.total_tokens,
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            rows.len(),
-            1_usize,
-            "Claude CLI and Desktop rows should aggregate as one product"
+            rows,
+            [
+                (Some("claude-code"), 0_i64, 1_i64, 12_i64),
+                (Some("claude-desktop"), 1_i64, 0_i64, 8_i64),
+            ],
+            "Claude Desktop is its own Agent, not an alias of Claude Code"
         );
-        let row = rows.first().expect("summary should contain one row");
-        assert_eq!(row.agent_name.as_deref(), Some("claude-code"));
-        assert_eq!(row.requests, 1_i64);
-        assert_eq!(row.responses, 1_i64);
-        assert_eq!(row.total_tokens, 20_i64);
     }
 
     #[test]
@@ -2097,6 +1950,11 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
             },
             session_id: "session-001".to_owned(),
+            turn_id: None,
+            naming_thread: false,
+            stream_id: None,
+            response_id: None,
+            previous_response_id: None,
             llm: LlmPayload {
                 provider: "OpenAI".to_owned(),
                 model: "gpt-5.5".to_owned(),
@@ -2106,10 +1964,10 @@ mod tests {
             token_usage: TokenUsagePayload {
                 input_tokens: Some(5_i64),
                 output_tokens: Some(7_i64),
-                cache_read_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
-                total_tokens: None,
+                cache_read_tokens: Some(0_i64),
+                cache_write_tokens: Some(0_i64),
+                reasoning_tokens: Some(0_i64),
+                total_tokens: Some(12_i64),
             },
             metadata: json!({}),
             attachments: Vec::new(),
@@ -2149,6 +2007,9 @@ mod tests {
             observed_at: timestamp(1_u32, 0_u32, 0_u32),
             metadata: json!({}),
             created_at: timestamp(1_u32, 0_u32, 1_u32),
+            stream_id: None,
+            response_id: None,
+            previous_response_id: None,
         }
     }
 

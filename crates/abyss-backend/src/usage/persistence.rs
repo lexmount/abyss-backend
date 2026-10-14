@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 
 use super::{
-    IngestEventsRequest, IngestUsageEvent,
+    IngestEventsRequest,
     attachments::{ValidatedImageAttachment, validate_image_attachments},
 };
 
@@ -27,7 +27,6 @@ pub fn validate_batch(
     // its table locks are acquired by either storage implementation.
     let mut attachments = Vec::with_capacity(request.events.len());
     for event in &request.events {
-        validate_event(event)?;
         attachments.push(validate_image_attachments(&event.attachments)?);
     }
     if request.diagnostic_captures.len() > max_batch_size {
@@ -50,88 +49,6 @@ pub fn validate_batch(
         }
     }
     Ok(attachments)
-}
-
-pub fn validate_event(event: &IngestUsageEvent) -> Result<(), AppError> {
-    require_non_empty(&event.event_id, "event_id")?;
-    require_non_empty(&event.device.host_name, "device.host_name")?;
-    require_non_empty(&event.device.platform, "device.platform")?;
-    require_non_empty(&event.agent.name, "agent.name")?;
-    require_non_empty(&event.session_id, "session_id")?;
-    require_non_empty(&event.llm.provider, "llm.provider")?;
-    require_non_empty(&event.llm.model, "llm.model")?;
-    let tokens = normalized_tokens(event)?;
-    if tokens.total == 0 {
-        return Ok(());
-    }
-    if tokens.total < tokens.component_total() {
-        tracing::debug!(
-            event_id = %event.event_id,
-            "provider total_tokens is lower than visible token components"
-        );
-    }
-    Ok(())
-}
-
-fn require_non_empty(value: &str, field: &str) -> Result<(), AppError> {
-    if value.trim().is_empty() {
-        return Err(AppError::validation(format!("{field} is required")));
-    }
-    Ok(())
-}
-
-pub struct NormalizedTokens {
-    pub input: i64,
-    pub output: i64,
-    pub cache_read: i64,
-    pub cache_write: i64,
-    pub reasoning: i64,
-    pub total: i64,
-}
-
-impl NormalizedTokens {
-    /// Sum of the disjoint input, cache read, cache write, and output counters.
-    ///
-    /// Reasoning is a breakdown of output and is never added again.
-    pub const fn component_total(&self) -> i64 {
-        self.input
-            .saturating_add(self.cache_read)
-            .saturating_add(self.cache_write)
-            .saturating_add(self.output)
-    }
-}
-
-pub fn normalized_tokens(event: &IngestUsageEvent) -> Result<NormalizedTokens, AppError> {
-    let input = normalize_token(event.token_usage.input_tokens, "input_tokens")?;
-    let output = normalize_token(event.token_usage.output_tokens, "output_tokens")?;
-    let cache_read = normalize_token(event.token_usage.cache_read_tokens, "cache_read_tokens")?;
-    let cache_write = normalize_token(event.token_usage.cache_write_tokens, "cache_write_tokens")?;
-    let reasoning = normalize_token(event.token_usage.reasoning_tokens, "reasoning_tokens")?;
-    let explicit_total = event
-        .token_usage
-        .total_tokens
-        .map(|value| normalize_token(Some(value), "total_tokens"))
-        .transpose()?;
-    let mut tokens = NormalizedTokens {
-        input,
-        output,
-        cache_read,
-        cache_write,
-        reasoning,
-        total: 0,
-    };
-    // Preserve an explicit producer total; derive it from the disjoint
-    // counters only when the field is absent.
-    tokens.total = explicit_total.unwrap_or_else(|| tokens.component_total());
-    Ok(tokens)
-}
-
-fn normalize_token(value: Option<i64>, field: &str) -> Result<i64, AppError> {
-    let value = value.unwrap_or(0);
-    if value < 0 {
-        return Err(AppError::validation(format!("{field} must be >= 0")));
-    }
-    Ok(value)
 }
 
 pub fn validate_event_type(value: &str) -> Result<String, AppError> {
@@ -176,61 +93,8 @@ pub fn parse_group_by(raw: Option<&str>) -> Vec<String> {
     }
 }
 
-pub fn normalize_slug(value: &str) -> String {
-    value
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| match character {
-            '_' | ' ' => '-',
-            other => other,
-        })
-        .collect()
-}
-
-pub fn canonical_agent_name(value: &str) -> String {
-    let normalized = normalize_slug(value);
-    match normalized.as_str() {
-        "claude" | "claude-desktop" => "claude-code".to_owned(),
-        _ => normalized,
-    }
-}
-
-pub fn agent_name_filter_values(value: &str) -> Vec<String> {
-    let canonical = canonical_agent_name(value);
-    if canonical == "claude-code" {
-        vec![
-            "claude-code".to_owned(),
-            "claude".to_owned(),
-            "claude-desktop".to_owned(),
-        ]
-    } else {
-        vec![canonical]
-    }
-}
-
-/// Stored Agent names matching any requested Agent; empty matches every Agent.
-pub fn agent_names_filter(values: &[String]) -> Vec<String> {
-    distinct(
-        values
-            .iter()
-            .filter_map(|value| non_empty(value))
-            .flat_map(agent_name_filter_values),
-    )
-}
-
-/// Provider slugs matching any requested provider; empty matches every provider.
-pub fn providers_filter(values: &[String]) -> Vec<String> {
-    distinct(
-        values
-            .iter()
-            .filter_map(|value| non_empty(value))
-            .map(normalize_slug),
-    )
-}
-
-/// Trimmed values compared exactly, such as models or session identifiers;
-/// empty matches every value.
+/// Trimmed values compared exactly, such as Agent names, providers, models, or
+/// session identifiers; empty matches every value.
 pub fn exact_values_filter(values: &[String]) -> Vec<String> {
     distinct(
         values
@@ -249,13 +113,6 @@ fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
 
 pub fn normalize_text(value: &str) -> String {
     value.trim().to_owned()
-}
-
-pub fn normalized_optional(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 pub fn non_empty(value: &str) -> Option<&str> {
@@ -292,146 +149,24 @@ pub fn sha256_bytes(value: &str) -> Vec<u8> {
     Sha256::digest(value.as_bytes()).to_vec()
 }
 
-pub struct TurnIdentity {
-    pub kind: TurnIdentityKind,
-    pub value: String,
-}
-
-#[derive(Clone, Copy)]
-pub enum TurnIdentityKind {
-    CodexTurnId,
-    ClaudeTurnId,
-    TurnId,
-    ResponseId,
-    MessageId,
-    RequestHash,
-}
-
-impl TurnIdentityKind {
-    pub const fn metadata_key(self) -> &'static str {
-        match self {
-            Self::CodexTurnId => "codex_turn_id",
-            Self::ClaudeTurnId => "claude_turn_id",
-            Self::TurnId => "turn_id",
-            Self::ResponseId => "response_id",
-            Self::MessageId => "message_id",
-            Self::RequestHash => "request_hash",
-        }
-    }
-}
-
-pub fn turn_identity(event: &IngestUsageEvent) -> Option<TurnIdentity> {
-    turn_identity_from_metadata(&event.metadata)
-}
-
-pub fn turn_identity_from_metadata(metadata: &serde_json::Value) -> Option<TurnIdentity> {
-    // Prefer Agent-level identities because one user turn may contain several
-    // provider round trips.
-    [
-        TurnIdentityKind::CodexTurnId,
-        TurnIdentityKind::ClaudeTurnId,
-        TurnIdentityKind::TurnId,
-        TurnIdentityKind::ResponseId,
-        TurnIdentityKind::MessageId,
-        TurnIdentityKind::RequestHash,
-    ]
-    .into_iter()
-    .find_map(|kind| {
-        metadata_string(metadata, kind.metadata_key()).map(|value| TurnIdentity { kind, value })
-    })
-}
-
-/// A Claude Code event outside the main loop: a side request (recap, title,
-/// suggestion, compaction, ...) or a subagent request. It carries no
-/// `claude_turn_id` and belongs to the session turn it occurs in.
-pub struct SessionTurnAttachment {
-    /// `cc_prompt_id` of the Claude Code billing header, shared with the
-    /// main-loop requests of the prompt a subagent works for.
-    pub prompt_id: Option<String>,
-}
-
-/// Billing-header field naming the user prompt a Claude Code request serves.
-const CLAUDE_CODE_PROMPT_ID_KEY: &str = "cc_prompt_id";
-const CLAUDE_CODE_BILLING_KEY: &str = "claude_code_billing";
-
-/// Storage resolves an attachment in order: the turn of a main-loop event with
-/// the same prompt id, the latest turn started at or before the event, the
-/// earliest turn, and only for a session without turns a turn of its own.
-/// Other Agents and Claude Code main-loop events keep their turn identity.
-pub fn session_turn_attachment(
-    agent_name: &str,
-    metadata: &serde_json::Value,
-) -> Option<SessionTurnAttachment> {
-    if agent_name != "claude-code"
-        || metadata_string(metadata, TurnIdentityKind::ClaudeTurnId.metadata_key()).is_some()
-    {
-        return None;
-    }
-    Some(SessionTurnAttachment {
-        prompt_id: metadata
-            .get(CLAUDE_CODE_BILLING_KEY)
-            .and_then(|billing| metadata_string(billing, CLAUDE_CODE_PROMPT_ID_KEY)),
-    })
-}
-
-fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
-    metadata
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::{
-        TurnIdentityKind, canonical_agent_name, escape_like_pattern, parse_group_by,
-        session_turn_attachment, turn_identity_from_metadata,
-    };
+    use super::{escape_like_pattern, exact_values_filter, parse_group_by};
 
     #[test]
     fn shared_normalization_is_backend_independent() {
-        assert_eq!(canonical_agent_name(" Claude Desktop "), "claude-code");
+        // Agent names and providers are matched exactly as reported: Claude
+        // Desktop stays apart from Claude Code and case is not folded.
+        assert_eq!(
+            exact_values_filter(&[
+                " claude-desktop ".to_owned(),
+                "claude-code".to_owned(),
+                "Codex".to_owned(),
+                "claude-code".to_owned(),
+            ]),
+            ["Codex", "claude-code", "claude-desktop"]
+        );
         assert_eq!(parse_group_by(Some("day,llm_model")), ["day", "model"]);
         assert_eq!(escape_like_pattern(r"a%b_c\d"), r"a\%b\_c\\d");
-    }
-
-    #[test]
-    fn agent_turn_identity_wins_over_provider_identities() {
-        let identity = turn_identity_from_metadata(&json!({
-            "response_id": "response",
-            "codex_turn_id": "turn"
-        }))
-        .expect("turn identity should be extracted");
-        assert!(matches!(identity.kind, TurnIdentityKind::CodexTurnId));
-        assert_eq!(identity.value, "turn");
-        let identity = turn_identity_from_metadata(&json!({
-            "response_id": "response",
-            "turn_id": "resp_1"
-        }))
-        .expect("turn identity should be extracted");
-        assert!(matches!(identity.kind, TurnIdentityKind::TurnId));
-    }
-
-    #[test]
-    fn only_claude_code_events_without_turn_id_attach_to_a_session_turn() {
-        let billing = json!({"claude_code_billing": {"cc_prompt_id": " prompt "}});
-        let attachment = session_turn_attachment("claude-code", &billing)
-            .expect("a Claude Code side request should attach");
-        assert_eq!(attachment.prompt_id.as_deref(), Some("prompt"));
-        let side = session_turn_attachment("claude-code", &json!({"message_id": "msg"}))
-            .expect("a request without billing header should attach");
-        assert_eq!(side.prompt_id, None);
-        assert!(
-            session_turn_attachment(
-                "claude-code",
-                &json!({"claude_turn_id": "cc_turn:3", "claude_code_billing": {"cc_prompt_id": "p"}})
-            )
-            .is_none()
-        );
-        assert!(session_turn_attachment("codex", &billing).is_none());
     }
 }

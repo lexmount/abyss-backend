@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use diesel::{
-    ExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl, SelectableHelper, SqliteConnection,
+    ExpressionMethods, IntoSql, QueryDsl, QueryableByName, RunQueryDsl, SelectableHelper,
+    SqliteConnection,
     dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
@@ -27,13 +28,9 @@ use crate::{
         diagnostics::IngestDiagnosticCapture,
         event_order::UsageEventTimelineOrder,
         persistence::{
-            SessionTurnAttachment, TurnIdentity, agent_names_filter, canonical_agent_name,
-            exact_values_filter, non_empty, normalize_limit, normalize_slug, normalize_text,
-            normalized_optional, normalized_tokens, parse_group_by, providers_filter,
-            session_turn_attachment, sha256_bytes, turn_identity, validate_batch,
-            validate_event_type,
+            exact_values_filter, non_empty, normalize_limit, normalize_text, parse_group_by,
+            sha256_bytes, validate_batch, validate_event_type,
         },
-        session_metadata_from_event,
     },
 };
 
@@ -98,7 +95,7 @@ fn ingest_one_event(
     event: &IngestUsageEvent,
     attachments: Vec<ValidatedImageAttachment>,
 ) -> Result<bool, AppError> {
-    let event_id = normalize_text(&event.event_id);
+    let event_id = event.event_id.clone();
     let exists = llm_usage_events::table
         .filter(llm_usage_events::event_id.eq(&event_id))
         .select(llm_usage_events::id)
@@ -111,10 +108,10 @@ fn ingest_one_event(
 
     let observed_at = timestamp_to_micros(event.observed_at);
     let now = timestamp_to_micros(Utc::now());
-    let agent_name = canonical_agent_name(&event.agent.name);
-    let agent_version = normalized_optional(event.agent.version.as_deref());
-    let provider = normalize_slug(&event.llm.provider);
-    let model = normalize_text(&event.llm.model);
+    let agent_name = event.agent.name.clone();
+    let agent_version = event.agent.version.clone();
+    let provider = event.llm.provider.clone();
+    let model = event.llm.model.clone();
     let device_id = upsert_device(connection, user_id, event, observed_at, now)?;
     let session_pk = upsert_session(
         connection,
@@ -126,17 +123,16 @@ fn ingest_one_event(
         observed_at,
         now,
     )?;
-    let turn_index = resolve_turn_index(connection, session_pk, event, &agent_name, observed_at)?;
-    let turn_pk = upsert_turn(
+    let (turn_pk, turn_index) = place_in_turn(
         connection,
         user_id,
         session_pk,
-        turn_index,
+        event.turn_id.as_deref(),
         observed_at,
         now,
     )?;
-    let tokens = normalized_tokens(event)?;
-    let text = normalized_optional(event.text.as_deref());
+    let tokens = &event.token_usage;
+    let text = event.text.clone();
     let event_pk = Uuid::now_v7();
     let metadata = serialize_json(&event.metadata, "event metadata")?;
 
@@ -150,22 +146,25 @@ fn ingest_one_event(
             event_id,
             agent_name: agent_name.clone(),
             agent_version,
-            session_id: normalize_text(&event.session_id),
+            session_id: event.session_id.clone(),
             turn_index,
             llm_provider: provider,
             llm_model: model,
             event_type: event.event_type.as_str().to_owned(),
             text: text.clone(),
             text_sha256: text.as_deref().map(sha256_bytes),
-            input_tokens: tokens.input,
-            output_tokens: tokens.output,
-            cache_read_tokens: tokens.cache_read,
-            cache_write_tokens: tokens.cache_write,
-            reasoning_tokens: tokens.reasoning,
-            total_tokens: tokens.total,
+            input_tokens: tokens.input_tokens.unwrap_or_default(),
+            output_tokens: tokens.output_tokens.unwrap_or_default(),
+            cache_read_tokens: tokens.cache_read_tokens.unwrap_or_default(),
+            cache_write_tokens: tokens.cache_write_tokens.unwrap_or_default(),
+            reasoning_tokens: tokens.reasoning_tokens.unwrap_or_default(),
+            total_tokens: tokens.total_tokens.unwrap_or_default(),
             observed_at,
             metadata,
             created_at: now,
+            stream_id: event.stream_id.clone(),
+            response_id: event.response_id.clone(),
+            previous_response_id: event.previous_response_id.clone(),
         })
         .on_conflict(llm_usage_events::event_id)
         .do_nothing()
@@ -184,6 +183,7 @@ fn ingest_one_event(
             event_pk,
             event_type: event.event_type.as_str(),
             metadata: &event.metadata,
+            naming_thread: event.naming_thread,
             observed_at,
         },
     )?;
@@ -228,9 +228,9 @@ fn upsert_device(
     now: i64,
 ) -> Result<Uuid, AppError> {
     let owner = user_id.to_string();
-    let host_name = normalize_text(&event.device.host_name);
-    let platform = normalize_slug(&event.device.platform);
-    let os_version = normalized_optional(event.device.os_version.as_deref());
+    let host_name = event.device.host_name.clone();
+    let platform = event.device.platform.clone();
+    let os_version = event.device.os_version.clone();
     let existing = devices::table
         .filter(devices::user_id.eq(&owner))
         .filter(devices::host_name.eq(&host_name))
@@ -283,7 +283,7 @@ fn upsert_session(
     now: i64,
 ) -> Result<Uuid, AppError> {
     let owner = user_id.to_string();
-    let session_id = normalize_text(&event.session_id);
+    let session_id = event.session_id.clone();
     let existing = agent_sessions::table
         .filter(agent_sessions::user_id.eq(&owner))
         .filter(agent_sessions::agent_name.eq(agent_name))
@@ -291,10 +291,8 @@ fn upsert_session(
         .select(SessionRow::as_select())
         .first::<SessionRow>(connection)
         .optional()?;
-    let incoming_metadata = session_metadata_from_event(&event.metadata);
     if let Some(existing) = existing {
         let id = parse_uuid(&existing.id, "session id")?;
-        let metadata = merge_json(&existing.metadata, &incoming_metadata, "session metadata")?;
         diesel::update(agent_sessions::table.find(existing.id))
             .set((
                 agent_sessions::device_context_id.eq(device_id.to_string()),
@@ -304,7 +302,6 @@ fn upsert_session(
                 agent_sessions::ended_at.eq(Some(
                     existing.ended_at.unwrap_or(observed_at).max(observed_at),
                 )),
-                agent_sessions::metadata.eq(metadata),
                 agent_sessions::updated_at.eq(now),
             ))
             .execute(connection)?;
@@ -322,7 +319,7 @@ fn upsert_session(
             session_id,
             started_at: observed_at,
             ended_at: Some(observed_at),
-            metadata: serialize_json(&incoming_metadata, "session metadata")?,
+            metadata: "{}".to_owned(),
             created_at: now,
             updated_at: now,
         })
@@ -330,164 +327,161 @@ fn upsert_session(
     Ok(id)
 }
 
-fn resolve_turn_index(
+/// Places an event in a turn of its session and returns the turn's id and
+/// position.
+///
+/// Events naming the same turn share it, and an event naming none joins the
+/// turn in progress when it was observed. Turns are numbered by when they
+/// started, so a turn that arrives late moves the turns after it.
+fn place_in_turn(
     connection: &mut SqliteConnection,
+    user_id: Uuid,
     session_pk: Uuid,
-    event: &IngestUsageEvent,
-    agent_name: &str,
+    turn_id: Option<&str>,
     observed_at: i64,
-) -> Result<i32, AppError> {
-    if let Some(attachment) = session_turn_attachment(agent_name, &event.metadata)
-        && let Some(turn_index) =
-            attached_turn_index(connection, session_pk, &attachment, observed_at)?
-    {
-        return Ok(turn_index);
-    }
-    // Events of one turn share its identity; an event without any identity
-    // is a turn of its own.
-    if let Some(identity) = turn_identity(event)
-        && let Some(existing) = existing_turn_index_for_identity(connection, session_pk, &identity)?
-    {
-        return Ok(existing);
-    }
-    Ok(agent_turns::table
-        .filter(agent_turns::session_pk.eq(session_pk.to_string()))
-        .select(max(agent_turns::turn_index))
-        .first::<Option<i32>>(connection)?
-        .unwrap_or(0_i32)
-        .saturating_add(1))
+    now: i64,
+) -> Result<(Uuid, i32), AppError> {
+    let session = session_pk.to_string();
+    let found = match turn_id {
+        Some(key) => named_turn(connection, &session, key)?,
+        None => turn_in_progress(connection, &session, observed_at)?,
+    };
+    let (turn_pk, turn_index, reordered) = if let Some(turn) = found {
+        diesel::update(agent_turns::table.find(&turn.id))
+            .set((
+                agent_turns::started_at.eq(turn.started_at.min(observed_at)),
+                agent_turns::ended_at
+                    .eq(Some(turn.ended_at.unwrap_or(observed_at).max(observed_at))),
+                agent_turns::updated_at.eq(now),
+            ))
+            .execute(connection)?;
+        (turn.id, turn.turn_index, observed_at < turn.started_at)
+    } else {
+        let last = agent_turns::table
+            .filter(agent_turns::session_pk.eq(&session))
+            .select(max(agent_turns::turn_index))
+            .first::<Option<i32>>(connection)?;
+        let id = Uuid::now_v7().to_string();
+        let turn_index = last.unwrap_or(0_i32).saturating_add(1_i32);
+        diesel::insert_into(agent_turns::table)
+            .values(NewTurn {
+                id: id.clone(),
+                user_id: user_id.to_string(),
+                session_pk: session.clone(),
+                turn_index,
+                turn_key: turn_id.map(str::to_owned),
+                started_at: observed_at,
+                ended_at: Some(observed_at),
+                created_at: now,
+                updated_at: now,
+            })
+            .execute(connection)?;
+        (id, turn_index, last.is_some())
+    };
+    let turn_index = if reordered && number_turns(connection, &session)? {
+        agent_turns::table
+            .find(&turn_pk)
+            .select(agent_turns::turn_index)
+            .first::<i32>(connection)?
+    } else {
+        turn_index
+    };
+    Ok((parse_uuid(&turn_pk, "turn id")?, turn_index))
 }
 
-/// Finds the stored turn a Claude Code side or subagent request belongs to;
-/// `None` only when the session has no turn yet.
-fn attached_turn_index(
+/// The turn named `key` in a session. The first named turn adopts the turn
+/// that events naming none opened at the start of the session.
+fn named_turn(
     connection: &mut SqliteConnection,
-    session_pk: Uuid,
-    attachment: &SessionTurnAttachment,
-    observed_at: i64,
-) -> Result<Option<i32>, AppError> {
-    let session = session_pk.to_string();
-    if let Some(prompt_id) = &attachment.prompt_id {
-        // Only main-loop events anchor a prompt, and each prompt id belongs to
-        // one turn. Walking the session index from its latest turn usually
-        // stops within the current turn instead of reading every megabyte
-        // metadata row of the session.
-        let prompt_turn = sql_query(
-            "SELECT turn_index FROM llm_usage_events \
-             WHERE session_pk = ?1 \
-               AND json_extract(metadata, '$.claude_code_billing.cc_prompt_id') = ?2 \
-               AND json_extract(metadata, '$.claude_turn_id') IS NOT NULL \
-             ORDER BY turn_index DESC, observed_at DESC, id DESC \
-             LIMIT 1",
-        )
-        .bind::<Text, _>(&session)
-        .bind::<Text, _>(prompt_id)
-        .get_result::<TurnIndexRow>(connection)
+    session: &str,
+    key: &str,
+) -> Result<Option<TurnRow>, AppError> {
+    let named = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session))
+        .filter(agent_turns::turn_key.eq(key))
+        .select(TurnRow::as_select())
+        .first::<TurnRow>(connection)
         .optional()?;
-        if let Some(row) = prompt_turn {
-            return Ok(Some(row.turn_index));
-        }
+    if named.is_some() {
+        return Ok(named);
     }
-    // Events may arrive out of order, so the observation time picks the turn.
-    let preceding = agent_turns::table
-        .filter(agent_turns::session_pk.eq(&session))
+    let mut turns = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session))
+        .select(TurnRow::as_select())
+        .limit(2_i64)
+        .load::<TurnRow>(connection)?;
+    let opening = match turns.as_slice() {
+        [turn] if turn.turn_key.is_none() => turns.pop(),
+        _ => None,
+    };
+    if let Some(turn) = &opening {
+        diesel::update(agent_turns::table.find(&turn.id))
+            .set(agent_turns::turn_key.eq(key))
+            .execute(connection)?;
+    }
+    Ok(opening)
+}
+
+/// The turn in progress when an event naming no turn was observed: the latest
+/// turn started by then, else the first turn of the session.
+fn turn_in_progress(
+    connection: &mut SqliteConnection,
+    session: &str,
+    observed_at: i64,
+) -> Result<Option<TurnRow>, AppError> {
+    let started = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session))
         .filter(agent_turns::started_at.le(observed_at))
-        .order_by((
-            agent_turns::started_at.desc(),
-            agent_turns::turn_index.desc(),
-        ))
-        .select(agent_turns::turn_index)
-        .first::<i32>(connection)
+        .order_by((agent_turns::started_at.desc(), agent_turns::id.desc()))
+        .select(TurnRow::as_select())
+        .first::<TurnRow>(connection)
         .optional()?;
-    if preceding.is_some() {
-        return Ok(preceding);
+    if started.is_some() {
+        return Ok(started);
     }
     agent_turns::table
-        .filter(agent_turns::session_pk.eq(&session))
-        .order_by((agent_turns::started_at.asc(), agent_turns::turn_index.asc()))
-        .select(agent_turns::turn_index)
-        .first::<i32>(connection)
+        .filter(agent_turns::session_pk.eq(session))
+        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
+        .select(TurnRow::as_select())
+        .first::<TurnRow>(connection)
         .optional()
         .map_err(AppError::from)
 }
 
-#[derive(QueryableByName)]
-struct TurnIndexRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    turn_index: i32,
-}
-
-fn existing_turn_index_for_identity(
-    connection: &mut SqliteConnection,
-    session_pk: Uuid,
-    identity: &TurnIdentity,
-) -> Result<Option<i32>, AppError> {
-    let rows = llm_usage_events::table
-        .filter(llm_usage_events::session_pk.eq(session_pk.to_string()))
-        .order_by((
-            llm_usage_events::observed_at.asc(),
-            llm_usage_events::id.asc(),
-        ))
-        .select((llm_usage_events::turn_index, llm_usage_events::metadata))
-        .load::<(i32, String)>(connection)?;
-    for (turn_index, metadata) in rows {
-        let metadata = serde_json::from_str::<serde_json::Value>(&metadata).map_err(|error| {
-            AppError::internal(format!("stored event metadata is invalid JSON: {error}"))
-        })?;
-        if metadata
-            .get(identity.kind.metadata_key())
-            .and_then(serde_json::Value::as_str)
-            == Some(identity.value.as_str())
-        {
-            return Ok(Some(turn_index));
-        }
+/// Numbers the turns of a session, and their events, by when the turns
+/// started. Writes nothing and returns `false` while the numbers already
+/// follow that order.
+fn number_turns(connection: &mut SqliteConnection, session: &str) -> Result<bool, AppError> {
+    let turns = agent_turns::table
+        .filter(agent_turns::session_pk.eq(session))
+        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
+        .select((agent_turns::id, agent_turns::turn_index))
+        .load::<(String, i32)>(connection)?;
+    let moved = turns
+        .iter()
+        .zip(1_i32..)
+        .filter(|((_, index), position)| index != position)
+        .collect::<Vec<_>>();
+    if moved.is_empty() {
+        return Ok(false);
     }
-    Ok(None)
-}
-
-fn upsert_turn(
-    connection: &mut SqliteConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-    turn_index: i32,
-    observed_at: i64,
-    now: i64,
-) -> Result<Uuid, AppError> {
-    let session = session_pk.to_string();
-    let existing = agent_turns::table
-        .filter(agent_turns::session_pk.eq(&session))
-        .filter(agent_turns::turn_index.eq(turn_index))
-        .select(TurnRow::as_select())
-        .first::<TurnRow>(connection)
-        .optional()?;
-    if let Some(existing) = existing {
-        let id = parse_uuid(&existing.id, "turn id")?;
-        diesel::update(agent_turns::table.find(existing.id))
-            .set((
-                agent_turns::started_at.eq(existing.started_at.min(observed_at)),
-                agent_turns::ended_at.eq(Some(
-                    existing.ended_at.unwrap_or(observed_at).max(observed_at),
-                )),
-                agent_turns::updated_at.eq(now),
-            ))
+    // Moved turns first step above every current number, so no single-row
+    // update collides with another turn's number or goes below one.
+    let above = turns.iter().map(|(_, index)| *index).max().unwrap_or(0_i32);
+    for ((id, _), position) in &moved {
+        diesel::update(agent_turns::table.find(id))
+            .set(agent_turns::turn_index.eq(above.saturating_add(*position)))
             .execute(connection)?;
-        return Ok(id);
     }
-
-    let id = Uuid::now_v7();
-    diesel::insert_into(agent_turns::table)
-        .values(NewTurn {
-            id: id.to_string(),
-            user_id: user_id.to_string(),
-            session_pk: session,
-            turn_index,
-            started_at: observed_at,
-            ended_at: Some(observed_at),
-            created_at: now,
-            updated_at: now,
-        })
-        .execute(connection)?;
-    Ok(id)
+    for ((id, _), position) in moved {
+        diesel::update(agent_turns::table.find(id))
+            .set(agent_turns::turn_index.eq(position))
+            .execute(connection)?;
+        diesel::update(llm_usage_events::table.filter(llm_usage_events::turn_pk.eq(id)))
+            .set(llm_usage_events::turn_index.eq(position))
+            .execute(connection)?;
+    }
+    Ok(true)
 }
 
 /// Writes the SQLite FTS5 projection. Virtual tables are intentionally outside
@@ -499,23 +493,20 @@ fn insert_search_projection(
     session_pk: Uuid,
     event: &IngestUsageEvent,
 ) -> Result<(), AppError> {
-    let projection =
-        SearchProjection::from_source(normalized_optional(event.text.as_deref()), &event.metadata);
+    let projection = SearchProjection::from_source(event.text.clone(), &event.metadata);
     sql_query(
         "INSERT INTO usage_events_fts (
              event_pk, user_id, session_pk, session_id, content, tool_names,
-             tool_content, commands, file_paths
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             tool_content
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind::<Text, _>(event_pk.to_string())
     .bind::<Text, _>(user_id.to_string())
     .bind::<Text, _>(session_pk.to_string())
-    .bind::<Text, _>(normalize_text(&event.session_id))
+    .bind::<Text, _>(&event.session_id)
     .bind::<diesel::sql_types::Nullable<Text>, _>(projection.content)
     .bind::<Text, _>(projection.tool_names.join("\n"))
     .bind::<Text, _>(projection.tool_content.join("\n"))
-    .bind::<Text, _>(projection.commands.join("\n"))
-    .bind::<Text, _>(projection.file_paths.join("\n"))
     .execute(connection)?;
     Ok(())
 }
@@ -525,14 +516,9 @@ fn ingest_one_diagnostic_capture(
     user_id: Uuid,
     capture: &IngestDiagnosticCapture,
 ) -> Result<bool, AppError> {
-    let event_ids = capture
-        .event_ids
-        .iter()
-        .map(|event_id| normalize_text(event_id))
-        .collect::<Vec<_>>();
     let events = llm_usage_events::table
         .filter(llm_usage_events::user_id.eq(user_id.to_string()))
-        .filter(llm_usage_events::event_id.eq_any(&event_ids))
+        .filter(llm_usage_events::event_id.eq_any(&capture.event_ids))
         .select((
             llm_usage_events::id,
             llm_usage_events::device_context_id,
@@ -681,7 +667,7 @@ fn load_filtered_events(
     if let Some(to) = filters.to {
         query = query.filter(llm_usage_events::observed_at.lt(timestamp_to_micros(to)));
     }
-    let agent_names = agent_names_filter(filters.agent_names);
+    let agent_names = exact_values_filter(filters.agent_names);
     if !agent_names.is_empty() {
         query = query.filter(llm_usage_events::agent_name.eq_any(agent_names));
     }
@@ -695,7 +681,7 @@ fn load_filtered_events(
     if let Some(turn_index) = filters.turn_index {
         query = query.filter(llm_usage_events::turn_index.eq(turn_index));
     }
-    let providers = providers_filter(filters.llm_providers);
+    let providers = exact_values_filter(filters.llm_providers);
     if !providers.is_empty() {
         query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
     }
@@ -733,8 +719,8 @@ fn load_filtered_events(
                 llm_usage_events::llm_provider,
                 llm_usage_events::llm_model,
                 llm_usage_events::event_type,
-                sql::<Nullable<Text>>("NULL"),
-                sql::<Nullable<Binary>>("NULL"),
+                None::<String>.into_sql::<Nullable<Text>>(),
+                None::<Vec<u8>>.into_sql::<Nullable<Binary>>(),
                 llm_usage_events::input_tokens,
                 llm_usage_events::output_tokens,
                 llm_usage_events::cache_read_tokens,
@@ -742,8 +728,11 @@ fn load_filtered_events(
                 llm_usage_events::reasoning_tokens,
                 llm_usage_events::total_tokens,
                 llm_usage_events::observed_at,
-                sql::<Text>("'{}'"),
+                "{}".into_sql::<Text>(),
                 llm_usage_events::created_at,
+                llm_usage_events::stream_id,
+                llm_usage_events::response_id,
+                llm_usage_events::previous_response_id,
             ))
             .load::<EventRow>(connection)?
     };
@@ -803,11 +792,8 @@ type OutlineRow = (
     i64,
     i64,
     i64,
-    bool,
     i64,
     i64,
-    Option<String>,
-    Option<String>,
     Option<String>,
     bool,
 );
@@ -836,21 +822,12 @@ pub(super) fn session_outline(
             llm_usage_events::cache_write_tokens,
             llm_usage_events::reasoning_tokens,
             llm_usage_events::total_tokens,
-            sql::<Bool>("json_type(metadata, '$.token_usage_estimated') IS 'true'"),
             llm_usage_events::observed_at,
             sql::<BigInt>("coalesce(length(text), 0)"),
             sql::<Nullable<Text>>(&format!(
                 "CASE WHEN event_type = 'request' THEN substr(text, -{OUTLINE_PREVIEW_CHARS}) \
                  ELSE substr(text, 1, {OUTLINE_PREVIEW_CHARS}) END"
             )),
-            sql::<Nullable<Text>>(
-                "CASE WHEN json_type(metadata, '$.response_id') = 'text' \
-                 THEN json_extract(metadata, '$.response_id') END",
-            ),
-            sql::<Nullable<Text>>(
-                "CASE WHEN json_type(metadata, '$.previous_response_id') = 'text' \
-                 THEN json_extract(metadata, '$.previous_response_id') END",
-            ),
             // SQLite text functions stop at the first NUL character, so the
             // length and preview above are wrong for text containing NUL.
             sql::<Bool>("coalesce(instr(CAST(text AS BLOB), x'00') > 0, 0)"),
@@ -858,7 +835,7 @@ pub(super) fn session_outline(
         .load::<OutlineRow>(connection)?;
     let nul_text_ids = rows
         .iter()
-        .filter(|row| row.19)
+        .filter(|row| row.16)
         .map(|row| row.0.clone())
         .collect::<Vec<_>>();
     let nul_texts = if nul_text_ids.is_empty() {
@@ -885,7 +862,7 @@ pub(super) fn session_outline(
         .map(|mut row| {
             let attachment_count = attachment_counts.get(&row.0).copied().unwrap_or(0);
             if let Some(text) = nul_texts.get(&row.0) {
-                (row.15, row.16) = text_outline(text, &row.6)?;
+                (row.14, row.15) = text_outline(text, &row.6)?;
             }
             Ok(UsageEventOutline {
                 id: parse_uuid(&row.0, "event id")?,
@@ -901,12 +878,10 @@ pub(super) fn session_outline(
                 cache_write_tokens: row.10,
                 reasoning_tokens: row.11,
                 total_tokens: row.12,
-                token_usage_estimated: row.13,
-                observed_at: timestamp_from_micros(row.14)?,
-                text_chars: row.15,
-                preview: row.16,
+                observed_at: timestamp_from_micros(row.13)?,
+                text_chars: row.14,
+                preview: row.15,
                 attachment_count,
-                ordering_metadata: UsageEventOutline::ordering_metadata(row.17, row.18),
             })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
@@ -981,7 +956,7 @@ fn assemble_timeline<E>(
             session_pk: session.id,
             user_id: session.user_id,
             device_context_id: session.device_context_id,
-            agent_name: canonical_agent_name(&session.agent_name),
+            agent_name: session.agent_name,
             agent_version: session.agent_version,
             session_id: session.session_id,
             started_at: session.started_at,
@@ -1069,9 +1044,9 @@ pub(super) fn usage_summary(
             .map(|json| (!values.is_empty(), json))
             .map_err(|error| AppError::internal(format!("serialize summary filter: {error}")))
     };
-    let (has_agents, agent_names) = filter_list(agent_names_filter(&query.agent_name))?;
+    let (has_agents, agent_names) = filter_list(exact_values_filter(&query.agent_name))?;
     let (has_sessions, session_ids) = filter_list(exact_values_filter(&query.session_id))?;
-    let (has_providers, providers) = filter_list(providers_filter(&query.llm_provider))?;
+    let (has_providers, providers) = filter_list(exact_values_filter(&query.llm_provider))?;
     let (has_models, models) = filter_list(exact_values_filter(&query.llm_model))?;
     let event_type = query
         .event_type
@@ -1136,12 +1111,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         CASE WHEN ?2 THEN d.host_name END AS host_name, \
         CASE WHEN ?2 THEN d.platform END AS platform, \
         CASE WHEN ?2 THEN d.os_version END AS os_version, \
-        CASE \
-            WHEN ?3 THEN CASE \
-                WHEN e.agent_name IN ('claude', 'claude-desktop') THEN 'claude-code' \
-                ELSE e.agent_name \
-            END \
-        END AS agent_name, \
+        CASE WHEN ?3 THEN e.agent_name END AS agent_name, \
         CASE WHEN ?4 THEN e.llm_provider END AS llm_provider, \
         CASE WHEN ?5 THEN e.llm_model END AS llm_model, \
         CASE WHEN ?6 THEN e.event_type END AS event_type, \
@@ -1404,7 +1374,7 @@ fn event_response(
         platform: device.map(|value| value.platform.clone()),
         session_pk: event.session_pk,
         turn_pk: event.turn_pk,
-        agent_name: canonical_agent_name(&event.agent_name),
+        agent_name: event.agent_name,
         agent_version: event.agent_version,
         session_id: event.session_id,
         turn_index: event.turn_index,
@@ -1420,18 +1390,12 @@ fn event_response(
         reasoning_tokens: event.reasoning_tokens,
         total_tokens: event.total_tokens,
         observed_at: event.observed_at,
+        stream_id: event.stream_id,
+        response_id: event.response_id,
+        previous_response_id: event.previous_response_id,
         metadata: event.metadata,
         attachments,
     }
-}
-
-fn merge_json(stored: &str, incoming: &serde_json::Value, field: &str) -> Result<String, AppError> {
-    let mut stored = serde_json::from_str::<serde_json::Value>(stored)
-        .map_err(|error| AppError::internal(format!("stored {field} is invalid JSON: {error}")))?;
-    if let (Some(stored), Some(incoming)) = (stored.as_object_mut(), incoming.as_object()) {
-        stored.extend(incoming.clone());
-    }
-    serialize_json(&stored, field)
 }
 
 fn serialize_json(value: &serde_json::Value, field: &str) -> Result<String, AppError> {
@@ -1531,11 +1495,10 @@ mod tests {
     #[test]
     fn validation_failure_leaves_relational_and_fts_tables_empty() {
         let mut database = database();
-        let mut request = request_with_text("invalid event");
-        request.events[0].token_usage.input_tokens = Some(-1);
+        let request = request_with_text("invalid event");
 
-        ingest_events(&mut database, &request, OWNER_ID, 100)
-            .expect_err("negative tokens should reject the batch");
+        ingest_events(&mut database, &request, OWNER_ID, 0)
+            .expect_err("a batch over the size limit should be rejected");
         let relational_count = llm_usage_events::table
             .select(count_star())
             .first::<i64>(&mut database)
@@ -1614,6 +1577,41 @@ mod tests {
     }
 
     #[test]
+    fn ingest_stores_reported_values_unchanged() {
+        let mut database = database();
+        let mut request = request_with_text("  hello \n");
+        let event = &mut request.events[0];
+        event.session_id = " Session ".to_owned();
+        event.llm.provider = "Gateway_Host".to_owned();
+        event.llm.model = " Model ".to_owned();
+        event.device.platform = "macOS".to_owned();
+        ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+        let mut empty = request_with_text("");
+        empty.events[0].event_id = "sqlite-empty-text".to_owned();
+        ingest_events(&mut database, &empty, OWNER_ID, 100).expect("ingest should succeed");
+
+        let query: RawEventsQuery =
+            serde_json::from_value(json!({})).expect("query should deserialize");
+        let events = raw_events(&mut database, &query, OWNER_ID, 50)
+            .expect("events should load")
+            .events;
+        let stored = events
+            .iter()
+            .find(|event| event.event_id == "sqlite-event")
+            .expect("the first event should be stored");
+        assert_eq!(stored.session_id, " Session ");
+        assert_eq!(stored.llm_provider, "Gateway_Host");
+        assert_eq!(stored.llm_model, " Model ");
+        assert_eq!(stored.platform.as_deref(), Some("macOS"));
+        assert_eq!(stored.text.as_deref(), Some("  hello \n"));
+        let empty = events
+            .iter()
+            .find(|event| event.event_id == "sqlite-empty-text")
+            .expect("the empty-text event should be stored");
+        assert_eq!(empty.text.as_deref(), Some(""));
+    }
+
+    #[test]
     fn event_list_leaves_out_content_but_keeps_what_a_list_shows() {
         let mut database = summary_seeded();
         let page = |database: &mut SqliteConnection, query: serde_json::Value| {
@@ -1642,10 +1640,10 @@ mod tests {
     fn summary_seeded() -> SqliteConnection {
         let mut database = database();
         let event = |id: &str, agent: &str, session: &str, turn: i32, observed_at: &str| {
-            let (provider, model) = if agent == "Codex" {
-                ("OpenAI", "gpt-5")
+            let (provider, model) = if agent == "codex" {
+                ("openai", "gpt-5")
             } else {
-                ("Anthropic", "claude-x")
+                ("anthropic", "claude-x")
             };
             json!({
                 "event_id": id,
@@ -1653,24 +1651,25 @@ mod tests {
                 "device": {"host_name": "alice-mbp", "platform": "macos", "os_version": "15.1"},
                 "agent": {"name": agent},
                 "session_id": session,
+                "turn_id": format!("{session}-{turn}"),
                 "llm": {"provider": provider, "model": model},
                 "event_type": if id.ends_with("req") { "request" } else { "response" },
                 "text": "body",
                 "token_usage": if id.ends_with("req") {
-                    json!({"input_tokens": 10_i64, "cache_read_tokens": 4_i64})
+                    json!({"input_tokens": 10_i64, "output_tokens": 0_i64, "cache_read_tokens": 4_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 14_i64})
                 } else {
-                    json!({"output_tokens": 5_i64})
+                    json!({"input_tokens": 0_i64, "output_tokens": 5_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 5_i64})
                 },
-                "metadata": {"raw_body": "large", "turn_id": format!("{session}-{turn}")}
+                "metadata": {"raw_body": "large"}
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({
             "events": [
-                event("a-req", "Codex", "alpha", 1_i32, "2026-09-01T23:00:00Z"),
-                event("a-res", "Codex", "alpha", 1_i32, "2026-09-01T23:30:00Z"),
+                event("a-req", "codex", "alpha", 1_i32, "2026-09-01T23:00:00Z"),
+                event("a-res", "codex", "alpha", 1_i32, "2026-09-01T23:30:00Z"),
                 event("b-req", "claude-desktop", "beta", 1_i32, "2026-09-02T01:00:00Z"),
                 event("c-res", "claude-code", "gamma", 1_i32, "2026-09-02T02:00:00Z"),
-                event("a2-req", "Codex", "alpha", 2_i32, "2026-09-03T00:00:00Z"),
+                event("a2-req", "codex", "alpha", 2_i32, "2026-09-03T00:00:00Z"),
             ]
         }))
         .expect("request should deserialize");
@@ -1686,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_groups_in_sql_with_canonical_agents_and_distinct_counts() {
+    fn summary_groups_in_sql_by_reported_agent_and_distinct_counts() {
         let mut database = summary_seeded();
 
         let rows = summary(
@@ -1694,22 +1693,29 @@ mod tests {
             json!({"group_by": "agent,provider,model", "to": "2026-09-03T00:00:00Z"}),
         );
 
+        // Claude Desktop is its own Agent, not an alias of Claude Code.
         assert_eq!(
             rows,
             json!([
-                // Equal totals fall back to the Agent name.
-                {
-                    "agent_name": "claude-code", "llm_provider": "anthropic",
-                    "llm_model": "claude-x",
-                    "sessions": 2_i64, "turns": 2_i64, "requests": 1_i64, "responses": 1_i64,
-                    "input_tokens": 10_i64, "output_tokens": 5_i64, "cache_read_tokens": 4_i64,
-                    "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 19_i64
-                },
                 {
                     "agent_name": "codex", "llm_provider": "openai", "llm_model": "gpt-5",
                     "sessions": 1_i64, "turns": 1_i64, "requests": 1_i64, "responses": 1_i64,
                     "input_tokens": 10_i64, "output_tokens": 5_i64, "cache_read_tokens": 4_i64,
                     "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 19_i64
+                },
+                {
+                    "agent_name": "claude-desktop", "llm_provider": "anthropic",
+                    "llm_model": "claude-x",
+                    "sessions": 1_i64, "turns": 1_i64, "requests": 1_i64, "responses": 0_i64,
+                    "input_tokens": 10_i64, "output_tokens": 0_i64, "cache_read_tokens": 4_i64,
+                    "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 14_i64
+                },
+                {
+                    "agent_name": "claude-code", "llm_provider": "anthropic",
+                    "llm_model": "claude-x",
+                    "sessions": 1_i64, "turns": 1_i64, "requests": 0_i64, "responses": 1_i64,
+                    "input_tokens": 0_i64, "output_tokens": 5_i64, "cache_read_tokens": 0_i64,
+                    "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 5_i64
                 }
             ])
         );
@@ -1721,7 +1727,11 @@ mod tests {
 
         let rows = summary(
             &mut database,
-            json!({"group_by": "day,event_type", "agent_name": ["claude"], "limit": 10_i64}),
+            json!({
+                "group_by": "day,event_type",
+                "agent_name": ["claude-code", "claude-desktop"],
+                "limit": 10_i64,
+            }),
         );
 
         let mut buckets = rows
@@ -1751,12 +1761,30 @@ mod tests {
         assert_eq!(codex_requests[0]["requests"], json!(2_i64));
         assert_eq!(codex_requests[0]["turns"], json!(2_i64));
         assert_eq!(codex_requests.as_array().map(Vec::len), Some(1));
+        // Agent names match exactly: no alias expansion and no case folding.
+        for agent in ["claude", "Codex"] {
+            let rows = summary(
+                &mut database,
+                json!({"group_by": "agent", "agent_name": [agent]}),
+            );
+            assert_eq!(rows, json!([]), "{agent} must not match another Agent");
+        }
+        // Providers match exactly as reported, without case folding.
+        let folded = summary(
+            &mut database,
+            json!({"group_by": "agent", "llm_provider": ["OpenAI"]}),
+        );
+        assert_eq!(
+            folded,
+            json!([]),
+            "OpenAI must not match the reported openai"
+        );
         // A list matches any of its values.
         let either = summary(
             &mut database,
             json!({
                 "group_by": "agent",
-                "llm_provider": ["OpenAI", "Anthropic"],
+                "llm_provider": ["openai", "anthropic"],
                 "session_id": ["alpha", "beta"],
             }),
         );
@@ -1770,7 +1798,7 @@ mod tests {
         assert_eq!(
             agents,
             vec![
-                (json!("claude-code"), json!(1_i64)),
+                (json!("claude-desktop"), json!(1_i64)),
                 (json!("codex"), json!(1_i64)),
             ]
         );
@@ -1792,27 +1820,21 @@ mod tests {
         assert!(rows[0].get("agent_name").is_none());
     }
 
-    /// One request of `agent` observed `second` seconds into a fixed minute.
-    fn turn_event(
-        id: &str,
-        agent: &str,
-        second: u32,
-        metadata: serde_json::Value,
-    ) -> serde_json::Value {
-        let mut event = json!({
+    /// One request observed `second` seconds into a fixed minute, working for
+    /// `turn` when it names one.
+    fn turn_event(id: &str, agent: &str, second: u32, turn: Option<&str>) -> serde_json::Value {
+        json!({
             "event_id": id,
             "observed_at": format!("2026-10-08T00:00:{second:02}Z"),
             "device": {"host_name": "local", "platform": "macos"},
             "agent": {"name": agent},
             "session_id": "thread-session",
-            // Distinct collector indexes expose any event left on its own turn.
-            "turn_index": second,
+            "turn_id": turn,
             "llm": {"provider": "Anthropic", "model": "claude-x"},
             "event_type": "request",
-            "token_usage": {"input_tokens": 1_i64}
-        });
-        event["metadata"] = metadata;
-        event
+            "token_usage": {"input_tokens": 1_i64, "output_tokens": 0_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 1_i64},
+            "metadata": {}
+        })
     }
 
     fn ingest_turn_events(database: &mut SqliteConnection, events: Vec<serde_json::Value>) {
@@ -1830,140 +1852,144 @@ mod tests {
             .expect("event should be stored")
     }
 
-    fn main_loop(turn: u32, prompt: &str) -> serde_json::Value {
-        json!({
-            "claude_turn_id": format!("cc_turn:{turn}"),
-            "claude_code_billing": {"cc_prompt_id": prompt, "cc_turn_index": turn.to_string()}
-        })
-    }
-
-    #[test]
-    fn claude_code_side_and_subagent_requests_join_the_turn_they_occur_in() {
-        let mut database = database();
-        ingest_turn_events(
-            &mut database,
-            vec![
-                turn_event("main-1", "claude-code", 10, main_loop(1, "prompt-1")),
-                turn_event(
-                    "subagent-1",
-                    "claude-code",
-                    12,
-                    json!({"claude_code_billing": {"cc_prompt_id": "prompt-1", "cc_is_subagent": "true"}}),
-                ),
-                turn_event("main-2", "claude-code", 30, main_loop(2, "prompt-2")),
-                // A failed `continue` replays with a new prompt id, same turn.
-                turn_event(
-                    "main-2-replay",
-                    "claude-code",
-                    35,
-                    main_loop(2, "prompt-2b"),
-                ),
-                turn_event(
-                    "subagent-2",
-                    "claude-code",
-                    40,
-                    json!({"claude_code_billing": {"cc_prompt_id": "prompt-2b", "cc_is_subagent": "true"}}),
-                ),
-                // A recap between the turns carries no billing header.
-                turn_event(
-                    "recap",
-                    "claude-code",
-                    20,
-                    json!({"message_id": "msg-recap"}),
-                ),
-            ],
-        );
-        // Out of order: observed during turn 2, delivered after everything.
-        ingest_turn_events(
-            &mut database,
-            vec![
-                turn_event(
-                    "late-title",
-                    "claude-code",
-                    32,
-                    json!({"request_hash": "title"}),
-                ),
-                turn_event(
-                    "late-subagent",
-                    "claude-code",
-                    45,
-                    json!({"claude_code_billing": {"cc_prompt_id": "prompt-1"}}),
-                ),
-            ],
-        );
-
-        let main_1 = turn_of(&mut database, "main-1");
-        let main_2 = turn_of(&mut database, "main-2");
-        assert_ne!(main_1, main_2);
-        assert_eq!(turn_of(&mut database, "main-2-replay"), main_2);
-        assert_eq!(turn_of(&mut database, "subagent-1"), main_1);
-        assert_eq!(turn_of(&mut database, "subagent-2"), main_2);
-        assert_eq!(turn_of(&mut database, "recap"), main_1);
-        assert_eq!(turn_of(&mut database, "late-title"), main_2);
-        assert_eq!(turn_of(&mut database, "late-subagent"), main_1);
-        let turns = agent_turns::table
+    /// Stored turns in number order: key, number, start and end second.
+    fn turns(database: &mut SqliteConnection) -> Vec<(Option<String>, i32, i64, Option<i64>)> {
+        agent_turns::table
             .order_by(agent_turns::turn_index.asc())
             .select((
+                agent_turns::turn_key,
                 agent_turns::turn_index,
                 agent_turns::started_at,
                 agent_turns::ended_at,
             ))
-            .load::<(i32, i64, Option<i64>)>(&mut database)
-            .expect("turns should load");
-        let second = |value: i64| {
-            super::timestamp_to_micros(
-                chrono::DateTime::parse_from_rfc3339(&format!("2026-10-08T00:00:{value:02}Z"))
-                    .expect("timestamp should parse")
-                    .into(),
-            )
-        };
-        assert_eq!(
-            turns,
+            .load::<(Option<String>, i32, i64, Option<i64>)>(database)
+            .expect("turns should load")
+    }
+
+    fn second(value: i64) -> i64 {
+        super::timestamp_to_micros(
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-08T00:00:{value:02}Z"))
+                .expect("timestamp should parse")
+                .into(),
+        )
+    }
+
+    #[test]
+    fn events_naming_a_turn_share_it_and_others_join_the_turn_in_progress() {
+        let mut database = database();
+        ingest_turn_events(
+            &mut database,
             vec![
-                (main_1, second(10), Some(second(45))),
-                (main_2, second(30), Some(second(40))),
+                turn_event("main-1", "codex", 10, Some("p1")),
+                turn_event("subagent-1", "codex", 12, Some("p1")),
+                turn_event("recap", "codex", 20, None),
+                turn_event("main-2", "codex", 30, Some("p2")),
+                turn_event("subagent-2", "codex", 40, Some("p2")),
+            ],
+        );
+        // Delivered late: a request naming no turn observed during turn 2, and
+        // a background agent of turn 1 still working during turn 2.
+        ingest_turn_events(
+            &mut database,
+            vec![
+                turn_event("late-title", "codex", 32, None),
+                turn_event("late-subagent", "codex", 45, Some("p1")),
+            ],
+        );
+
+        for (event, turn) in [
+            ("main-1", 1_i32),
+            ("subagent-1", 1_i32),
+            ("recap", 1_i32),
+            ("late-subagent", 1_i32),
+            ("main-2", 2_i32),
+            ("subagent-2", 2_i32),
+            ("late-title", 2_i32),
+        ] {
+            assert_eq!(turn_of(&mut database, event), turn, "{event}");
+        }
+        assert_eq!(
+            turns(&mut database),
+            vec![
+                (Some("p1".to_owned()), 1_i32, second(10), Some(second(45))),
+                (Some("p2".to_owned()), 2_i32, second(30), Some(second(40))),
             ]
         );
     }
 
     #[test]
-    fn claude_code_side_request_before_any_turn_keeps_todays_turn() {
+    fn the_first_named_turn_adopts_the_turn_opened_without_one() {
         let mut database = database();
         ingest_turn_events(
             &mut database,
-            vec![turn_event(
-                "title",
-                "claude-code",
-                5,
-                json!({"request_hash": "title"}),
-            )],
+            vec![turn_event("probe", "claude-code", 5, None)],
         );
-        let first = turn_of(&mut database, "title");
         ingest_turn_events(
             &mut database,
             vec![
-                turn_event("main-1", "claude-code", 10, main_loop(1, "prompt-1")),
-                // Earlier than every turn: joins the session's earliest turn.
-                turn_event("probe", "claude-code", 1, json!({})),
+                turn_event("main-1", "claude-code", 10, Some("p1")),
+                turn_event("main-2", "claude-code", 30, Some("p2")),
+                // Earlier than every turn: joins the first one.
+                turn_event("early", "claude-code", 1, None),
             ],
         );
-        assert_ne!(turn_of(&mut database, "main-1"), first);
-        assert_eq!(turn_of(&mut database, "probe"), first);
+
+        assert_eq!(turn_of(&mut database, "probe"), 1_i32);
+        assert_eq!(turn_of(&mut database, "main-1"), 1_i32);
+        assert_eq!(turn_of(&mut database, "early"), 1_i32);
+        assert_eq!(turn_of(&mut database, "main-2"), 2_i32);
+        assert_eq!(
+            turns(&mut database),
+            vec![
+                (Some("p1".to_owned()), 1_i32, second(1), Some(second(10))),
+                (Some("p2".to_owned()), 2_i32, second(30), Some(second(30))),
+            ]
+        );
     }
 
     #[test]
-    fn other_agents_keep_provider_turn_identities() {
+    fn turns_are_numbered_by_start_time_whatever_order_they_arrive_in() {
         let mut database = database();
         ingest_turn_events(
             &mut database,
             vec![
-                turn_event("codex-1", "codex", 10, json!({"codex_turn_id": "turn-a"})),
-                turn_event("codex-2", "codex", 20, json!({"response_id": "resp-b"})),
+                turn_event("b", "codex", 30, Some("b")),
+                turn_event("b-next", "codex", 31, Some("b")),
+                turn_event("c", "codex", 50, Some("c")),
             ],
         );
-        assert_ne!(
-            turn_of(&mut database, "codex-1"),
-            turn_of(&mut database, "codex-2")
+        assert_eq!(turn_of(&mut database, "c"), 2_i32);
+
+        // A turn delivered late started first.
+        ingest_turn_events(&mut database, vec![turn_event("a", "codex", 10, Some("a"))]);
+        for (event, turn) in [("a", 1_i32), ("b", 2_i32), ("b-next", 2_i32), ("c", 3_i32)] {
+            assert_eq!(turn_of(&mut database, event), turn, "{event}");
+        }
+
+        // A late event of a known turn moves its start before every other turn.
+        ingest_turn_events(
+            &mut database,
+            vec![turn_event("c-early", "codex", 5, Some("c"))],
+        );
+        for (event, turn) in [
+            ("c-early", 1_i32),
+            ("c", 1_i32),
+            ("a", 2_i32),
+            ("b", 3_i32),
+            ("b-next", 3_i32),
+        ] {
+            assert_eq!(turn_of(&mut database, event), turn, "{event}");
+        }
+        assert_eq!(
+            turns(&mut database)
+                .into_iter()
+                .map(|(key, index, ..)| (key, index))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("c".to_owned()), 1_i32),
+                (Some("a".to_owned()), 2_i32),
+                (Some("b".to_owned()), 3_i32),
+            ]
         );
     }
 
@@ -1973,14 +1999,13 @@ mod tests {
                 "event_id": "sqlite-event",
                 "observed_at": "2026-08-27T00:00:00Z",
                 "device": {"host_name": "local", "platform": "macos"},
-                "agent": {"name": "Codex"},
+                "agent": {"name": "codex"},
                 "session_id": "sqlite-session",
-                "turn_index": 1,
-                "llm": {"provider": "OpenAI", "model": "gpt-5"},
+                "llm": {"provider": "openai", "model": "gpt-5"},
                 "event_type": "response",
                 "text": text,
-                "token_usage": {"output_tokens": 3},
-                "metadata": {"response_id": "sqlite-response"}
+                "token_usage": {"input_tokens": 0_i64, "output_tokens": 3_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 3_i64},
+                "metadata": {}
             }]
         }))
         .expect("test ingest request should deserialize")

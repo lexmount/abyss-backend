@@ -22,8 +22,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-const WORKING_DIRECTORY_METADATA_KEY: &str = "working_directory";
-
 #[derive(Deserialize)]
 /// Atomic batch accepted by the event-ingestion endpoint.
 pub struct IngestEventsRequest {
@@ -47,13 +45,29 @@ pub struct IngestUsageEvent {
     pub agent: AgentPayload,
     /// Agent-native session identifier.
     pub session_id: String,
+    /// The user turn this request works for, unique within its session;
+    /// absent when the request works for no particular turn.
+    pub turn_id: Option<String>,
+    /// Whether the request comes from a thread the Agent opened only to name
+    /// another session.
+    #[serde(default)]
+    pub naming_thread: bool,
+    /// The thread that sent this exchange's request, as the Agent declares
+    /// it; requests with the same value continue one conversation.
+    pub stream_id: Option<String>,
+    /// Provider identity of the response this exchange produced; both events
+    /// of the exchange carry it.
+    pub response_id: Option<String>,
+    /// The response this exchange's request continues after; the request then
+    /// carries only the messages added since.
+    pub previous_response_id: Option<String>,
     /// LLM provider and model labels.
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.
     pub event_type: UsageEventType,
     /// Optional prompt or response text.
     pub text: Option<String>,
-    /// Provider-reported token counters; missing counters default to zero.
+    /// Token counters of the `AgentEvent`; absent counters are stored as zero.
     #[serde(default)]
     pub token_usage: TokenUsagePayload,
     /// Collector metadata retained with the raw event.
@@ -67,10 +81,9 @@ pub struct IngestUsageEvent {
 #[derive(Debug, Deserialize)]
 /// Collector-supplied host identity used to group events by device context.
 pub struct DevicePayload {
-    /// User-visible host name; `hostname` remains an accepted JSON alias.
-    #[serde(alias = "hostname")]
+    /// User-visible host name, stored exactly as received.
     pub host_name: String,
-    /// Normalized operating-system or runtime platform label.
+    /// Operating-system or runtime platform label, stored exactly as received.
     pub platform: String,
     /// Optional operating-system version observed by the collector.
     pub os_version: Option<String>,
@@ -79,7 +92,7 @@ pub struct DevicePayload {
 #[derive(Debug, Deserialize)]
 /// Collector-supplied Agent identity.
 pub struct AgentPayload {
-    /// Agent name, normalized to a canonical slug during ingest.
+    /// Agent name identified by the collector, stored exactly as received.
     pub name: String,
     /// Optional Agent build or release version.
     pub version: Option<String>,
@@ -88,7 +101,7 @@ pub struct AgentPayload {
 #[derive(Debug, Deserialize)]
 /// Collector-supplied LLM target identity.
 pub struct LlmPayload {
-    /// Provider name, normalized to a lowercase slug during ingest.
+    /// Provider name, stored exactly as received.
     pub provider: String,
     /// Provider-specific model identifier.
     pub model: String,
@@ -119,7 +132,7 @@ impl UsageEventType {
     clippy::struct_field_names,
     reason = "Public JSON token usage fields intentionally include the token suffix."
 )]
-/// Token counters reported by the event producer.
+/// Token counters of the `AgentEvent`, stored as sent.
 ///
 /// Input, cache read, cache write, and output counters are disjoint;
 /// reasoning is a breakdown of output.
@@ -134,7 +147,7 @@ pub struct TokenUsagePayload {
     pub cache_write_tokens: Option<i64>,
     /// Part of output tokens spent on reasoning.
     pub reasoning_tokens: Option<i64>,
-    /// Sum of the four disjoint counters, derived when omitted.
+    /// Sum of the four disjoint counters.
     pub total_tokens: Option<i64>,
 }
 
@@ -235,7 +248,7 @@ pub struct SummaryRow {
     /// Device OS version when grouped by device.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os_version: Option<String>,
-    /// Canonical Agent name when grouped by Agent.
+    /// Agent name as reported by the collector, when grouped by Agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     /// LLM provider when grouped by provider.
@@ -438,7 +451,7 @@ pub struct UsageEventListItem {
     pub session_pk: Uuid,
     /// Backend turn primary key.
     pub turn_pk: Uuid,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Agent version observed on this event.
     pub agent_version: Option<String>,
@@ -446,7 +459,7 @@ pub struct UsageEventListItem {
     pub session_id: String,
     /// Backend-normalized turn number.
     pub turn_index: i32,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -518,7 +531,7 @@ pub struct UsageEventResponse {
     pub session_pk: Uuid,
     /// Backend turn primary key.
     pub turn_pk: Uuid,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Agent version observed on this event.
     pub agent_version: Option<String>,
@@ -526,7 +539,7 @@ pub struct UsageEventResponse {
     pub session_id: String,
     /// Backend-normalized turn number.
     pub turn_index: i32,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -550,6 +563,15 @@ pub struct UsageEventResponse {
     pub total_tokens: i64,
     /// Collector observation timestamp.
     pub observed_at: DateTime<Utc>,
+    /// Agent-declared thread of the exchange.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// Provider identity of the response the exchange produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// Response whose conversation the exchange's request continues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
     /// Collector metadata retained without schema expansion.
     pub metadata: Value,
     /// Ordered attachment metadata associated with the event.
@@ -588,7 +610,7 @@ pub struct UsageEventOutline {
     pub turn_pk: Uuid,
     /// Backend-normalized turn number.
     pub turn_index: i32,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -606,8 +628,6 @@ pub struct UsageEventOutline {
     pub reasoning_tokens: i64,
     /// Provider-reported or derived total-token count.
     pub total_tokens: i64,
-    /// Whether the collector estimated token usage.
-    pub token_usage_estimated: bool,
     /// Collector observation timestamp.
     pub observed_at: DateTime<Utc>,
     /// Text length in characters; zero when text is absent.
@@ -617,26 +637,6 @@ pub struct UsageEventOutline {
     pub preview: Option<String>,
     /// Number of image attachments on the event.
     pub attachment_count: i64,
-    /// Provider response-chain identifiers needed by timeline ordering.
-    #[serde(skip)]
-    pub ordering_metadata: Value,
-}
-
-impl UsageEventOutline {
-    /// Builds the minimal metadata object consumed by timeline ordering.
-    pub fn ordering_metadata(
-        response_id: Option<String>,
-        previous_response_id: Option<String>,
-    ) -> Value {
-        let mut metadata = serde_json::Map::new();
-        if let Some(value) = response_id {
-            metadata.insert("response_id".to_owned(), Value::String(value));
-        }
-        if let Some(value) = previous_response_id {
-            metadata.insert("previous_response_id".to_owned(), Value::String(value));
-        }
-        Value::Object(metadata)
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -648,7 +648,7 @@ pub struct SessionInfo {
     pub user_id: Uuid,
     /// Most recently associated device context.
     pub device_context_id: Uuid,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Most recently known Agent version.
     pub agent_version: Option<String>,
@@ -667,25 +667,6 @@ pub struct SessionInfo {
     pub purpose: Option<String>,
     /// For a naming thread, the task session its title was matched to.
     pub parent_session_pk: Option<Uuid>,
-}
-
-/// Extracts the endpoint working directory retained in session metadata.
-#[must_use]
-pub fn session_working_directory(metadata: &Value) -> Option<String> {
-    metadata
-        .get(WORKING_DIRECTORY_METADATA_KEY)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 4_096)
-        .map(str::to_owned)
-}
-
-/// Keeps only stable session-level metadata from an event.
-#[must_use]
-pub fn session_metadata_from_event(metadata: &Value) -> Value {
-    session_working_directory(metadata).map_or_else(
-        || json!({}),
-        |working_directory| json!({WORKING_DIRECTORY_METADATA_KEY: working_directory}),
-    )
 }
 
 #[derive(Debug, Serialize)]
@@ -713,7 +694,6 @@ mod tests {
     use super::{
         IngestEventsRequest, RawEventFields, RawEventsQuery, SummaryFields, SummaryQuery,
         SummaryResponse, SummaryRow, TokenUsageSummaryResponse, UsageEventType,
-        session_metadata_from_event, session_working_directory,
     };
     use serde_json::json;
 
@@ -741,10 +721,7 @@ mod tests {
                     },
                     "event_type": "request",
                     "text": "Explain this repository.",
-                    "token_usage": {
-                        "input_tokens": 10_i64,
-                        "cache_read_tokens": 2_i64
-                    },
+                    "token_usage": {"input_tokens": 10_i64, "output_tokens": 0_i64, "cache_read_tokens": 2_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 12_i64},
                     "metadata": {
                         "source": "unit-test"
                     }
@@ -787,14 +764,13 @@ mod tests {
                     "event_id": "evt-usage-002",
                     "observed_at": "2026-05-20T01:03:03Z",
                     "device": {
-                        "hostname": "alice-mbp",
+                        "host_name": "alice-mbp",
                         "platform": "macos"
                     },
                     "agent": {
-                        "name": "Claude Code"
+                        "name": "claude-code"
                     },
                     "session_id": "session-002",
-                    "turn_index": 2_i32,
                     "llm": {
                         "provider": "Anthropic",
                         "model": "claude-4"
@@ -816,29 +792,17 @@ mod tests {
         );
         assert_eq!(
             event.token_usage.total_tokens, None,
-            "omitted token_usage should default to empty token counters"
+            "omitted token_usage should leave every counter absent"
+        );
+        assert_eq!(event.turn_id, None, "an omitted turn names no turn");
+        assert!(
+            !event.naming_thread,
+            "an omitted flag is not a naming thread"
         );
         assert_eq!(
             event.metadata,
             json!({}),
             "omitted metadata should default to an empty object"
-        );
-    }
-
-    #[test]
-    fn session_metadata_keeps_only_a_bounded_working_directory() {
-        let metadata = json!({
-            "working_directory": "/Users/alice/repo",
-            "request_hash": "sensitive-event-detail"
-        });
-
-        assert_eq!(
-            session_working_directory(&metadata).as_deref(),
-            Some("/Users/alice/repo")
-        );
-        assert_eq!(
-            session_metadata_from_event(&metadata),
-            json!({"working_directory": "/Users/alice/repo"})
         );
     }
 
