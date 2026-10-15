@@ -53,6 +53,7 @@ diesel::table! {
         user_id -> Text,
         session_pk -> Text,
         turn_index -> Integer,
+        turn_key -> Nullable<Text>,
         started_at -> BigInt,
         ended_at -> Nullable<BigInt>,
         created_at -> BigInt,
@@ -88,6 +89,9 @@ diesel::table! {
         observed_at -> BigInt,
         metadata -> Text,
         created_at -> BigInt,
+        stream_id -> Nullable<Text>,
+        response_id -> Nullable<Text>,
+        previous_response_id -> Nullable<Text>,
     }
 }
 
@@ -133,6 +137,21 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+
+    session_titles (session_pk) {
+        session_pk -> Text,
+        user_id -> Text,
+        title -> Nullable<Text>,
+        title_event_pk -> Nullable<Text>,
+        title_observed_at -> Nullable<BigInt>,
+        purpose -> Nullable<Text>,
+        updated_at -> BigInt,
+        parent_session_pk -> Nullable<Text>,
+    }
+}
+
 diesel::joinable!(agent_sessions -> app_users (user_id));
 diesel::joinable!(agent_sessions -> devices (device_context_id));
 diesel::joinable!(agent_turns -> agent_sessions (session_pk));
@@ -149,6 +168,7 @@ diesel::joinable!(agent_diagnostic_capture_events -> llm_usage_events (event_pk)
 diesel::joinable!(agent_diagnostic_captures -> agent_sessions (session_pk));
 diesel::joinable!(agent_diagnostic_captures -> app_users (user_id));
 diesel::joinable!(agent_diagnostic_captures -> devices (device_context_id));
+diesel::joinable!(session_titles -> agent_sessions (session_pk));
 
 diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_capture_events,
@@ -159,4 +179,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     devices,
     llm_usage_events,
     llm_usage_event_attachments,
+    session_titles,
 );

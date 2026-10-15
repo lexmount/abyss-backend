@@ -9,7 +9,7 @@ pub mod models;
 /// Diesel's compile-time representation of the PostgreSQL schema.
 pub mod schema;
 
-use diesel::{PgConnection, RunQueryDsl, r2d2::ConnectionManager, sql_query};
+use diesel::{IntoSql, PgConnection, RunQueryDsl, r2d2::ConnectionManager, sql_types::Integer};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
 use crate::{config::Config, error::AppError};
@@ -37,6 +37,6 @@ pub fn run_migrations(pool: &DbPool) -> Result<(), Box<dyn std::error::Error + S
 
 /// Executes the minimal PostgreSQL query used by the readiness endpoint.
 pub fn check_ready(connection: &mut PgConnection) -> Result<(), AppError> {
-    sql_query("SELECT 1").execute(connection)?;
+    diesel::select(1_i32.into_sql::<Integer>()).execute(connection)?;
     Ok(())
 }

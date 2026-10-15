@@ -47,16 +47,21 @@ CREATE TABLE agent_sessions (
 CREATE INDEX agent_sessions_user_time_idx
     ON agent_sessions (user_id, started_at DESC);
 
+-- turn_key is the turn the Agent named for its requests, unique within the
+-- session; it is NULL for the turn opened by requests naming none. turn_index
+-- is the turn's position in the session by start time.
 CREATE TABLE agent_turns (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
     session_pk TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
     turn_index INTEGER NOT NULL CHECK (turn_index >= 1),
+    turn_key TEXT,
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE (session_pk, turn_index)
+    UNIQUE (session_pk, turn_index),
+    UNIQUE (session_pk, turn_key)
 ) STRICT;
 
 CREATE INDEX agent_turns_user_session_idx
@@ -85,6 +90,12 @@ CREATE TABLE llm_usage_events (
     reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
     observed_at INTEGER NOT NULL,
+    -- Agent-declared thread of the exchange; equal values continue one conversation.
+    stream_id TEXT,
+    -- Provider identity of the response the exchange produced.
+    response_id TEXT,
+    -- Response whose conversation the exchange's request continues.
+    previous_response_id TEXT,
     metadata TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata)),
     created_at INTEGER NOT NULL
 ) STRICT;
@@ -154,7 +165,35 @@ CREATE VIRTUAL TABLE usage_events_fts USING fts5(
     content,
     tool_names,
     tool_content,
-    commands,
-    file_paths,
     tokenize = 'unicode61'
 );
+
+
+-- Session names read back from the Agents' own title-generation calls, kept
+-- apart from agent_sessions so session rows keep their shape. purpose marks
+-- sessions that exist only to generate a title, such as Codex naming threads,
+-- and parent_session_pk the task session such a thread was matched to.
+CREATE TABLE session_titles (
+    session_pk TEXT PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+    title TEXT,
+    title_event_pk TEXT REFERENCES llm_usage_events(id) ON DELETE SET NULL,
+    title_observed_at INTEGER,
+    purpose TEXT,
+    parent_session_pk TEXT REFERENCES agent_sessions(id) ON DELETE SET NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+
+-- Event rows hold whole request bodies in text and metadata, so reading a
+-- token column from the row walks through megabytes of overflow pages. These
+-- indexes carry every column the usage summary and the session list read,
+-- letting both answer from the index alone.
+CREATE INDEX llm_usage_events_summary_cover_idx
+    ON llm_usage_events (
+        user_id, observed_at, agent_name, llm_provider, llm_model, event_type,
+        device_context_id, session_pk, turn_pk, session_id,
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+        reasoning_tokens, total_tokens
+    );
+CREATE INDEX llm_usage_events_session_activity_idx
+    ON llm_usage_events (session_pk, observed_at, total_tokens);

@@ -246,7 +246,7 @@ pub struct MatchedEvent {
     pub turn_index: i32,
     /// Request or response side.
     pub event_type: String,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -300,9 +300,7 @@ fn index_definition() -> Value {
                 "observed_at": {"type": "date"},
                 "content": {"type": "text"},
                 "tool_names": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
-                "tool_content": {"type": "text"},
-                "commands": {"type": "text"},
-                "file_paths": {"type": "text"}
+                "tool_content": {"type": "text"}
             }
         }
     })
@@ -322,9 +320,9 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
         }
         filters.push(json!({"range": {"observed_at": Value::Object(range)}}));
     }
-    push_term_filter(&mut filters, "agent_name", query.agent_name.as_deref());
-    push_term_filter(&mut filters, "llm_provider", query.llm_provider.as_deref());
-    push_term_filter(&mut filters, "llm_model", query.llm_model.as_deref());
+    push_terms_filter(&mut filters, "agent_name", &query.agent_names);
+    push_terms_filter(&mut filters, "llm_provider", &query.llm_providers);
+    push_terms_filter(&mut filters, "llm_model", &query.llm_models);
     push_term_filter(&mut filters, "event_type", query.event_type.as_deref());
 
     json!({
@@ -341,8 +339,6 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
                         "fields": [
                             "content^4",
                             "session_id^3",
-                            "commands^3",
-                            "file_paths^3",
                             "tool_names^2",
                             "tool_content"
                         ],
@@ -375,8 +371,6 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
                     "number_of_fragments": 2,
                     "fields": {
                         "content": {},
-                        "commands": {},
-                        "file_paths": {},
                         "tool_names": {},
                         "tool_content": {}
                     }
@@ -399,6 +393,15 @@ fn push_term_filter(filters: &mut Vec<Value>, field: &str, value: Option<&str>) 
         let mut term = serde_json::Map::new();
         term.insert(field.to_owned(), Value::String(value.to_owned()));
         filters.push(json!({"term": Value::Object(term)}));
+    }
+}
+
+/// Matches any of `values`; an empty list adds no filter.
+fn push_terms_filter(filters: &mut Vec<Value>, field: &str, values: &[String]) {
+    if !values.is_empty() {
+        let mut terms = serde_json::Map::new();
+        terms.insert(field.to_owned(), json!(values));
+        filters.push(json!({"terms": Value::Object(terms)}));
     }
 }
 
@@ -594,17 +597,11 @@ impl TryFrom<RawSearchResponse> for SearchMatchPage {
 }
 
 fn ordered_fragments(highlights: &HashMap<String, Vec<String>>) -> Vec<String> {
-    [
-        "content",
-        "commands",
-        "file_paths",
-        "tool_names",
-        "tool_content",
-    ]
-    .into_iter()
-    .flat_map(|field| highlights.get(field).into_iter().flatten().cloned())
-    .take(2)
-    .collect()
+    ["content", "tool_names", "tool_content"]
+        .into_iter()
+        .flat_map(|field| highlights.get(field).into_iter().flatten().cloned())
+        .take(2)
+        .collect()
 }
 
 #[cfg(test)]
@@ -625,9 +622,9 @@ mod tests {
             text: "timeout".to_owned(),
             from: Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap()),
             to: None,
-            agent_name: Some("claude-code".to_owned()),
-            llm_provider: None,
-            llm_model: None,
+            agent_names: vec!["claude-code".to_owned(), "codex".to_owned()],
+            llm_providers: Vec::new(),
+            llm_models: vec!["gpt-5".to_owned()],
             event_type: None,
             page: 1,
             page_size: 20,
@@ -640,7 +637,13 @@ mod tests {
             .as_array()
             .expect("filters should be an array");
         assert!(filters.contains(&json!({"term": {"user_id": user_id}})));
-        assert!(filters.contains(&json!({"term": {"agent_name": "claude-code"}})));
+        assert!(filters.contains(&json!({"terms": {"agent_name": ["claude-code", "codex"]}})));
+        assert!(filters.contains(&json!({"terms": {"llm_model": ["gpt-5"]}})));
+        assert!(
+            !filters
+                .iter()
+                .any(|filter| filter["terms"].get("llm_provider").is_some())
+        );
         assert_eq!(request["collapse"]["field"], "session_pk");
     }
 

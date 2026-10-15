@@ -16,6 +16,16 @@ and optional full-text search.
 - Health and storage-readiness probes.
 - Embedded migrations for both supported storage profiles.
 
+A session is titled by the `session_title` the collector reports for a call in
+which the Agent names its own session (Claude Code); otherwise by its first
+nonempty user input, collapsed to one line and truncated to 80 characters with
+an ellipsis. An Agent title is never replaced by a default title. Requests whose
+`purpose` marks them as naming calls are not user input. Codex names tasks from
+separate threads that do not say which session they name; those threads are
+marked `title_generation` from their `thread_source` and are not linked to a
+task. Naming calls retain their own events and usage. Existing sessions receive
+default titles through a one-time backfill.
+
 Exactly one storage profile is compiled into a binary:
 
 - `postgres-es` uses PostgreSQL as the source of truth and optionally projects

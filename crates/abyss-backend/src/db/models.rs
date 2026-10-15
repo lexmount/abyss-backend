@@ -74,7 +74,7 @@ pub struct AgentSession {
     pub user_id: Uuid,
     /// Most recently associated device-context key.
     pub device_context_id: Uuid,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Most recently observed Agent version.
     pub agent_version: Option<String>,
@@ -102,7 +102,7 @@ pub struct NewAgentSession {
     pub user_id: Uuid,
     /// Associated device-context key.
     pub device_context_id: Uuid,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Optional Agent version.
     pub agent_version: Option<String>,
@@ -131,8 +131,11 @@ pub struct AgentTurn {
     pub user_id: Uuid,
     /// Parent session primary key.
     pub session_pk: Uuid,
-    /// Positive turn number unique within the session.
+    /// Position of the turn in its session by start time.
     pub turn_index: i32,
+    /// Turn the Agent named for its requests; `None` for the turn opened by
+    /// requests naming none.
+    pub turn_key: Option<String>,
     /// Earliest event observation in the turn.
     pub started_at: DateTime<Utc>,
     /// Latest event observation in the turn.
@@ -153,8 +156,11 @@ pub struct NewAgentTurn {
     pub user_id: Uuid,
     /// Parent session primary key.
     pub session_pk: Uuid,
-    /// Positive turn number unique within the session.
+    /// Position of the turn in its session by start time.
     pub turn_index: i32,
+    /// Turn the Agent named for its requests; `None` for the turn opened by
+    /// requests naming none.
+    pub turn_key: Option<String>,
     /// Initial earliest observation time.
     pub started_at: DateTime<Utc>,
     /// Initial latest observation time.
@@ -182,7 +188,7 @@ pub struct UsageEvent {
     pub turn_pk: Uuid,
     /// Collector-generated idempotency key.
     pub event_id: String,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Agent version observed for the event.
     pub agent_version: Option<String>,
@@ -190,7 +196,7 @@ pub struct UsageEvent {
     pub session_id: String,
     /// Normalized turn number copied for direct filtering.
     pub turn_index: i32,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -218,6 +224,12 @@ pub struct UsageEvent {
     pub metadata: Value,
     /// Server insertion time.
     pub created_at: DateTime<Utc>,
+    /// Agent-declared thread of the exchange.
+    pub stream_id: Option<String>,
+    /// Provider identity of the response the exchange produced.
+    pub response_id: Option<String>,
+    /// Response whose conversation the exchange's request continues.
+    pub previous_response_id: Option<String>,
 }
 
 #[derive(Queryable, Selectable)]
@@ -297,7 +309,7 @@ pub struct NewUsageEvent {
     pub turn_pk: Uuid,
     /// Collector-generated idempotency key.
     pub event_id: String,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Optional Agent version.
     pub agent_version: Option<String>,
@@ -305,7 +317,7 @@ pub struct NewUsageEvent {
     pub session_id: String,
     /// Backend-normalized turn number.
     pub turn_index: i32,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -333,6 +345,12 @@ pub struct NewUsageEvent {
     pub metadata: Value,
     /// Server insertion time.
     pub created_at: DateTime<Utc>,
+    /// Agent-declared thread of the exchange.
+    pub stream_id: Option<String>,
+    /// Provider identity of the response the exchange produced.
+    pub response_id: Option<String>,
+    /// Response whose conversation the exchange's request continues.
+    pub previous_response_id: Option<String>,
 }
 
 #[derive(Insertable)]

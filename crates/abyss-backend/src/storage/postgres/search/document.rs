@@ -31,9 +31,9 @@ pub struct SearchDocument {
     pub turn_pk: Uuid,
     /// Backend-normalized turn number.
     pub turn_index: i32,
-    /// Canonical Agent name used for exact filtering.
+    /// Agent name as reported by the collector, used for exact filtering.
     pub agent_name: String,
-    /// Canonical LLM provider slug used for exact filtering.
+    /// LLM provider as reported by the collector, used for exact filtering.
     pub llm_provider: String,
     /// Provider-specific model identifier used for exact filtering.
     pub llm_model: String,
@@ -50,12 +50,6 @@ pub struct SearchDocument {
     /// Bounded raw tool inputs and outputs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_content: Vec<String>,
-    /// Bounded command strings extracted from structured tool input.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub commands: Vec<String>,
-    /// Bounded paths and working directories extracted from allowlisted fields.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub file_paths: Vec<String>,
 }
 
 impl SearchDocument {
@@ -78,8 +72,6 @@ impl SearchDocument {
             content: projection.content,
             tool_names: projection.tool_names,
             tool_content: projection.tool_content,
-            commands: projection.commands,
-            file_paths: projection.file_paths,
         }
     }
 }
@@ -98,7 +90,6 @@ mod tests {
     fn extracts_only_searchable_tool_metadata() {
         let mut event = usage_event();
         event.metadata = json!({
-            "working_directory": "/Users/alice/repo",
             "authorization": "Bearer secret",
             "content_segments": [
                 {
@@ -120,8 +111,11 @@ mod tests {
         let document = SearchDocument::from_event(event);
 
         assert_eq!(document.tool_names, ["Bash"]);
-        assert_eq!(document.commands, ["cargo test"]);
-        assert_eq!(document.file_paths, ["/Users/alice/repo", "src/lib.rs"]);
+        // Tool inputs are searchable as written; no field is pulled out by name.
+        assert_eq!(
+            document.tool_content[0],
+            "{\"command\":\"cargo test\",\"nested\":{\"file_path\":\"src/lib.rs\"}}"
+        );
         assert_eq!(document.tool_content.len(), 2);
         let serialized = serde_json::to_string(&document).expect("document should serialize");
         assert!(!serialized.contains("Bearer secret"));
@@ -153,7 +147,6 @@ mod tests {
             "before {HIGHLIGHT_START}match{HIGHLIGHT_END} after"
         ));
         event.metadata = json!({
-            "working_directory": format!("/tmp/{HIGHLIGHT_START}repo"),
             "content_segments": [
                 {
                     "type": "tool_call",
@@ -204,6 +197,9 @@ mod tests {
             observed_at: Utc::now(),
             metadata: json!({}),
             created_at: Utc::now(),
+            stream_id: None,
+            response_id: None,
+            previous_response_id: None,
         }
     }
 }

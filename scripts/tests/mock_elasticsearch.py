@@ -17,8 +17,6 @@ HIGHLIGHT_START = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]"
 HIGHLIGHT_END = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]"
 SEARCHABLE_FIELDS = (
     "content",
-    "commands",
-    "file_paths",
     "tool_names",
     "tool_content",
     "session_id",
@@ -148,6 +146,10 @@ def matches_filters(document: dict[str, Any], filters: list[dict[str, Any]]) -> 
         if "term" in clause:
             for field, expected in clause["term"].items():
                 if document.get(field) != expected:
+                    return False
+        if "terms" in clause:
+            for field, accepted in clause["terms"].items():
+                if document.get(field) not in accepted:
                     return False
         if "range" in clause:
             for field, bounds in clause["range"].items():

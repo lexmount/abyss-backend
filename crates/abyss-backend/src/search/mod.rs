@@ -32,12 +32,15 @@ pub struct SessionSearchQuery {
     pub from: Option<DateTime<Utc>>,
     /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
-    /// Optional canonical Agent filter.
-    pub agent_name: Option<String>,
-    /// Optional canonical LLM provider filter.
-    pub llm_provider: Option<String>,
-    /// Optional model filter.
-    pub llm_model: Option<String>,
+    /// Optional Agent filter, matched exactly; repeat the key to match any of several.
+    #[serde(default)]
+    pub agent_name: Vec<String>,
+    /// Optional LLM provider filter, matched exactly; repeat the key to match any of several.
+    #[serde(default)]
+    pub llm_provider: Vec<String>,
+    /// Optional model filter; repeat the key to match any of several.
+    #[serde(default)]
+    pub llm_model: Vec<String>,
     /// Optional request or response filter.
     pub event_type: Option<String>,
     /// One-based result page.
@@ -93,11 +96,9 @@ impl SessionSearchQuery {
             text,
             from: self.from,
             to: self.to,
-            agent_name: normalized_optional(self.agent_name.as_deref(), "agent_name")?
-                .map(|value| canonical_agent_name(&value)),
-            llm_provider: normalized_optional(self.llm_provider.as_deref(), "llm_provider")?
-                .map(|value| normalize_slug(&value)),
-            llm_model: normalized_optional(self.llm_model.as_deref(), "llm_model")?,
+            agent_names: normalized_list(&self.agent_name, "agent_name")?,
+            llm_providers: normalized_list(&self.llm_provider, "llm_provider")?,
+            llm_models: normalized_list(&self.llm_model, "llm_model")?,
             event_type,
             page,
             page_size,
@@ -114,12 +115,12 @@ pub struct ValidatedSearchQuery {
     pub from: Option<DateTime<Utc>>,
     /// Exclusive upper observation-time bound.
     pub to: Option<DateTime<Utc>>,
-    /// Canonical Agent-name filter.
-    pub agent_name: Option<String>,
-    /// Canonical provider slug filter.
-    pub llm_provider: Option<String>,
-    /// Trimmed model filter.
-    pub llm_model: Option<String>,
+    /// Trimmed Agent names to match exactly, any of, or empty for every Agent.
+    pub agent_names: Vec<String>,
+    /// Trimmed providers to match any of, or empty for every provider.
+    pub llm_providers: Vec<String>,
+    /// Trimmed models to match any of, or empty for every model.
+    pub llm_models: Vec<String>,
     /// Canonical request or response filter.
     pub event_type: Option<String>,
     /// One-based result page.
@@ -154,7 +155,7 @@ pub struct SessionSearchResult {
     pub session_pk: Uuid,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// Canonical Agent name.
+    /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Most recently observed Agent version.
     pub agent_version: Option<String>,
@@ -187,7 +188,7 @@ pub struct SessionSearchMatch {
     pub turn_index: i32,
     /// Request or response side.
     pub event_type: String,
-    /// Canonical LLM provider slug.
+    /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
@@ -270,24 +271,15 @@ fn normalized_optional(value: Option<&str>, field: &str) -> Result<Option<String
         .transpose()
 }
 
-fn normalize_slug(value: &str) -> String {
-    value
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| match character {
-            '_' | ' ' => '-',
-            other => other,
-        })
-        .collect()
-}
-
-fn canonical_agent_name(value: &str) -> String {
-    let normalized = normalize_slug(value);
-    match normalized.as_str() {
-        "claude" | "claude-desktop" => "claude-code".to_owned(),
-        _ => normalized,
-    }
+/// Validates and trims every value, then de-duplicates them.
+fn normalized_list(values: &[String], field: &str) -> Result<Vec<String>, AppError> {
+    let mut normalized = values
+        .iter()
+        .map(|value| normalized_required(value, field, MAX_FILTER_CHARACTERS))
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -323,6 +315,18 @@ mod tests {
     }
 
     #[test]
+    fn matches_agent_names_exactly_as_reported() {
+        let mut agents = query("hello");
+        agents.agent_name = vec![
+            " claude-desktop ".to_owned(),
+            "claude-code".to_owned(),
+            "claude-code".to_owned(),
+        ];
+        let validated = agents.validate().expect("agent filter is valid");
+        assert_eq!(validated.agent_names, ["claude-code", "claude-desktop"]);
+    }
+
+    #[test]
     fn parses_highlights_without_rendering_html() {
         let fragment = SearchFragment::parse(&format!(
             "before {HIGHLIGHT_START}timeout{HIGHLIGHT_END} after"
@@ -338,9 +342,9 @@ mod tests {
             q: q.to_owned(),
             from: None,
             to: None,
-            agent_name: None,
-            llm_provider: None,
-            llm_model: None,
+            agent_name: Vec::new(),
+            llm_provider: Vec::new(),
+            llm_model: Vec::new(),
             event_type: None,
             page: None,
             page_size: None,
