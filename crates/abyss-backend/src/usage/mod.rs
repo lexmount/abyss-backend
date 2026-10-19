@@ -56,7 +56,7 @@ pub struct IngestUsageEvent {
     /// it; requests with the same value continue one conversation.
     pub stream_id: Option<String>,
     /// Provider identity of the response this exchange produced; both events
-    /// of the exchange carry it. Used to group a fallback turn when turn_id
+    /// of the exchange carry it. Used to group a fallback turn when `turn_id`
     /// is absent; one user turn can contain several such model calls.
     pub response_id: Option<String>,
     /// The response this exchange's request continues after; the request then
