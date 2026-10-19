@@ -46,7 +46,7 @@ pub struct IngestUsageEvent {
     /// Agent-native session identifier.
     pub session_id: String,
     /// The user turn this request works for, unique within its session;
-    /// absent when the request works for no particular turn.
+    /// absent when the collector cannot identify a particular turn.
     pub turn_id: Option<String>,
     /// Whether the request comes from a thread the Agent opened only to name
     /// another session.
@@ -56,7 +56,8 @@ pub struct IngestUsageEvent {
     /// it; requests with the same value continue one conversation.
     pub stream_id: Option<String>,
     /// Provider identity of the response this exchange produced; both events
-    /// of the exchange carry it.
+    /// of the exchange carry it. Used to group a fallback turn when turn_id
+    /// is absent; one user turn can contain several such model calls.
     pub response_id: Option<String>,
     /// The response this exchange's request continues after; the request then
     /// carries only the messages added since.

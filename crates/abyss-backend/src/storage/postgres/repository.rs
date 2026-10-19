@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use diesel::{
-    Connection, ExpressionMethods, IntoSql, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
-    SelectableHelper, define_sql_function,
+    Connection, ExpressionMethods, IntoSql, JoinOnDsl, PgConnection, QueryDsl, QueryableByName,
+    RunQueryDsl, SelectableHelper, define_sql_function,
     dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
@@ -690,6 +690,7 @@ fn ingest_one_event(
         user_id,
         session.id,
         event.turn_id.as_deref(),
+        event.response_id.as_deref(),
         observed_at,
         now,
     )?;
@@ -881,20 +882,23 @@ fn upsert_session(
 /// Places an event in a turn of its session and returns the turn's id and
 /// position.
 ///
-/// Events naming the same turn share it, and an event naming none joins the
-/// turn in progress when it was observed. Turns are numbered by when they
-/// started, so a turn that arrives late moves the turns after it.
+/// Explicit turn ids take priority; otherwise each response id gets its own
+/// fallback turn. Events with neither id join the turn in progress.
+/// Turns are numbered by when they started, so a turn that arrives late
+/// moves the turns after it.
 fn place_in_turn(
     connection: &mut PgConnection,
     user_id: Uuid,
     session_pk: Uuid,
     turn_id: Option<&str>,
+    response_id: Option<&str>,
     observed_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<(Uuid, i32), AppError> {
-    let found = match turn_id {
-        Some(key) => named_turn(connection, session_pk, key)?,
-        None => turn_in_progress(connection, session_pk, observed_at)?,
+    let found = match (turn_id, response_id) {
+        (Some(key), _) => named_turn(connection, session_pk, key)?,
+        (None, Some(key)) => response_turn(connection, session_pk, key)?,
+        (None, None) => turn_in_progress(connection, session_pk, observed_at)?,
     };
     let (turn_pk, turn_index, reordered) = if let Some(turn) = found {
         diesel::update(agent_turns::table.find(turn.id))
@@ -940,7 +944,8 @@ fn place_in_turn(
 }
 
 /// The turn named `key` in a session. The first named turn adopts the turn
-/// that events naming none opened at the start of the session.
+/// that events with neither turn nor response id opened at the start of the
+/// session. A response fallback turn keeps its separate identity.
 fn named_turn(
     connection: &mut PgConnection,
     session_pk: Uuid,
@@ -965,11 +970,39 @@ fn named_turn(
         _ => None,
     };
     if let Some(turn) = &opening {
+        let has_response = llm_usage_events::table
+            .filter(llm_usage_events::turn_pk.eq(turn.id))
+            .filter(llm_usage_events::response_id.is_not_null())
+            .select(llm_usage_events::id)
+            .first::<Uuid>(connection)
+            .optional()?
+            .is_some();
+        if has_response {
+            return Ok(None);
+        }
         diesel::update(agent_turns::table.find(turn.id))
             .set(agent_turns::turn_key.eq(key))
             .execute(connection)?;
     }
     Ok(opening)
+}
+
+/// Reuses the fallback turn for a model response within this session.
+/// Explicit turn keys and response ids occupy separate identity domains.
+fn response_turn(
+    connection: &mut PgConnection,
+    session_pk: Uuid,
+    response_id: &str,
+) -> Result<Option<AgentTurn>, AppError> {
+    agent_turns::table
+        .inner_join(llm_usage_events::table.on(llm_usage_events::turn_pk.eq(agent_turns::id)))
+        .filter(llm_usage_events::session_pk.eq(session_pk))
+        .filter(llm_usage_events::response_id.eq(response_id))
+        .filter(agent_turns::turn_key.is_null())
+        .select(AgentTurn::as_select())
+        .first::<AgentTurn>(connection)
+        .optional()
+        .map_err(AppError::from)
 }
 
 /// The turn in progress when an event naming no turn was observed: the latest
