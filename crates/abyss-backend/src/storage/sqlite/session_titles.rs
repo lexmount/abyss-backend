@@ -184,7 +184,7 @@ mod tests {
         database
     }
 
-    /// A request whose collector conversation holds one user message.
+    /// A request whose collector conversation holds one user entry.
     fn request(agent: &str, session: &str, id: &str, at: &str, input: &str) -> Value {
         event(
             agent,
@@ -193,7 +193,7 @@ mod tests {
             at,
             "request",
             json!({"conversation": {
-                "messages": [{"role": "user", "text": input}],
+                "entries": [{"role": "user", "text": input}],
                 "completeness": "complete"
             }}),
         )
@@ -346,7 +346,7 @@ mod tests {
             "2026-09-30T00:00:01Z",
             "response",
             json!({"conversation": {
-                "messages": [{"role": "assistant", "text": "{\"title\":\"Quoted\"}"}],
+                "entries": [{"role": "assistant", "text": "{\"title\":\"Quoted\"}"}],
                 "completeness": "complete"
             }}),
         );

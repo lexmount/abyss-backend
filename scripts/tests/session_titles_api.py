@@ -23,7 +23,7 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
             value["naming_thread"] = True
         if kind == "request":
             value["metadata"]["conversation"] = {
-                "messages": [{"role": "user", "text": text}], "completeness": "complete",
+                "entries": [{"role": "user", "text": text}], "completeness": "complete",
             }
         return value
 

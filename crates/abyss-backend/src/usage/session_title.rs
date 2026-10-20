@@ -31,7 +31,7 @@ pub enum TitleContribution<'a> {
 }
 
 impl<'a> TitleContribution<'a> {
-    /// Classifies an event from collector fields without reading its messages.
+    /// Classifies an event from collector fields without reading its entries.
     /// Requests the Agent made for its own purposes, such as naming calls, are
     /// not user input.
     pub fn of(event_type: &str, metadata: &'a Value, naming_thread: bool) -> Option<Self> {
@@ -51,9 +51,9 @@ impl<'a> TitleContribution<'a> {
 /// Default name: the first non-empty user input, on one line, at most 80 chars.
 pub fn default_title(metadata: &Value) -> Option<String> {
     let input = Conversation::read(metadata)?
-        .messages
+        .entries
         .into_iter()
-        .find(|message| message.role == "user" && !message.text.trim().is_empty())?
+        .find(|entry| entry.role == "user" && !entry.text.trim().is_empty())?
         .text;
     let input = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = input.chars();
@@ -80,8 +80,8 @@ mod tests {
         json!({"conversation": conversation})
     }
 
-    fn default_of(messages: &Value) -> Option<String> {
-        default_title(&request(&json!({"messages": messages})))
+    fn default_of(entries: &Value) -> Option<String> {
+        default_title(&request(&json!({"entries": entries})))
     }
 
     #[test]
@@ -90,7 +90,7 @@ mod tests {
             default_of(&json!([
                 {"role":"system","text":"Instructions"},
                 {"role":"assistant","text":"Previous reply"},
-                {"role":"tool","text":"Tool output"},
+                {"role":"tool_result","text":"Tool output","call_id":"call_1"},
                 {"role":"user","text":"  "},
                 {"role":"user","text":" 修复\n  登录问题 "},
                 {"role":"user","text":"Second request"}
@@ -116,13 +116,13 @@ mod tests {
 
     #[test]
     fn default_title_requires_readable_user_input() {
-        for messages in [
+        for entries in [
             json!([]),
             json!([{"role":"system","text":"Instructions"}]),
             json!([{"role":"user","text":" \n "}]),
-            json!([{"role":"tool","text":"Output"}]),
+            json!([{"role":"tool_result","text":"Output","call_id":"call_1"}]),
         ] {
-            assert_eq!(default_of(&messages), None);
+            assert_eq!(default_of(&entries), None);
         }
         assert_eq!(default_title(&json!({"text":"No role"})), None);
     }
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(
             TitleContribution::of(
                 "response",
-                &request(&json!({"messages":[
+                &request(&json!({"entries":[
                     {"role":"assistant","text":"{\"title\":\"Quoted\"}"}
                 ]})),
                 false
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn naming_requests_are_not_user_input() {
-        let mut metadata = request(&json!({"messages":[{"role":"user","text":"<session>…"}]}));
+        let mut metadata = request(&json!({"entries":[{"role":"user","text":"<session>…"}]}));
         metadata["purpose"] = json!("session_title");
         assert_eq!(TitleContribution::of("request", &metadata, false), None);
     }
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn naming_threads_are_marked_from_the_collector_flag() {
         let metadata =
-            request(&json!({"messages":[{"role":"user","text":"Generate a concise title"}]}));
+            request(&json!({"entries":[{"role":"user","text":"Generate a concise title"}]}));
         assert_eq!(
             TitleContribution::of("request", &metadata, true),
             Some(TitleContribution::TitleThread)
@@ -174,17 +174,16 @@ mod tests {
     #[test]
     fn incomplete_conversations_give_no_default() {
         for status in ["partial", "unsupported"] {
-            let metadata = request(
-                &json!({"completeness":status,"messages":[{"role":"user","text":"hello"}]}),
-            );
+            let metadata =
+                request(&json!({"completeness":status,"entries":[{"role":"user","text":"hello"}]}));
             assert_eq!(default_title(&metadata), None);
         }
     }
 
     #[test]
-    fn content_outside_collector_messages_is_never_interpreted() {
+    fn content_outside_collector_entries_is_never_interpreted() {
         let metadata = json!({"raw_body":{"parts":[{"content_base64":"e30="}]},
-            "conversation":{"messages":[], "completeness":"complete", "provider":{"input":"secret"}}});
+            "conversation":{"entries":[], "completeness":"complete", "provider":{"input":"secret"}}});
         assert_eq!(default_title(&metadata), None);
     }
 }
