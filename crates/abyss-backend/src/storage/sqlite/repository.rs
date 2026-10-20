@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use diesel::{
-    ExpressionMethods, IntoSql, QueryDsl, QueryableByName, RunQueryDsl, SelectableHelper,
-    SqliteConnection,
+    ExpressionMethods, IntoSql, NullableExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl,
+    SelectableHelper, SqliteConnection,
     dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
@@ -31,7 +31,10 @@ use crate::{
             exact_values_filter, non_empty, normalize_limit, normalize_text, parse_group_by,
             sha256_bytes, validate_batch, validate_event_type,
         },
-        streams::{RequestFacts, ResponseFacts},
+        streams::{
+            RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
+            session_streams as streams_of,
+        },
     },
 };
 
@@ -39,7 +42,8 @@ use super::{
     models::{
         AttachmentRow, DeviceRecord, DeviceRow, EventRecord, EventRow, NewAttachment, NewDevice,
         NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewStreamFacts,
-        NewTurn, SessionRecord, SessionRow, TurnRecord, TurnRow, parse_uuid, timestamp_from_micros,
+        NewTurn, SessionRecord, SessionRow, StreamEventRow, TurnRecord, TurnRow, parse_uuid,
+        timestamp_from_micros,
     },
     schema::{
         agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
@@ -512,6 +516,59 @@ fn insert_search_projection(
     .bind::<Text, _>(projection.tool_content.join("\n"))
     .execute(connection)?;
     Ok(())
+}
+
+/// Derives the streams of one session's events from their stream facts,
+/// without reading any request body.
+pub(super) fn session_streams(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<SessionStreamsResponse, AppError> {
+    let events = stream_events(connection, user_id, session_pk)?;
+    if events.is_empty() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    Ok(streams_of(session_pk, events))
+}
+
+/// The events of one session in session order, with their stream facts and
+/// without any request body.
+fn stream_events(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<Vec<StreamEvent>, AppError> {
+    llm_usage_events::table
+        .left_join(llm_usage_event_stream_facts::table)
+        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
+        .filter(llm_usage_events::session_pk.eq(session_pk.to_string()))
+        .order_by((
+            llm_usage_events::observed_at.asc(),
+            llm_usage_events::event_type.asc(),
+            llm_usage_events::id.asc(),
+        ))
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::event_id,
+            llm_usage_events::event_type,
+            llm_usage_events::observed_at,
+            llm_usage_events::response_id,
+            llm_usage_events::previous_response_id,
+            llm_usage_event_stream_facts::new_from.nullable(),
+            llm_usage_event_stream_facts::starts_turn.nullable(),
+            llm_usage_event_stream_facts::last_identity.nullable(),
+            llm_usage_event_stream_facts::trailing.nullable(),
+            llm_usage_event_stream_facts::result_ids.nullable(),
+            llm_usage_event_stream_facts::emitted_ids.nullable(),
+            llm_usage_event_stream_facts::output_skeleton.nullable(),
+        ))
+        .load::<StreamEventRow>(connection)?
+        .into_iter()
+        .map(StreamEventRow::into_stream_event)
+        .collect()
 }
 
 /// Stores the stream facts read from one new event's own entries.
@@ -1448,10 +1505,10 @@ mod tests {
     use super::{
         super::{
             migrations,
-            schema::{agent_turns, llm_usage_event_stream_facts, llm_usage_events},
+            schema::{agent_sessions, agent_turns, llm_usage_event_stream_facts, llm_usage_events},
             search,
         },
-        ingest_events, raw_events, session_outline, usage_summary,
+        ingest_events, raw_events, session_outline, session_streams, usage_summary,
     };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -1707,6 +1764,58 @@ mod tests {
                 ),
             ],
             "one row per event, written once, the other side's columns NULL"
+        );
+    }
+
+    #[test]
+    fn session_streams_link_stored_exchanges() {
+        let mut database = database();
+        let event = |id: &str, second: u8, event_type: &str, entries: serde_json::Value| {
+            let response = if second < 3 { "r1" } else { "r2" };
+            json!({
+                "event_id": id,
+                "observed_at": format!("2026-10-20T00:00:0{second}Z"),
+                "device": {"host_name": "local", "platform": "macos"},
+                "agent": {"name": "codex"},
+                "session_id": "streams-session",
+                "llm": {"provider": "openai", "model": "gpt-5"},
+                "event_type": event_type,
+                "response_id": response,
+                "metadata": {"conversation": {"entries": entries, "completeness": "complete"}}
+            })
+        };
+        let request: IngestEventsRequest = serde_json::from_value(json!({"events": [
+            event("a", 1, "request", json!([{"role": "user", "text": "fix the bug"}])),
+            event("ab", 2, "response", json!([
+                {"role": "tool_call", "text": "{}", "call_id": "c1"}
+            ])),
+            event("abc", 3, "request", json!([
+                {"role": "user", "text": "fix the bug"},
+                {"role": "tool_call", "text": "{}", "call_id": "c1"},
+                {"role": "tool_result", "text": "ok", "call_id": "c1"}
+            ])),
+            event("abcd", 4, "response", json!([{"role": "assistant", "text": "fixed"}]))
+        ]}))
+        .expect("test ingest request should deserialize");
+        ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+        let session_pk = agent_sessions::table
+            .select(agent_sessions::id)
+            .first::<String>(&mut database)
+            .expect("the session is stored");
+        let session_pk = Uuid::parse_str(&session_pk).expect("a UUID");
+
+        let streams = session_streams(&mut database, OWNER_ID, session_pk)
+            .expect("the session's streams derive");
+        let bases = streams
+            .exchanges
+            .iter()
+            .map(|exchange| (exchange.id.as_str(), exchange.base.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(bases, [("r1", None), ("r2", Some("r1"))]);
+        assert_eq!(streams.segments.len(), 1);
+        assert!(
+            session_streams(&mut database, OWNER_ID, Uuid::nil()).is_err(),
+            "a session without events is not found"
         );
     }
 

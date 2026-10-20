@@ -29,6 +29,7 @@ use crate::{
         SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
         TokenUsageSummaryResponse, UsageEventResponse,
         session_list::{SessionListQuery, SessionListResponse},
+        streams::SessionStreamsResponse,
         trajectory::{self, SessionTrajectoryResponse},
     },
 };
@@ -86,6 +87,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/agent-usage/sessions/{session_pk}/trajectory",
             get(session_trajectory),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/streams",
+            get(session_streams),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -197,6 +202,18 @@ async fn session_trajectory(
     let user_id = state.identity.authenticate(&headers)?;
     let timeline = state.storage.session_timeline(user_id, session_pk).await?;
     Ok(Json(trajectory::build(timeline)))
+}
+
+/// Exchanges and segments of one session, without content.
+async fn session_streams(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionStreamsResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state.storage.session_streams(user_id, session_pk).await?,
+    ))
 }
 
 async fn usage_event(
