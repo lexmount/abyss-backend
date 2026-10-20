@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use super::schema::{
     agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-    devices, llm_usage_event_attachments, llm_usage_events, search_outbox,
+    devices, llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
+    search_outbox,
 };
 
 #[derive(Clone, Debug, Queryable, Selectable)]
@@ -351,6 +352,28 @@ pub struct NewUsageEvent {
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
     pub previous_response_id: Option<String>,
+}
+
+#[derive(Debug, Default, Insertable)]
+#[diesel(table_name = llm_usage_event_stream_facts)]
+/// Stream facts of a new event; the other side's columns stay NULL.
+pub struct NewStreamFacts {
+    /// Event the facts were read from.
+    pub event_pk: Uuid,
+    /// Request: index where the new part begins.
+    pub new_from: Option<i32>,
+    /// Request: whether the new part opens a turn.
+    pub starts_turn: Option<bool>,
+    /// Request: last identity of the last run.
+    pub last_identity: Option<String>,
+    /// Request: roles of the model-side entries after it.
+    pub trailing: Option<Value>,
+    /// Request without model output: call ids of its tool results.
+    pub result_ids: Option<Value>,
+    /// Response: identities of its entries.
+    pub emitted_ids: Option<Value>,
+    /// Response: skeleton of its entries.
+    pub output_skeleton: Option<Value>,
 }
 
 #[derive(Insertable)]

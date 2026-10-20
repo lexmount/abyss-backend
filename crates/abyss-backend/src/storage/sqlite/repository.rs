@@ -20,7 +20,7 @@ use crate::{
         IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, OUTLINE_PREVIEW_CHARS,
         RawEventsQuery, RawEventsResponse, SessionInfo, SessionOutlineResponse,
         SessionTimelineResponse, SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline,
-        UsageEventOutline, UsageEventResponse,
+        UsageEventOutline, UsageEventResponse, UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -31,18 +31,20 @@ use crate::{
             exact_values_filter, non_empty, normalize_limit, normalize_text, parse_group_by,
             sha256_bytes, validate_batch, validate_event_type,
         },
+        streams::{RequestFacts, ResponseFacts},
     },
 };
 
 use super::{
     models::{
         AttachmentRow, DeviceRecord, DeviceRow, EventRecord, EventRow, NewAttachment, NewDevice,
-        NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewTurn,
-        SessionRecord, SessionRow, TurnRecord, TurnRow, parse_uuid, timestamp_from_micros,
+        NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewStreamFacts,
+        NewTurn, SessionRecord, SessionRow, TurnRecord, TurnRow, parse_uuid, timestamp_from_micros,
     },
     schema::{
         agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-        app_users, devices, llm_usage_event_attachments, llm_usage_events,
+        app_users, devices, llm_usage_event_attachments, llm_usage_event_stream_facts,
+        llm_usage_events,
     },
     session_titles,
 };
@@ -173,6 +175,7 @@ fn ingest_one_event(
         return Ok(false);
     }
 
+    insert_stream_facts(connection, event_pk, event)?;
     insert_attachments(connection, user_id, event_pk, attachments, now)?;
     insert_search_projection(connection, event_pk, user_id, session_pk, event)?;
     session_titles::capture(
@@ -508,6 +511,27 @@ fn insert_search_projection(
     .bind::<Text, _>(projection.tool_names.join("\n"))
     .bind::<Text, _>(projection.tool_content.join("\n"))
     .execute(connection)?;
+    Ok(())
+}
+
+/// Stores the stream facts read from one new event's own entries.
+fn insert_stream_facts(
+    connection: &mut SqliteConnection,
+    event_pk: Uuid,
+    event: &IngestUsageEvent,
+) -> Result<(), AppError> {
+    let event_pk = event_pk.to_string();
+    let facts = match event.event_type {
+        UsageEventType::Request => {
+            NewStreamFacts::request(event_pk, &RequestFacts::read(&event.metadata))?
+        }
+        UsageEventType::Response => {
+            NewStreamFacts::response(event_pk, &ResponseFacts::read(&event.metadata))?
+        }
+    };
+    diesel::insert_into(llm_usage_event_stream_facts::table)
+        .values(facts)
+        .execute(connection)?;
     Ok(())
 }
 
@@ -1424,7 +1448,7 @@ mod tests {
     use super::{
         super::{
             migrations,
-            schema::{agent_turns, llm_usage_events},
+            schema::{agent_turns, llm_usage_event_stream_facts, llm_usage_events},
             search,
         },
         ingest_events, raw_events, session_outline, usage_summary,
@@ -1609,6 +1633,81 @@ mod tests {
             .find(|event| event.event_id == "sqlite-empty-text")
             .expect("the empty-text event should be stored");
         assert_eq!(empty.text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn ingest_stores_the_stream_facts_of_each_new_event_beside_it() {
+        type Facts = (
+            String,
+            Option<i32>,
+            Option<bool>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let mut database = database();
+        let event = |id: &str, event_type: &str, entries: serde_json::Value| {
+            json!({
+                "event_id": id,
+                "observed_at": "2026-10-19T00:00:00Z",
+                "device": {"host_name": "local", "platform": "macos"},
+                "agent": {"name": "codex"},
+                "session_id": "sqlite-session",
+                "llm": {"provider": "openai", "model": "gpt-5"},
+                "event_type": event_type,
+                "metadata": {"conversation": {"entries": entries, "completeness": "complete"}}
+            })
+        };
+        let request: IngestEventsRequest = serde_json::from_value(json!({"events": [
+            event("ask", "request", json!([
+                {"role": "user", "text": "fix it"},
+                {"role": "tool_call", "text": "{}", "call_id": "a", "item_id": "fc_1"},
+                {"role": "tool_result", "text": "ok", "call_id": "a"}
+            ])),
+            event("answer", "response", json!([
+                {"role": "assistant", "text": "done", "item_id": "msg_1"}
+            ]))
+        ]}))
+        .expect("test ingest request should deserialize");
+        for _ in 0_u8..2 {
+            ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+        }
+
+        let facts = llm_usage_event_stream_facts::table
+            .inner_join(llm_usage_events::table)
+            .order(llm_usage_events::event_id.desc())
+            .select((
+                llm_usage_events::event_id,
+                llm_usage_event_stream_facts::new_from,
+                llm_usage_event_stream_facts::starts_turn,
+                llm_usage_event_stream_facts::last_identity,
+                llm_usage_event_stream_facts::trailing,
+                llm_usage_event_stream_facts::emitted_ids,
+            ))
+            .load::<Facts>(&mut database)
+            .expect("stream facts should load");
+        assert_eq!(
+            facts,
+            [
+                (
+                    "ask".to_owned(),
+                    Some(2_i32),
+                    Some(false),
+                    Some("a".to_owned()),
+                    Some("[]".to_owned()),
+                    None
+                ),
+                (
+                    "answer".to_owned(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(r#"["item:msg_1"]"#.to_owned())
+                ),
+            ],
+            "one row per event, written once, the other side's columns NULL"
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ use diesel::{
     },
     upsert::excluded,
 };
+use serde::Serialize;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
@@ -28,12 +30,13 @@ use crate::{
         models::{
             AgentSession, AgentTurn, Device, NewAgentDiagnosticCapture,
             NewAgentDiagnosticCaptureEvent, NewAgentSession, NewAgentTurn, NewDevice,
-            NewSearchOutboxTask, NewUsageEvent, NewUsageEventAttachment, UsageEvent,
-            UsageEventAttachment,
+            NewSearchOutboxTask, NewStreamFacts, NewUsageEvent, NewUsageEventAttachment,
+            UsageEvent, UsageEventAttachment,
         },
         schema::{
             agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions,
-            agent_turns, devices, llm_usage_event_attachments, llm_usage_events, search_outbox,
+            agent_turns, devices, llm_usage_event_attachments, llm_usage_event_stream_facts,
+            llm_usage_events, search_outbox,
         },
     },
     error::AppError,
@@ -41,7 +44,7 @@ use crate::{
         IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, OUTLINE_PREVIEW_CHARS,
         RawEventsQuery, RawEventsResponse, SessionInfo, SessionOutlineResponse,
         SessionTimelineResponse, SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline,
-        UsageEventOutline, UsageEventResponse,
+        UsageEventOutline, UsageEventResponse, UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -53,6 +56,7 @@ use crate::{
             normalize_limit, normalize_text, parse_group_by, sha256_bytes, unix_epoch,
             validate_batch, validate_event_type,
         },
+        streams::{RequestFacts, ResponseFacts},
     },
 };
 
@@ -659,6 +663,38 @@ pub fn image_attachment(
     })
 }
 
+fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, AppError> {
+    serde_json::to_value(value)
+        .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
+}
+
+/// Stream fact columns of one ingested event; the other side's stay NULL.
+fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFacts, AppError> {
+    Ok(match event.event_type {
+        UsageEventType::Request => {
+            let facts = RequestFacts::read(&event.metadata);
+            NewStreamFacts {
+                event_pk,
+                new_from: Some(facts.new_from),
+                starts_turn: Some(facts.starts_turn),
+                last_identity: facts.last_identity,
+                trailing: Some(json_value(&facts.trailing, "trailing roles")?),
+                result_ids: Some(json_value(&facts.result_ids, "result ids")?),
+                ..NewStreamFacts::default()
+            }
+        }
+        UsageEventType::Response => {
+            let facts = ResponseFacts::read(&event.metadata);
+            NewStreamFacts {
+                event_pk,
+                emitted_ids: Some(json_value(&facts.emitted_ids, "emitted ids")?),
+                output_skeleton: Some(json_value(&facts.output_skeleton, "output skeleton")?),
+                ..NewStreamFacts::default()
+            }
+        }
+    })
+}
+
 fn ingest_one_event(
     connection: &mut PgConnection,
     user_id: Uuid,
@@ -742,6 +778,9 @@ fn ingest_one_event(
     // The enclosing transaction commits the event and its projection task
     // together, providing at-least-once delivery to Elasticsearch.
     if inserted == 1 {
+        diesel::insert_into(llm_usage_event_stream_facts::table)
+            .values(stream_facts(usage_event_id, event)?)
+            .execute(connection)?;
         diesel::insert_into(search_outbox::table)
             .values(NewSearchOutboxTask {
                 event_pk: usage_event_id,
