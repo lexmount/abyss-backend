@@ -23,6 +23,7 @@ use crate::{
         UsageEventResponse,
         attachments::StoredImageAttachment,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
+        streams::SessionStreamsResponse,
     },
 };
 
@@ -164,6 +165,19 @@ impl StorageBackend for PostgresEsBackend {
         Box::pin(async move {
             self.run_db(move |connection| {
                 repository::session_outline(connection, user_id, session_pk)
+            })
+            .await
+        })
+    }
+
+    fn session_streams(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::session_streams(connection, user_id, session_pk)
             })
             .await
         })

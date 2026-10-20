@@ -354,6 +354,38 @@ pub struct NewUsageEvent {
     pub previous_response_id: Option<String>,
 }
 
+#[derive(Queryable)]
+/// The columns of one session event that its streams read; the facts are
+/// NULL for an event stored before they were read.
+pub struct StreamEventRow {
+    /// Event primary key.
+    pub id: Uuid,
+    /// Collector-generated idempotency key.
+    pub event_id: String,
+    /// Canonical request or response value.
+    pub event_type: String,
+    /// Collector observation time.
+    pub observed_at: DateTime<Utc>,
+    /// Provider identity of the response the exchange produced.
+    pub response_id: Option<String>,
+    /// Response whose conversation the exchange's request continues.
+    pub previous_response_id: Option<String>,
+    /// Request: index where the new part begins.
+    pub new_from: Option<i32>,
+    /// Request: whether the new part opens a turn.
+    pub starts_turn: Option<bool>,
+    /// Request: last identity of the last run.
+    pub last_identity: Option<String>,
+    /// Request: roles of the model-side entries after it.
+    pub trailing: Option<Value>,
+    /// Request without model output: call ids of its tool results.
+    pub result_ids: Option<Value>,
+    /// Response: identities of its entries.
+    pub emitted_ids: Option<Value>,
+    /// Response: skeleton of its entries.
+    pub output_skeleton: Option<Value>,
+}
+
 #[derive(Debug, Default, Insertable)]
 #[diesel(table_name = llm_usage_event_stream_facts)]
 /// Stream facts of a new event; the other side's columns stay NULL.

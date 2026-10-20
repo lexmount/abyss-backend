@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use diesel::{
-    Connection, ExpressionMethods, IntoSql, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
-    SelectableHelper, define_sql_function,
+    Connection, ExpressionMethods, IntoSql, NullableExpressionMethods, PgConnection, QueryDsl,
+    QueryableByName, RunQueryDsl, SelectableHelper, define_sql_function,
     dsl::{count_star, max, sql},
     result::OptionalExtension,
     sql_query,
@@ -21,7 +21,7 @@ use diesel::{
     },
     upsert::excluded,
 };
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -31,7 +31,7 @@ use crate::{
             AgentSession, AgentTurn, Device, NewAgentDiagnosticCapture,
             NewAgentDiagnosticCaptureEvent, NewAgentSession, NewAgentTurn, NewDevice,
             NewSearchOutboxTask, NewStreamFacts, NewUsageEvent, NewUsageEventAttachment,
-            UsageEvent, UsageEventAttachment,
+            StreamEventRow, UsageEvent, UsageEventAttachment,
         },
         schema::{
             agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions,
@@ -56,7 +56,10 @@ use crate::{
             normalize_limit, normalize_text, parse_group_by, sha256_bytes, unix_epoch,
             validate_batch, validate_event_type,
         },
-        streams::{RequestFacts, ResponseFacts},
+        streams::{
+            EventFacts, RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
+            session_streams as streams_of,
+        },
     },
 };
 
@@ -661,6 +664,98 @@ pub fn image_attachment(
         sha256: hex::encode(attachment.sha256),
         content,
     })
+}
+
+/// Derives the streams of one session's events from their stream facts,
+/// without reading any request body.
+pub fn session_streams(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<SessionStreamsResponse, AppError> {
+    let events = stream_events(connection, user_id, session_pk)?;
+    if events.is_empty() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    Ok(streams_of(session_pk, events))
+}
+
+/// The events of one session in session order, with their stream facts and
+/// without any request body.
+fn stream_events(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<Vec<StreamEvent>, AppError> {
+    llm_usage_events::table
+        .left_join(llm_usage_event_stream_facts::table)
+        .filter(llm_usage_events::user_id.eq(user_id))
+        .filter(llm_usage_events::session_pk.eq(session_pk))
+        .order((
+            llm_usage_events::observed_at.asc(),
+            llm_usage_events::event_type.asc(),
+            llm_usage_events::id.asc(),
+        ))
+        .select((
+            llm_usage_events::id,
+            llm_usage_events::event_id,
+            llm_usage_events::event_type,
+            llm_usage_events::observed_at,
+            llm_usage_events::response_id,
+            llm_usage_events::previous_response_id,
+            llm_usage_event_stream_facts::new_from.nullable(),
+            llm_usage_event_stream_facts::starts_turn.nullable(),
+            llm_usage_event_stream_facts::last_identity.nullable(),
+            llm_usage_event_stream_facts::trailing.nullable(),
+            llm_usage_event_stream_facts::result_ids.nullable(),
+            llm_usage_event_stream_facts::emitted_ids.nullable(),
+            llm_usage_event_stream_facts::output_skeleton.nullable(),
+        ))
+        .load::<StreamEventRow>(connection)?
+        .into_iter()
+        .map(stream_event)
+        .collect()
+}
+
+fn stream_event(row: StreamEventRow) -> Result<StreamEvent, AppError> {
+    let facts = if row.event_type == UsageEventType::Request.as_str() {
+        EventFacts::Request(RequestFacts {
+            new_from: row.new_from.unwrap_or_default(),
+            starts_turn: row.starts_turn.unwrap_or_default(),
+            last_identity: row.last_identity,
+            trailing: json_list(row.trailing, "trailing roles")?,
+            result_ids: json_list(row.result_ids, "result ids")?,
+        })
+    } else {
+        EventFacts::Response(ResponseFacts {
+            emitted_ids: json_list(row.emitted_ids, "emitted ids")?,
+            output_skeleton: json_list(row.output_skeleton, "output skeleton")?,
+        })
+    };
+    Ok(StreamEvent {
+        pk: row.id,
+        event_id: row.event_id,
+        observed_at: row.observed_at,
+        response_id: row.response_id,
+        previous_response_id: row.previous_response_id,
+        facts,
+    })
+}
+
+/// A stored JSON list; absent reads as empty.
+fn json_list<T: DeserializeOwned + Default>(
+    value: Option<Value>,
+    field: &str,
+) -> Result<T, AppError> {
+    value.map_or_else(
+        || Ok(T::default()),
+        |value| {
+            serde_json::from_value(value)
+                .map_err(|error| AppError::internal(format!("stored {field} are invalid: {error}")))
+        },
+    )
 }
 
 fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, AppError> {

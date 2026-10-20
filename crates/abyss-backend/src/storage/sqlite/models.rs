@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use diesel::{Insertable, Queryable, Selectable};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -10,7 +10,7 @@ use crate::{
     error::AppError,
     usage::{
         event_order::TimelineEvent,
-        streams::{RequestFacts, ResponseFacts},
+        streams::{EventFacts, RequestFacts, ResponseFacts, StreamEvent},
     },
 };
 
@@ -212,6 +212,66 @@ impl NewStreamFacts {
             ..Self::default()
         })
     }
+}
+
+/// The columns of one session event that its streams read; the facts are
+/// NULL for an event stored before they were read.
+#[derive(Queryable)]
+pub(super) struct StreamEventRow {
+    pub(super) id: String,
+    pub(super) event_id: String,
+    pub(super) event_type: String,
+    pub(super) observed_at: i64,
+    pub(super) response_id: Option<String>,
+    pub(super) previous_response_id: Option<String>,
+    pub(super) new_from: Option<i32>,
+    pub(super) starts_turn: Option<bool>,
+    pub(super) last_identity: Option<String>,
+    pub(super) trailing: Option<String>,
+    pub(super) result_ids: Option<String>,
+    pub(super) emitted_ids: Option<String>,
+    pub(super) output_skeleton: Option<String>,
+}
+
+impl StreamEventRow {
+    pub(super) fn into_stream_event(self) -> Result<StreamEvent, AppError> {
+        let facts = if self.event_type == "request" {
+            EventFacts::Request(RequestFacts {
+                new_from: self.new_from.unwrap_or_default(),
+                starts_turn: self.starts_turn.unwrap_or_default(),
+                last_identity: self.last_identity,
+                trailing: json_list(self.trailing.as_deref(), "trailing roles")?,
+                result_ids: json_list(self.result_ids.as_deref(), "result ids")?,
+            })
+        } else {
+            EventFacts::Response(ResponseFacts {
+                emitted_ids: json_list(self.emitted_ids.as_deref(), "emitted ids")?,
+                output_skeleton: json_list(self.output_skeleton.as_deref(), "output skeleton")?,
+            })
+        };
+        Ok(StreamEvent {
+            pk: parse_uuid(&self.id, "event id")?,
+            event_id: self.event_id,
+            observed_at: timestamp_from_micros(self.observed_at)?,
+            response_id: self.response_id,
+            previous_response_id: self.previous_response_id,
+            facts,
+        })
+    }
+}
+
+/// A stored JSON list; absent reads as empty.
+fn json_list<T: DeserializeOwned + Default>(
+    text: Option<&str>,
+    field: &str,
+) -> Result<T, AppError> {
+    text.map_or_else(
+        || Ok(T::default()),
+        |text| {
+            serde_json::from_str(text)
+                .map_err(|error| AppError::internal(format!("stored {field} are invalid: {error}")))
+        },
+    )
 }
 
 fn json_text<T: Serialize>(value: &T, field: &str) -> Result<String, AppError> {

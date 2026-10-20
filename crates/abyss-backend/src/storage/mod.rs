@@ -24,6 +24,7 @@ use crate::{
         UsageEventResponse,
         attachments::StoredImageAttachment,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
+        streams::SessionStreamsResponse,
     },
 };
 
@@ -79,6 +80,14 @@ pub trait StorageBackend: Send + Sync {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>>;
+
+    /// Derives the exchanges and segments of an owner-scoped session; not
+    /// found when the owner has no event in that session.
+    fn session_streams(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>>;
 
     /// Lists one page of owner-scoped sessions, most recently active first.
     fn list_sessions(
