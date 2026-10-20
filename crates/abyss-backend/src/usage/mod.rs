@@ -15,6 +15,8 @@ pub mod persistence;
 /// Owner-scoped session index contracts.
 pub mod session_list;
 pub mod session_title;
+/// Stream facts read from each event at ingest.
+pub mod streams;
 pub mod trajectory;
 
 use chrono::{DateTime, Utc};

@@ -96,6 +96,21 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::{Bool, Integer, Nullable, Text};
+
+    llm_usage_event_stream_facts (event_pk) {
+        event_pk -> Text,
+        new_from -> Nullable<Integer>,
+        starts_turn -> Nullable<Bool>,
+        last_identity -> Nullable<Text>,
+        trailing -> Nullable<Text>,
+        result_ids -> Nullable<Text>,
+        emitted_ids -> Nullable<Text>,
+        output_skeleton -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
     use diesel::sql_types::{BigInt, Binary, Integer, Nullable, Text};
 
     llm_usage_event_attachments (id) {
@@ -163,6 +178,7 @@ diesel::joinable!(llm_usage_events -> app_users (user_id));
 diesel::joinable!(llm_usage_events -> devices (device_context_id));
 diesel::joinable!(llm_usage_event_attachments -> app_users (user_id));
 diesel::joinable!(llm_usage_event_attachments -> llm_usage_events (event_pk));
+diesel::joinable!(llm_usage_event_stream_facts -> llm_usage_events (event_pk));
 diesel::joinable!(agent_diagnostic_capture_events -> agent_diagnostic_captures (capture_pk));
 diesel::joinable!(agent_diagnostic_capture_events -> llm_usage_events (event_pk));
 diesel::joinable!(agent_diagnostic_captures -> agent_sessions (session_pk));
@@ -179,5 +195,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     devices,
     llm_usage_events,
     llm_usage_event_attachments,
+    llm_usage_event_stream_facts,
     session_titles,
 );

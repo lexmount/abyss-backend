@@ -2,14 +2,21 @@
 
 use chrono::{DateTime, Utc};
 use diesel::{Insertable, Queryable, Selectable};
+use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{error::AppError, usage::event_order::TimelineEvent};
+use crate::{
+    error::AppError,
+    usage::{
+        event_order::TimelineEvent,
+        streams::{RequestFacts, ResponseFacts},
+    },
+};
 
 use super::schema::{
     agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-    devices, llm_usage_event_attachments, llm_usage_events,
+    devices, llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
 };
 
 #[derive(Queryable, Selectable)]
@@ -166,6 +173,50 @@ pub(super) struct NewEvent {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
+}
+
+/// Stream facts of a new event; the other side's columns stay NULL.
+#[derive(Default, Insertable)]
+#[diesel(table_name = llm_usage_event_stream_facts)]
+pub(super) struct NewStreamFacts {
+    pub(super) event_pk: String,
+    pub(super) new_from: Option<i32>,
+    pub(super) starts_turn: Option<bool>,
+    pub(super) last_identity: Option<String>,
+    pub(super) trailing: Option<String>,
+    pub(super) result_ids: Option<String>,
+    pub(super) emitted_ids: Option<String>,
+    pub(super) output_skeleton: Option<String>,
+}
+
+impl NewStreamFacts {
+    /// Columns of a request's facts.
+    pub(super) fn request(event_pk: String, facts: &RequestFacts) -> Result<Self, AppError> {
+        Ok(Self {
+            event_pk,
+            new_from: Some(facts.new_from),
+            starts_turn: Some(facts.starts_turn),
+            last_identity: facts.last_identity.clone(),
+            trailing: Some(json_text(&facts.trailing, "trailing roles")?),
+            result_ids: Some(json_text(&facts.result_ids, "result ids")?),
+            ..Self::default()
+        })
+    }
+
+    /// Columns of a response's facts.
+    pub(super) fn response(event_pk: String, facts: &ResponseFacts) -> Result<Self, AppError> {
+        Ok(Self {
+            event_pk,
+            emitted_ids: Some(json_text(&facts.emitted_ids, "emitted ids")?),
+            output_skeleton: Some(json_text(&facts.output_skeleton, "output skeleton")?),
+            ..Self::default()
+        })
+    }
+}
+
+fn json_text<T: Serialize>(value: &T, field: &str) -> Result<String, AppError> {
+    serde_json::to_string(value)
+        .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
 }
 
 #[derive(Queryable, Selectable)]

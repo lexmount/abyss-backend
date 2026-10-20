@@ -32,7 +32,6 @@ pub struct Entry {
     pub name: Option<String>,
     /// Identity of the item the entry belongs to, as the traffic carries it.
     #[serde(default)]
-    #[expect(dead_code, reason = "read once streams are linked by item identity")]
     pub item_id: Option<String>,
 }
 
