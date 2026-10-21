@@ -3,7 +3,7 @@ members = ["crates/abyss-backend"]
 resolver = "3"
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["chunchi.che@lexmount.com"]
 license-file = "LICENSE"
