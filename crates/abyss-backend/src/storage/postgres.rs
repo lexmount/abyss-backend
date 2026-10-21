@@ -22,6 +22,9 @@ use crate::{
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
         UsageEventResponse,
         attachments::StoredImageAttachment,
+        preview::{ConversationPreview, Window},
+        segments::{SegmentResponse, ValidatedSegmentQuery},
+        session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
         streams::SessionStreamsResponse,
     },
@@ -170,6 +173,19 @@ impl StorageBackend for PostgresEsBackend {
         })
     }
 
+    fn session_header(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionHeaderResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::session_header(connection, user_id, session_pk)
+            })
+            .await
+        })
+    }
+
     fn session_streams(
         &self,
         user_id: Uuid,
@@ -178,6 +194,35 @@ impl StorageBackend for PostgresEsBackend {
         Box::pin(async move {
             self.run_db(move |connection| {
                 repository::session_streams(connection, user_id, session_pk)
+            })
+            .await
+        })
+    }
+
+    fn session_segment(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        head: String,
+        query: ValidatedSegmentQuery,
+    ) -> BoxedFuture<'_, Result<SegmentResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::session_segment(connection, user_id, session_pk, &head, &query)
+            })
+            .await
+        })
+    }
+
+    fn event_conversation(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+        window: Window,
+    ) -> BoxedFuture<'_, Result<ConversationPreview, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::event_conversation(connection, user_id, event_pk, &window)
             })
             .await
         })

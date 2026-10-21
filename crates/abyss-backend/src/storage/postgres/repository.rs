@@ -56,9 +56,14 @@ use crate::{
             normalize_limit, normalize_text, parse_group_by, sha256_bytes, unix_epoch,
             validate_batch, validate_event_type,
         },
+        preview::{ConversationPreview, Window, preview},
+        segments::{
+            SegmentResponse, TokenCounts, ValidatedSegmentQuery, page_event_pks, segment_response,
+        },
+        session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
             EventFacts, RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
-            session_streams as streams_of,
+            segment_page, session_streams as streams_of, stream_counts,
         },
     },
 };
@@ -680,6 +685,148 @@ pub fn session_streams(
         )));
     }
     Ok(streams_of(session_pk, events))
+}
+
+/// Columns of one session event the header reads.
+type HeaderColumns = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    DateTime<Utc>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+/// The header of an owner-scoped session.
+pub fn session_header(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<SessionHeaderResponse, AppError> {
+    let events = llm_usage_events::table
+        .filter(llm_usage_events::user_id.eq(user_id))
+        .filter(llm_usage_events::session_pk.eq(session_pk))
+        .select((
+            llm_usage_events::session_id,
+            llm_usage_events::agent_name,
+            llm_usage_events::agent_version,
+            llm_usage_events::llm_provider,
+            llm_usage_events::llm_model,
+            llm_usage_events::observed_at,
+            llm_usage_events::input_tokens,
+            llm_usage_events::output_tokens,
+            llm_usage_events::cache_read_tokens,
+            llm_usage_events::cache_write_tokens,
+            llm_usage_events::reasoning_tokens,
+            llm_usage_events::total_tokens,
+        ))
+        .load::<HeaderColumns>(connection)?
+        .into_iter()
+        .map(header_event)
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    let counts = stream_counts(stream_events(connection, user_id, session_pk)?);
+    Ok(header_of(session_pk, events, counts))
+}
+
+fn header_event(
+    (
+        session_id,
+        agent_name,
+        agent_version,
+        provider,
+        model,
+        observed_at,
+        input,
+        output,
+        cache_read,
+        cache_write,
+        reasoning,
+        total,
+    ): HeaderColumns,
+) -> HeaderEvent {
+    HeaderEvent {
+        session_id,
+        agent_name,
+        agent_version,
+        provider,
+        model,
+        observed_at,
+        tokens: TokenCounts {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            total,
+        },
+    }
+}
+
+/// One page of the exchanges of the segment holding exchange `head`, with a
+/// preview of each event.
+pub fn session_segment(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+    head: &str,
+    query: &ValidatedSegmentQuery,
+) -> Result<SegmentResponse, AppError> {
+    let events = stream_events(connection, user_id, session_pk)?;
+    let page =
+        segment_page(events, head, query.after.as_deref(), query.limit).ok_or_else(|| {
+            AppError::not_found(format!(
+                "exchange not found in session {session_pk}: {head}"
+            ))
+        })?;
+    let events = usage_events(connection, user_id, &page_event_pks(&page))?;
+    Ok(segment_response(session_pk, page, events, &query.window))
+}
+
+/// The conversation of one owner-scoped event through `window`.
+pub fn event_conversation(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+    window: &Window,
+) -> Result<ConversationPreview, AppError> {
+    usage_event(connection, user_id, event_pk).map(|event| preview(event, window))
+}
+
+/// Owner-scoped events by primary key, with their device labels and
+/// attachments.
+fn usage_events(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    pks: &[Uuid],
+) -> Result<HashMap<Uuid, UsageEventResponse>, AppError> {
+    let events = llm_usage_events::table
+        .filter(llm_usage_events::id.eq_any(pks))
+        .filter(llm_usage_events::user_id.eq(user_id))
+        .load::<UsageEvent>(connection)?;
+    let devices = load_device_contexts_for_events(connection, &events)?;
+    let mut attachments = load_attachments_for_events(connection, &events)?;
+    Ok(events
+        .into_iter()
+        .map(|event| {
+            let (event_pk, device_id) = (event.id, event.device_context_id);
+            let attachments = attachments.remove(&event_pk).unwrap_or_default();
+            (
+                event_pk,
+                event_response(event, devices.get(&device_id), attachments),
+            )
+        })
+        .collect())
 }
 
 /// The events of one session in session order, with their stream facts and

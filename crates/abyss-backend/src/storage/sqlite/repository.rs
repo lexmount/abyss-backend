@@ -31,9 +31,14 @@ use crate::{
             exact_values_filter, non_empty, normalize_limit, normalize_text, parse_group_by,
             sha256_bytes, validate_batch, validate_event_type,
         },
+        preview::{ConversationPreview, Window, preview},
+        segments::{
+            SegmentResponse, TokenCounts, ValidatedSegmentQuery, page_event_pks, segment_response,
+        },
+        session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
-            RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
-            session_streams as streams_of,
+            RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent, segment_page,
+            session_streams as streams_of, stream_counts,
         },
     },
 };
@@ -532,6 +537,152 @@ pub(super) fn session_streams(
         )));
     }
     Ok(streams_of(session_pk, events))
+}
+
+/// Columns of one session event the header reads.
+type HeaderColumns = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+/// The header of an owner-scoped session.
+pub(super) fn session_header(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+) -> Result<SessionHeaderResponse, AppError> {
+    let events = llm_usage_events::table
+        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
+        .filter(llm_usage_events::session_pk.eq(session_pk.to_string()))
+        .select((
+            llm_usage_events::session_id,
+            llm_usage_events::agent_name,
+            llm_usage_events::agent_version,
+            llm_usage_events::llm_provider,
+            llm_usage_events::llm_model,
+            llm_usage_events::observed_at,
+            llm_usage_events::input_tokens,
+            llm_usage_events::output_tokens,
+            llm_usage_events::cache_read_tokens,
+            llm_usage_events::cache_write_tokens,
+            llm_usage_events::reasoning_tokens,
+            llm_usage_events::total_tokens,
+        ))
+        .load::<HeaderColumns>(connection)?
+        .into_iter()
+        .map(header_event)
+        .collect::<Result<Vec<_>, AppError>>()?;
+    if events.is_empty() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    let counts = stream_counts(stream_events(connection, user_id, session_pk)?);
+    Ok(header_of(session_pk, events, counts))
+}
+
+fn header_event(
+    (
+        session_id,
+        agent_name,
+        agent_version,
+        provider,
+        model,
+        observed_at,
+        input,
+        output,
+        cache_read,
+        cache_write,
+        reasoning,
+        total,
+    ): HeaderColumns,
+) -> Result<HeaderEvent, AppError> {
+    Ok(HeaderEvent {
+        session_id,
+        agent_name,
+        agent_version,
+        provider,
+        model,
+        observed_at: timestamp_from_micros(observed_at)?,
+        tokens: TokenCounts {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            total,
+        },
+    })
+}
+
+/// One page of the exchanges of the segment holding exchange `head`, with a
+/// preview of each event.
+pub(super) fn session_segment(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+    head: &str,
+    query: &ValidatedSegmentQuery,
+) -> Result<SegmentResponse, AppError> {
+    let events = stream_events(connection, user_id, session_pk)?;
+    let page =
+        segment_page(events, head, query.after.as_deref(), query.limit).ok_or_else(|| {
+            AppError::not_found(format!(
+                "exchange not found in session {session_pk}: {head}"
+            ))
+        })?;
+    let events = usage_events(connection, user_id, &page_event_pks(&page))?;
+    Ok(segment_response(session_pk, page, events, &query.window))
+}
+
+/// The conversation of one owner-scoped event through `window`.
+pub(super) fn event_conversation(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+    window: &Window,
+) -> Result<ConversationPreview, AppError> {
+    usage_event(connection, user_id, event_pk).map(|event| preview(event, window))
+}
+
+/// Owner-scoped events by primary key, with their device labels and
+/// attachments.
+fn usage_events(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    pks: &[Uuid],
+) -> Result<HashMap<Uuid, UsageEventResponse>, AppError> {
+    let events = llm_usage_events::table
+        .filter(llm_usage_events::id.eq_any(pks.iter().map(Uuid::to_string)))
+        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
+        .select(EventRow::as_select())
+        .load::<EventRow>(connection)?
+        .into_iter()
+        .map(EventRow::into_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let devices = load_device_contexts(connection, &events)?;
+    let mut attachments = load_attachments(connection, &events)?;
+    Ok(events
+        .into_iter()
+        .map(|event| {
+            let (event_pk, device_id) = (event.id, event.device_context_id);
+            let attachments = attachments.remove(&event_pk).unwrap_or_default();
+            (
+                event_pk,
+                event_response(event, devices.get(&device_id), attachments),
+            )
+        })
+        .collect())
 }
 
 /// The events of one session in session order, with their stream facts and
@@ -1499,7 +1650,11 @@ mod tests {
 
     use crate::{
         search::SessionSearchQuery,
-        usage::{IngestEventsRequest, RawEventsQuery, SummaryQuery},
+        usage::{
+            IngestEventsRequest, RawEventsQuery, SummaryQuery,
+            preview::{PreviewQuery, Window},
+            segments::SegmentQuery,
+        },
     };
 
     use super::{
@@ -1508,7 +1663,8 @@ mod tests {
             schema::{agent_sessions, agent_turns, llm_usage_event_stream_facts, llm_usage_events},
             search,
         },
-        ingest_events, raw_events, session_outline, session_streams, usage_summary,
+        event_conversation, ingest_events, raw_events, session_header, session_outline,
+        session_segment, session_streams, usage_summary,
     };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -1767,8 +1923,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_streams_link_stored_exchanges() {
+    /// A database holding session `streams-session`: exchange r1 asks and
+    /// calls c1, exchange r2 sends its result back and gets an answer.
+    fn streams_database() -> (SqliteConnection, Uuid) {
         let mut database = database();
         let event = |id: &str, second: u8, event_type: &str, entries: serde_json::Value| {
             let response = if second < 3 { "r1" } else { "r2" };
@@ -1803,20 +1960,100 @@ mod tests {
             .first::<String>(&mut database)
             .expect("the session is stored");
         let session_pk = Uuid::parse_str(&session_pk).expect("a UUID");
+        (database, session_pk)
+    }
 
+    #[test]
+    fn session_streams_link_stored_exchanges() {
+        let (mut database, session_pk) = streams_database();
         let streams = session_streams(&mut database, OWNER_ID, session_pk)
             .expect("the session's streams derive");
-        let bases = streams
-            .exchanges
+        let segments = streams
+            .segments
             .iter()
-            .map(|exchange| (exchange.id.as_str(), exchange.base.as_deref()))
+            .map(|segment| (segment.head.as_str(), segment.exchange_count))
             .collect::<Vec<_>>();
-        assert_eq!(bases, [("r1", None), ("r2", Some("r1"))]);
-        assert_eq!(streams.segments.len(), 1);
+        assert_eq!(segments, [("r1", 2)], "r2 continues r1 by its call");
         assert!(
             session_streams(&mut database, OWNER_ID, Uuid::nil()).is_err(),
             "a session without events is not found"
         );
+    }
+
+    #[test]
+    fn segments_and_conversations_preview_stored_events() {
+        let (mut database, session_pk) = streams_database();
+        let query = SegmentQuery {
+            entries: Some("0".to_owned()),
+            text_preview: Some(3),
+            ..SegmentQuery::default()
+        }
+        .validate()
+        .expect("a valid query");
+        let segment = session_segment(&mut database, OWNER_ID, session_pk, "r1", &query)
+            .expect("the segment pages");
+        assert_eq!(
+            (segment.segment.as_str(), segment.next.as_deref()),
+            ("r1", None)
+        );
+        let r2 = &segment.exchanges[1];
+        assert_eq!(
+            (r2.exchange.base.as_deref(), r2.model.as_deref()),
+            (Some("r1"), Some("gpt-5"))
+        );
+        let request = r2.request.as_ref().expect("a request preview");
+        assert_eq!(
+            (
+                request.entries_total,
+                request.omitted_entries,
+                request.chunks.len()
+            ),
+            (3_usize, 2_usize, 1_usize)
+        );
+        assert_eq!(
+            request.chunks[0].entries[0],
+            json!({"role": "user", "text": "fix", "text_length": 11_usize})
+        );
+        assert!(session_segment(&mut database, OWNER_ID, session_pk, "zz", &query).is_err());
+
+        let window = Window::parse(&PreviewQuery {
+            entries: Some("-1".to_owned()),
+            text_preview: None,
+        })
+        .expect("a valid window");
+        let conversation = event_conversation(&mut database, OWNER_ID, request.event_pk, &window)
+            .expect("the event's conversation");
+        assert_eq!(
+            (
+                conversation.chunks[0].from,
+                conversation.chunks[0].entries[0]["role"].clone()
+            ),
+            (2, json!("tool_result"))
+        );
+    }
+
+    #[test]
+    fn the_session_header_sums_its_events() {
+        let (mut database, session_pk) = streams_database();
+        let header = session_header(&mut database, OWNER_ID, session_pk).expect("the header");
+        assert_eq!(
+            (
+                header.event_count,
+                header.exchange_count,
+                header.turn_count,
+                header.segment_count
+            ),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(
+            (header.agents[0].name.as_str(), header.models.as_slice()),
+            ("codex", ["gpt-5".to_owned()].as_slice())
+        );
+        assert_eq!(
+            header.end.signed_duration_since(header.start),
+            chrono::TimeDelta::seconds(3)
+        );
+        assert!(session_header(&mut database, OWNER_ID, Uuid::nil()).is_err());
     }
 
     #[test]
