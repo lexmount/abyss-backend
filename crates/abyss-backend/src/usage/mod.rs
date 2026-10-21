@@ -73,8 +73,6 @@ pub struct IngestUsageEvent {
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.
     pub event_type: UsageEventType,
-    /// Optional prompt or response text.
-    pub text: Option<String>,
     /// Token counters of the `AgentEvent`; absent counters are stored as zero.
     #[serde(default)]
     pub token_usage: TokenUsagePayload,
@@ -553,10 +551,6 @@ pub struct UsageEventResponse {
     pub llm_model: String,
     /// Canonical request or response value.
     pub event_type: String,
-    /// Optional prompt or response text.
-    pub text: Option<String>,
-    /// Lowercase SHA-256 of text when text is present.
-    pub text_sha256: Option<String>,
     /// Normalized input-token count.
     pub input_tokens: i64,
     /// Normalized output-token count.
@@ -598,14 +592,11 @@ pub struct SessionTimelineResponse<E = UsageEventResponse> {
     pub turns: Vec<TurnTimeline<E>>,
 }
 
-/// Session timeline whose events omit text and metadata bodies.
+/// Session timeline whose events omit metadata bodies.
 pub type SessionOutlineResponse = SessionTimelineResponse<UsageEventOutline>;
 
-/// Maximum number of characters returned in an outline event preview.
-pub const OUTLINE_PREVIEW_CHARS: i64 = 200;
-
 #[derive(Debug, Serialize)]
-/// Content-free representation of one event, sized independently of its text.
+/// Content-free representation of one event, sized independently of its content.
 ///
 /// Full content is loaded separately by event primary key.
 pub struct UsageEventOutline {
@@ -638,11 +629,6 @@ pub struct UsageEventOutline {
     pub total_tokens: i64,
     /// Collector observation timestamp.
     pub observed_at: DateTime<Utc>,
-    /// Text length in characters; zero when text is absent.
-    pub text_chars: i64,
-    /// Up to [`OUTLINE_PREVIEW_CHARS`] characters of text: the tail of a
-    /// request, where the newest prompt is, or the head of a response.
-    pub preview: Option<String>,
     /// Number of image attachments on the event.
     pub attachment_count: i64,
 }
@@ -728,7 +714,6 @@ mod tests {
                         "model": "gpt-5.5"
                     },
                     "event_type": "request",
-                    "text": "Explain this repository.",
                     "token_usage": {"input_tokens": 10_i64, "output_tokens": 0_i64, "cache_read_tokens": 2_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 12_i64},
                     "metadata": {
                         "source": "unit-test"

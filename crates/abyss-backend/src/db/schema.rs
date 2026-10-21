@@ -107,6 +107,9 @@ diesel::table! {
         result_ids -> Nullable<Jsonb>,
         emitted_ids -> Nullable<Jsonb>,
         output_skeleton -> Nullable<Jsonb>,
+        label_index -> Nullable<Integer>,
+        label_text -> Nullable<Text>,
+        label_length -> Nullable<Integer>,
     }
 }
 

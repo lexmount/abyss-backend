@@ -109,9 +109,14 @@ def event(
         "response_id": f"response-{run_id}",
         "llm": {"provider": "openai", "model": "gpt-5.5"},
         "event_type": event_type,
-        "text": text,
         "token_usage": token_usage,
-        "metadata": {"test_run": run_id},
+        "metadata": {
+            "test_run": run_id,
+            "conversation": {
+                "entries": [{"role": "user" if event_type == "request" else "assistant", "text": text}],
+                "completeness": "complete",
+            },
+        },
     }
     if event_type == "request":
         value["attachments"] = [
@@ -250,10 +255,10 @@ def run(base_url: str, token: str, run_id: str) -> None:
         [item["id"] for item in listed_events] == [item["id"] for item in raw_events],
         "event list must return the same events in the same order",
     )
-    content_fields = {"text", "text_sha256", "metadata", "attachments"}
+    content_fields = {"metadata", "attachments"}
     require(
         all(content_fields.isdisjoint(item) for item in listed_events),
-        "event list items must leave out text, metadata, and attachments",
+        "event list items must leave out metadata and attachments",
     )
     require(
         all(
@@ -454,10 +459,6 @@ def run(base_url: str, token: str, run_id: str) -> None:
                 outline_event[field] == timeline_event[field],
                 f"session outline {field} must match the timeline event",
             )
-        require(
-            outline_event["text_chars"] == len(timeline_event["text"] or ""),
-            "session outline text length must count characters",
-        )
         require(
             outline_event["attachment_count"] == len(timeline_event["attachments"]),
             "session outline must count event attachments",

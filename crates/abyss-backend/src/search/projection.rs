@@ -16,57 +16,38 @@ pub struct SearchProjection {
 }
 
 impl SearchProjection {
-    pub fn from_source(text: Option<String>, metadata: &Value) -> Self {
-        let extracted = SearchableMetadata::extract(metadata);
-        Self {
-            content: text
-                .map(|value| sanitize_search_text(&value))
-                .map(|value| truncate_characters(value, MAX_CONTENT_CHARACTERS)),
-            tool_names: extracted.tool_names,
-            tool_content: extracted.tool_content,
-        }
-    }
-}
-
-struct SearchableMetadata {
-    tool_names: Vec<String>,
-    tool_content: Vec<String>,
-}
-
-impl SearchableMetadata {
-    fn extract(metadata: &Value) -> Self {
-        let mut extracted = Self {
-            tool_names: Vec::new(),
-            tool_content: Vec::new(),
-        };
-
-        // Ignore every other top-level key so headers, credentials, and image
-        // data never enter a derived full-text index.
-        let Some(segments) = metadata.get("content_segments").and_then(Value::as_array) else {
-            return extracted;
-        };
-        for segment in segments.iter().take(MAX_EXTRACTED_VALUES) {
-            let Some(object) = segment.as_object() else {
-                continue;
-            };
-            match object.get("type").and_then(Value::as_str) {
-                Some("tool_call") => {
-                    if let Some(name) = object.get("name").and_then(Value::as_str) {
-                        push_bounded(&mut extracted.tool_names, name);
-                    }
-                    if let Some(input) = object.get("input").and_then(Value::as_str) {
-                        push_bounded(&mut extracted.tool_content, input);
-                    }
-                }
-                Some("tool_result") => {
-                    if let Some(output) = object.get("output").and_then(Value::as_str) {
-                        push_bounded(&mut extracted.tool_content, output);
-                    }
-                }
-                _ => {}
+    /// Reads the event's conversation entries: the text of every entry, of
+    /// every role, in order, and the names of the tools it calls. Every other
+    /// metadata key is ignored, so headers, credentials, and image data never
+    /// enter a derived full-text index.
+    pub fn from_source(metadata: &Value) -> Self {
+        let entries = metadata
+            .get("conversation")
+            .and_then(|conversation| conversation.get("entries"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut tool_names = Vec::new();
+        let mut texts = Vec::new();
+        for entry in entries {
+            if entry.get("role").and_then(Value::as_str) == Some("tool_call")
+                && let Some(name) = entry.get("name").and_then(Value::as_str)
+            {
+                push_bounded(&mut tool_names, name);
+            }
+            if let Some(text) = entry.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                texts.push(text);
             }
         }
-        extracted
+        Self {
+            content: (!texts.is_empty())
+                .then(|| sanitize_search_text(&texts.join("\n")))
+                .map(|value| truncate_characters(value, MAX_CONTENT_CHARACTERS)),
+            tool_names,
+            tool_content: Vec::new(),
+        }
     }
 }
 

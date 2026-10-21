@@ -6,10 +6,10 @@ use chrono::{DateTime, Utc};
 use diesel::{
     ExpressionMethods, IntoSql, NullableExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl,
     SelectableHelper, SqliteConnection,
-    dsl::{count_star, max, sql},
+    dsl::{count_star, max},
     result::OptionalExtension,
     sql_query,
-    sql_types::{BigInt, Binary, Bool, Nullable, Text},
+    sql_types::{BigInt, Bool, Nullable, Text},
 };
 use uuid::Uuid;
 
@@ -17,10 +17,10 @@ use crate::{
     error::AppError,
     search::projection::SearchProjection,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, OUTLINE_PREVIEW_CHARS,
-        RawEventsQuery, RawEventsResponse, SessionInfo, SessionOutlineResponse,
-        SessionTimelineResponse, SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline,
-        UsageEventOutline, UsageEventResponse, UsageEventType,
+        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
+        RawEventsResponse, SessionInfo, SessionOutlineResponse, SessionTimelineResponse,
+        SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline, UsageEventOutline,
+        UsageEventResponse, UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -29,7 +29,7 @@ use crate::{
         event_order::UsageEventTimelineOrder,
         persistence::{
             exact_values_filter, non_empty, normalize_limit, normalize_text, parse_group_by,
-            sha256_bytes, validate_batch, validate_event_type,
+            validate_batch, validate_event_type,
         },
         preview::{ConversationPreview, Window, preview},
         segments::{
@@ -38,7 +38,7 @@ use crate::{
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
             RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent, segment_page,
-            session_streams as streams_of, stream_counts,
+            session_streams as streams_of, stream_summary,
         },
     },
 };
@@ -143,7 +143,6 @@ fn ingest_one_event(
         now,
     )?;
     let tokens = &event.token_usage;
-    let text = event.text.clone();
     let event_pk = Uuid::now_v7();
     let metadata = serialize_json(&event.metadata, "event metadata")?;
 
@@ -162,8 +161,6 @@ fn ingest_one_event(
             llm_provider: provider,
             llm_model: model,
             event_type: event.event_type.as_str().to_owned(),
-            text: text.clone(),
-            text_sha256: text.as_deref().map(sha256_bytes),
             input_tokens: tokens.input_tokens.unwrap_or_default(),
             output_tokens: tokens.output_tokens.unwrap_or_default(),
             cache_read_tokens: tokens.cache_read_tokens.unwrap_or_default(),
@@ -505,7 +502,7 @@ fn insert_search_projection(
     session_pk: Uuid,
     event: &IngestUsageEvent,
 ) -> Result<(), AppError> {
-    let projection = SearchProjection::from_source(event.text.clone(), &event.metadata);
+    let projection = SearchProjection::from_source(&event.metadata);
     sql_query(
         "INSERT INTO usage_events_fts (
              event_pk, user_id, session_pk, session_id, content, tool_names,
@@ -587,8 +584,8 @@ pub(super) fn session_header(
             "session not found: {session_pk}"
         )));
     }
-    let counts = stream_counts(stream_events(connection, user_id, session_pk)?);
-    Ok(header_of(session_pk, events, counts))
+    let summary = stream_summary(stream_events(connection, user_id, session_pk)?);
+    Ok(header_of(session_pk, events, summary))
 }
 
 fn header_event(
@@ -715,6 +712,9 @@ fn stream_events(
             llm_usage_event_stream_facts::result_ids.nullable(),
             llm_usage_event_stream_facts::emitted_ids.nullable(),
             llm_usage_event_stream_facts::output_skeleton.nullable(),
+            llm_usage_event_stream_facts::label_index.nullable(),
+            llm_usage_event_stream_facts::label_text.nullable(),
+            llm_usage_event_stream_facts::label_length.nullable(),
         ))
         .load::<StreamEventRow>(connection)?
         .into_iter()
@@ -951,8 +951,6 @@ fn load_filtered_events(
                 llm_usage_events::llm_provider,
                 llm_usage_events::llm_model,
                 llm_usage_events::event_type,
-                None::<String>.into_sql::<Nullable<Text>>(),
-                None::<Vec<u8>>.into_sql::<Nullable<Binary>>(),
                 llm_usage_events::input_tokens,
                 llm_usage_events::output_tokens,
                 llm_usage_events::cache_read_tokens,
@@ -1025,9 +1023,6 @@ type OutlineRow = (
     i64,
     i64,
     i64,
-    i64,
-    Option<String>,
-    bool,
 );
 
 pub(super) fn session_outline(
@@ -1036,8 +1031,8 @@ pub(super) fn session_outline(
     session_pk: Uuid,
 ) -> Result<SessionOutlineResponse, AppError> {
     let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
-    // Only fixed-size columns and SQL-computed summaries are selected, so the
-    // outline stays small no matter how large event text or metadata grows.
+    // Only fixed-size columns are selected, so the outline stays small no
+    // matter how large event metadata grows.
     let rows = llm_usage_events::table
         .filter(llm_usage_events::session_pk.eq(session.id.to_string()))
         .select((
@@ -1055,32 +1050,8 @@ pub(super) fn session_outline(
             llm_usage_events::reasoning_tokens,
             llm_usage_events::total_tokens,
             llm_usage_events::observed_at,
-            sql::<BigInt>("coalesce(length(text), 0)"),
-            sql::<Nullable<Text>>(&format!(
-                "CASE WHEN event_type = 'request' THEN substr(text, -{OUTLINE_PREVIEW_CHARS}) \
-                 ELSE substr(text, 1, {OUTLINE_PREVIEW_CHARS}) END"
-            )),
-            // SQLite text functions stop at the first NUL character, so the
-            // length and preview above are wrong for text containing NUL.
-            sql::<Bool>("coalesce(instr(CAST(text AS BLOB), x'00') > 0, 0)"),
         ))
         .load::<OutlineRow>(connection)?;
-    let nul_text_ids = rows
-        .iter()
-        .filter(|row| row.16)
-        .map(|row| row.0.clone())
-        .collect::<Vec<_>>();
-    let nul_texts = if nul_text_ids.is_empty() {
-        HashMap::new()
-    } else {
-        llm_usage_events::table
-            .filter(llm_usage_events::id.eq_any(nul_text_ids))
-            .select((llm_usage_events::id, llm_usage_events::text))
-            .load::<(String, Option<String>)>(connection)?
-            .into_iter()
-            .filter_map(|(id, text)| text.map(|text| (id, text)))
-            .collect::<HashMap<_, _>>()
-    };
     let event_ids = rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>();
     let attachment_counts = llm_usage_event_attachments::table
         .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
@@ -1091,11 +1062,8 @@ pub(super) fn session_outline(
         .collect::<HashMap<_, _>>();
     let mut events = rows
         .into_iter()
-        .map(|mut row| {
+        .map(|row| {
             let attachment_count = attachment_counts.get(&row.0).copied().unwrap_or(0);
-            if let Some(text) = nul_texts.get(&row.0) {
-                (row.14, row.15) = text_outline(text, &row.6)?;
-            }
             Ok(UsageEventOutline {
                 id: parse_uuid(&row.0, "event id")?,
                 event_id: row.1,
@@ -1111,8 +1079,6 @@ pub(super) fn session_outline(
                 reasoning_tokens: row.11,
                 total_tokens: row.12,
                 observed_at: timestamp_from_micros(row.13)?,
-                text_chars: row.14,
-                preview: row.15,
                 attachment_count,
             })
         })
@@ -1125,23 +1091,6 @@ pub(super) fn session_outline(
     let mut timeline = assemble_timeline(session, turns, events_by_turn);
     session_titles::fill(connection, &mut timeline.session)?;
     Ok(timeline)
-}
-
-/// Computes the outline length and preview in Rust for text SQLite cannot measure.
-fn text_outline(text: &str, event_type: &str) -> Result<(i64, Option<String>), AppError> {
-    let chars = text.chars().count();
-    let preview_chars = usize::try_from(OUTLINE_PREVIEW_CHARS)
-        .map_err(|error| AppError::internal(format!("invalid outline preview size: {error}")))?;
-    let preview = if event_type == "request" {
-        text.chars()
-            .skip(chars.saturating_sub(preview_chars))
-            .collect()
-    } else {
-        text.chars().take(preview_chars).collect()
-    };
-    let chars = i64::try_from(chars)
-        .map_err(|error| AppError::internal(format!("invalid event text length: {error}")))?;
-    Ok((chars, Some(preview)))
 }
 
 fn load_session_turns(
@@ -1613,8 +1562,6 @@ fn event_response(
         llm_provider: event.llm_provider,
         llm_model: event.llm_model,
         event_type: event.event_type,
-        text: event.text,
-        text_sha256: event.text_sha256.map(hex::encode),
         input_tokens: event.input_tokens,
         output_tokens: event.output_tokens,
         cache_read_tokens: event.cache_read_tokens,
@@ -1663,8 +1610,8 @@ mod tests {
             schema::{agent_sessions, agent_turns, llm_usage_event_stream_facts, llm_usage_events},
             search,
         },
-        event_conversation, ingest_events, raw_events, session_header, session_outline,
-        session_segment, session_streams, usage_summary,
+        event_conversation, ingest_events, raw_events, session_header, session_segment,
+        session_streams, usage_summary,
     };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -1750,29 +1697,6 @@ mod tests {
     }
 
     #[test]
-    fn outline_measures_text_containing_nul_characters() {
-        let mut database = database();
-        let text = format!("ab\0{}", "c".repeat(300));
-        ingest_events(&mut database, &request_with_text(&text), OWNER_ID, 100)
-            .expect("ingest should succeed");
-        let session_pk = llm_usage_events::table
-            .select(llm_usage_events::session_pk)
-            .first::<String>(&mut database)
-            .expect("event should exist");
-        let session_pk = Uuid::parse_str(&session_pk).expect("session pk should be a UUID");
-
-        let outline =
-            session_outline(&mut database, OWNER_ID, session_pk).expect("outline should load");
-
-        let event = &outline.turns[0].events[0];
-        assert_eq!(event.text_chars, 303);
-        assert_eq!(
-            event.preview.as_deref(),
-            Some(format!("ab\0{}", "c".repeat(197)).as_str())
-        );
-    }
-
-    #[test]
     fn raw_body_archive_survives_ingest_retries_and_trajectory_projection() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use sha2::Digest as _;
@@ -1823,10 +1747,6 @@ mod tests {
         event.llm.model = " Model ".to_owned();
         event.device.platform = "macOS".to_owned();
         ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
-        let mut empty = request_with_text("");
-        empty.events[0].event_id = "sqlite-empty-text".to_owned();
-        ingest_events(&mut database, &empty, OWNER_ID, 100).expect("ingest should succeed");
-
         let query: RawEventsQuery =
             serde_json::from_value(json!({})).expect("query should deserialize");
         let events = raw_events(&mut database, &query, OWNER_ID, 50)
@@ -1840,12 +1760,10 @@ mod tests {
         assert_eq!(stored.llm_provider, "Gateway_Host");
         assert_eq!(stored.llm_model, " Model ");
         assert_eq!(stored.platform.as_deref(), Some("macOS"));
-        assert_eq!(stored.text.as_deref(), Some("  hello \n"));
-        let empty = events
-            .iter()
-            .find(|event| event.event_id == "sqlite-empty-text")
-            .expect("the empty-text event should be stored");
-        assert_eq!(empty.text.as_deref(), Some(""));
+        assert_eq!(
+            stored.metadata["conversation"]["entries"][0]["text"],
+            json!("  hello \n")
+        );
     }
 
     #[test]
@@ -1974,6 +1892,14 @@ mod tests {
             .map(|segment| (segment.head.as_str(), segment.exchange_count))
             .collect::<Vec<_>>();
         assert_eq!(segments, [("r1", 2)], "r2 continues r1 by its call");
+        let label = streams.segments[0]
+            .label
+            .as_ref()
+            .expect("r1 asks in words");
+        assert_eq!(
+            (label.entry_index, label.text.as_str(), label.length),
+            (0_i32, "fix the bug", 11_i32)
+        );
         assert!(
             session_streams(&mut database, OWNER_ID, Uuid::nil()).is_err(),
             "a session without events is not found"
@@ -2053,6 +1979,11 @@ mod tests {
             header.end.signed_duration_since(header.start),
             chrono::TimeDelta::seconds(3)
         );
+        assert_eq!(
+            header.title.as_ref().map(|title| title.text.as_str()),
+            Some("fix the bug"),
+            "the title is the first request's label"
+        );
         assert!(session_header(&mut database, OWNER_ID, Uuid::nil()).is_err());
     }
 
@@ -2074,10 +2005,8 @@ mod tests {
             assert_eq!(listed.id, complete.id);
             assert_eq!(listed.total_tokens, complete.total_tokens);
             assert_eq!(listed.host_name.as_deref(), Some("alice-mbp"));
-            assert_eq!(listed.text, None);
             assert_eq!(listed.metadata, json!({}));
             assert!(listed.attachments.is_empty());
-            assert_eq!(complete.text.as_deref(), Some("body"));
             assert_eq!(complete.metadata["raw_body"], json!("large"));
         }
     }
@@ -2099,7 +2028,6 @@ mod tests {
                 "turn_id": format!("{session}-{turn}"),
                 "llm": {"provider": provider, "model": model},
                 "event_type": if id.ends_with("req") { "request" } else { "response" },
-                "text": "body",
                 "token_usage": if id.ends_with("req") {
                     json!({"input_tokens": 10_i64, "output_tokens": 0_i64, "cache_read_tokens": 4_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 14_i64})
                 } else {
@@ -2448,9 +2376,11 @@ mod tests {
                 "session_id": "sqlite-session",
                 "llm": {"provider": "openai", "model": "gpt-5"},
                 "event_type": "response",
-                "text": text,
                 "token_usage": {"input_tokens": 0_i64, "output_tokens": 3_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 3_i64},
-                "metadata": {}
+                "metadata": {"conversation": {
+                    "entries": [{"role": "assistant", "text": text}],
+                    "completeness": "complete"
+                }}
             }]
         }))
         .expect("test ingest request should deserialize")

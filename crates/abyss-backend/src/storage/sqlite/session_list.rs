@@ -216,7 +216,6 @@ mod tests {
             "turn_id": format!("{session}-{turn}"),
             "llm": {"provider": "OpenAI", "model": model},
             "event_type": "response",
-            "text": "reply",
             "token_usage": {"input_tokens": 0_i64, "output_tokens": 10_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 10_i64},
             "metadata": {}
         })

@@ -6,7 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::{segments::TokenCounts, streams::StreamCounts};
+use super::{
+    segments::TokenCounts,
+    streams::{EntryLabel, StreamSummary},
+};
 
 /// The columns of one session event the header reads.
 pub struct HeaderEvent {
@@ -26,6 +29,8 @@ pub struct SessionHeaderResponse {
     pub session_pk: Uuid,
     /// Session id the agent declared.
     pub session_id: String,
+    /// The new user words of the session's first request.
+    pub title: Option<EntryLabel>,
     /// Agents that reported events, by name and version.
     pub agents: Vec<HeaderAgent>,
     /// Earliest event time.
@@ -53,7 +58,7 @@ pub struct HeaderAgent {
 pub fn session_header(
     session_pk: Uuid,
     events: Vec<HeaderEvent>,
-    counts: StreamCounts,
+    summary: StreamSummary,
 ) -> SessionHeaderResponse {
     let start = events.iter().map(|event| event.observed_at).min();
     let end = events.iter().map(|event| event.observed_at).max();
@@ -78,13 +83,14 @@ pub fn session_header(
     SessionHeaderResponse {
         session_pk,
         session_id,
+        title: summary.title,
         agents: agents.into_iter().collect(),
         start: start.unwrap_or_default(),
         end: end.unwrap_or_default(),
         event_count,
-        exchange_count: counts.exchanges,
-        turn_count: counts.turns,
-        segment_count: counts.segments,
+        exchange_count: summary.exchanges,
+        turn_count: summary.turns,
+        segment_count: summary.segments,
         tokens,
         providers: providers.into_iter().collect(),
         models: models.into_iter().collect(),

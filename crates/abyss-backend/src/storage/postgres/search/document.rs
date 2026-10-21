@@ -56,7 +56,7 @@ impl SearchDocument {
     /// Projects one source event into the strict Elasticsearch mapping.
     #[must_use]
     pub fn from_event(event: UsageEvent) -> Self {
-        let projection = SearchProjection::from_source(event.text, &event.metadata);
+        let projection = SearchProjection::from_source(&event.metadata);
         Self {
             event_pk: event.id,
             user_id: event.user_id,
@@ -86,46 +86,39 @@ mod tests {
 
     use super::{HIGHLIGHT_END, HIGHLIGHT_START, MAX_CONTENT_CHARACTERS, SearchDocument};
 
+    /// `entries` as an event's complete conversation.
+    fn conversation(entries: &serde_json::Value) -> serde_json::Value {
+        json!({"conversation": {"entries": entries, "completeness": "complete"}})
+    }
+
     #[test]
-    fn extracts_only_searchable_tool_metadata() {
+    fn indexes_every_entry_text_and_the_called_tool_names_only() {
         let mut event = usage_event();
-        event.metadata = json!({
-            "authorization": "Bearer secret",
-            "content_segments": [
-                {
-                    "type": "tool_call",
-                    "name": "Bash",
-                    "input": "{\"command\":\"cargo test\",\"nested\":{\"file_path\":\"src/lib.rs\"}}"
-                },
-                {
-                    "type": "tool_result",
-                    "output": "all tests passed"
-                },
-                {
-                    "type": "image",
-                    "content_base64": "secret-image"
-                }
-            ]
-        });
+        event.metadata = conversation(&json!([
+            {"role": "user", "text": "run the tests"},
+            {"role": "tool_call", "text": "{\"command\":\"cargo test\"}", "call_id": "c1", "name": "Bash"},
+            {"role": "tool_result", "text": "all tests passed", "call_id": "c1"}
+        ]));
+        event.metadata["headers"] = json!([{"name": "authorization", "value": "Bearer secret"}]);
 
         let document = SearchDocument::from_event(event);
 
         assert_eq!(document.tool_names, ["Bash"]);
-        // Tool inputs are searchable as written; no field is pulled out by name.
         assert_eq!(
-            document.tool_content[0],
-            "{\"command\":\"cargo test\",\"nested\":{\"file_path\":\"src/lib.rs\"}}"
+            document.content.as_deref(),
+            Some("run the tests\n{\"command\":\"cargo test\"}\nall tests passed")
         );
-        assert_eq!(document.tool_content.len(), 2);
+        assert!(document.tool_content.is_empty());
         let serialized = serde_json::to_string(&document).expect("document should serialize");
         assert!(!serialized.contains("Bearer secret"));
-        assert!(!serialized.contains("secret-image"));
     }
 
     #[test]
     fn truncates_oversized_content_on_a_utf8_boundary() {
         let mut event = usage_event();
-        event.text = Some("会".repeat(MAX_CONTENT_CHARACTERS + 1));
+        event.metadata = conversation(&json!([
+            {"role": "user", "text": "会".repeat(MAX_CONTENT_CHARACTERS + 1)}
+        ]));
 
         let document = SearchDocument::from_event(event);
 
@@ -143,26 +136,15 @@ mod tests {
     fn strips_highlight_markers_from_every_searchable_field() {
         let mut event = usage_event();
         event.session_id = format!("session-{HIGHLIGHT_START}one{HIGHLIGHT_END}");
-        event.text = Some(format!(
-            "before {HIGHLIGHT_START}match{HIGHLIGHT_END} after"
-        ));
-        event.metadata = json!({
-            "content_segments": [
-                {
-                    "type": "tool_call",
-                    "name": format!("{HIGHLIGHT_START}Bash{HIGHLIGHT_END}"),
-                    "input": serde_json::to_string(&json!({
-                        "command": format!("cargo {HIGHLIGHT_START}test{HIGHLIGHT_END}"),
-                        "file_path": format!("src/{HIGHLIGHT_END}lib.rs")
-                    }))
-                    .expect("tool input should serialize")
-                },
-                {
-                    "type": "tool_result",
-                    "output": format!("{HIGHLIGHT_START}passed{HIGHLIGHT_END}")
-                }
-            ]
-        });
+        event.metadata = conversation(&json!([
+            {"role": "user", "text": format!("before {HIGHLIGHT_START}match{HIGHLIGHT_END} after")},
+            {
+                "role": "tool_call",
+                "text": format!("cargo {HIGHLIGHT_START}test{HIGHLIGHT_END}"),
+                "call_id": "c1",
+                "name": format!("{HIGHLIGHT_START}Bash{HIGHLIGHT_END}")
+            }
+        ]));
 
         let serialized = serde_json::to_string(&SearchDocument::from_event(event))
             .expect("document should serialize");
@@ -186,7 +168,7 @@ mod tests {
             llm_provider: "openai".to_owned(),
             llm_model: "gpt-5".to_owned(),
             event_type: "request".to_owned(),
-            text: Some("hello".to_owned()),
+            text: None,
             text_sha256: None,
             input_tokens: 1,
             output_tokens: 0,

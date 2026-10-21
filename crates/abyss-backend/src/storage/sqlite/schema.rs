@@ -107,6 +107,9 @@ diesel::table! {
         result_ids -> Nullable<Text>,
         emitted_ids -> Nullable<Text>,
         output_skeleton -> Nullable<Text>,
+        label_index -> Nullable<Integer>,
+        label_text -> Nullable<Text>,
+        label_length -> Nullable<Integer>,
     }
 }
 

@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{SessionInfo, SessionTimelineResponse, UsageEventResponse};
+use super::{SessionInfo, SessionTimelineResponse, UsageEventResponse, conversation::Conversation};
 
 /// Purpose the collector declares on both events of a call that asks the
 /// model to summarize the conversation so far.
@@ -94,8 +94,6 @@ pub enum TrajectoryItemKind {
     /// A conversation entry the event carries, with the role the collector
     /// reported.
     Message,
-    /// Event text of an event whose conversation could not be read.
-    Text,
     /// A tool call entry: its name, call identifier, and input.
     ToolCall,
     /// A tool result entry: its call identifier and output.
@@ -203,19 +201,9 @@ impl Merger {
         let stream = self.conversation.place(event);
         if let Some(items) = ConversationProjection::project(event, stream) {
             self.items.extend(items);
-        } else {
-            self.unclassified_request(event, stream);
         }
         if is_compaction(event) {
             self.compaction(event, stream, first_new);
-        }
-    }
-
-    fn unclassified_request(&mut self, event: &UsageEventResponse, stream: usize) {
-        if let Some(text) = event.text.as_ref().filter(|text| !text.is_empty()) {
-            let mut item = TrajectoryItem::new(TrajectoryItemKind::Text, stream, event);
-            item.text = Some(text.clone());
-            self.items.push(item);
         }
     }
 
@@ -250,20 +238,27 @@ impl Merger {
             .as_ref()
             .and_then(|id| self.compactions.remove(id));
         if let Some(index) = compaction {
-            // The response of a compaction exchange is the summary.
-            if let Some(summary) = event.text.as_deref().map(str::trim)
-                && !summary.is_empty()
+            // The replies of a compaction exchange's response are the summary.
+            let summary = Conversation::read(&event.metadata)
+                .map(|conversation| {
+                    conversation
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.role == "assistant")
+                        .map(|entry| entry.text.trim().to_owned())
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default();
+            if !summary.is_empty()
                 && let Some(item) = self.items.get_mut(index)
             {
-                item.output = Some(summary.to_owned());
+                item.output = Some(summary);
                 item.output_event_pk = Some(event.id);
             }
         } else if let Some(items) = projected {
             self.items.extend(items);
-        } else if let Some(text) = event.text.as_deref().filter(|text| !text.trim().is_empty()) {
-            let mut item = TrajectoryItem::new(TrajectoryItemKind::Text, stream, event);
-            item.text = Some(text.to_owned());
-            self.items.push(item);
         }
     }
 }
@@ -283,7 +278,6 @@ mod tests {
     fn shown(item: &TrajectoryItem) -> &str {
         item.role.as_deref().unwrap_or(match item.kind {
             TrajectoryItemKind::Message => "message",
-            TrajectoryItemKind::Text => "text",
             TrajectoryItemKind::ToolCall => "tool_call",
             TrajectoryItemKind::ToolResult => "tool_result",
             TrajectoryItemKind::Compaction => "compaction",
@@ -317,11 +311,7 @@ mod tests {
     fn conversation(side: &str, entries: Value) -> UsageEventResponse {
         let mut conversation = json!({"completeness": "complete"});
         conversation["entries"] = entries;
-        event(
-            side,
-            "flattened text",
-            json!({"conversation": conversation}),
-        )
+        event(side, json!({"conversation": conversation}))
     }
 
     /// An event with the stream and response identities its exchange declares.
@@ -351,13 +341,13 @@ mod tests {
         request.cache_read_tokens = 77_000;
         request.cache_write_tokens = 400;
         request.total_tokens = 77_402;
-        let unreadable = event("request", "", json!({}));
-        let mut response = event("response", "", json!({}));
+        let unreadable = event("request", json!({}));
+        let mut response = event("response", json!({}));
         response.llm_model = "other-model".to_owned();
         response.output_tokens = 150;
         response.reasoning_tokens = 40;
         response.total_tokens = 150;
-        let mut cached = event("request", "", json!({}));
+        let mut cached = event("request", json!({}));
         cached.cache_read_tokens = 10;
         let ids = [request.id, unreadable.id, response.id, cached.id];
 
@@ -392,8 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn events_without_a_readable_conversation_show_their_text_verbatim() {
-        let text = "system: instructions\n\n用户内容\n\n用户内容";
+    fn events_without_a_readable_conversation_add_nothing() {
         for metadata in [
             json!({}),
             json!({"conversation":{"completeness":"partial","entries":[]}}),
@@ -404,17 +393,9 @@ mod tests {
             // The retired field is not read.
             json!({"conversation":{"messages":[{"role":"user","text":"用户内容"}],"completeness":"complete"}}),
         ] {
-            let items = build(timeline(vec![event("request", text, metadata)])).items;
-            assert_eq!(texts(&items), [("text", 0, text)]);
-            assert!(!items[0].continued);
+            let items = build(timeline(vec![event("request", metadata)])).items;
+            assert!(items.is_empty(), "{items:?}");
         }
-        // A failed response with neither a conversation nor text adds nothing.
-        let failed = event(
-            "response",
-            "",
-            json!({"conversation":{"entries":[],"completeness":"unsupported"}}),
-        );
-        assert!(build(timeline(vec![failed])).items.is_empty());
     }
 
     #[test]
@@ -590,25 +571,33 @@ mod tests {
         let mut request = user_request(&["write the report", PROMPT]);
         request.metadata["purpose"] = json!(COMPACTION_PURPOSE);
         request.response_id = Some("resp_compact".to_owned());
-        let mut response = event("response", SUMMARY, json!({"purpose": COMPACTION_PURPOSE}));
+        let mut response = conversation("response", json!([entry("assistant", SUMMARY)]));
+        response.metadata["purpose"] = json!(COMPACTION_PURPOSE);
         response.response_id = Some("resp_compact".to_owned());
         let replay = format!("Here is the summary of the earlier conversation:\n{SUMMARY}");
         let events = vec![
             user_request(&["write the report"]),
-            event("response", "working", json!({})),
+            conversation("response", json!([entry("assistant", "working")])),
             request,
             response,
             user_request(&[&replay]),
             // Prompt text alone does not make a compaction.
             user_request(&[PROMPT]),
-            event("response", SUMMARY, json!({})),
+            conversation("response", json!([entry("assistant", SUMMARY)])),
         ];
 
         let items = build(timeline(events)).items;
 
         assert_eq!(
             items.iter().map(shown).collect::<Vec<_>>(),
-            ["user", "text", "compaction", "user", "user", "text"]
+            [
+                "user",
+                "assistant",
+                "compaction",
+                "user",
+                "user",
+                "assistant"
+            ]
         );
         assert_eq!(
             items[2].input.as_deref(),
@@ -648,7 +637,7 @@ mod tests {
         }
     }
 
-    fn event(event_type: &str, text: &str, metadata: Value) -> UsageEventResponse {
+    fn event(event_type: &str, metadata: Value) -> UsageEventResponse {
         UsageEventResponse {
             id: Uuid::now_v7(),
             event_id: Uuid::now_v7().to_string(),
@@ -665,8 +654,6 @@ mod tests {
             llm_provider: "openai".to_owned(),
             llm_model: "gpt-5".to_owned(),
             event_type: event_type.to_owned(),
-            text: (!text.is_empty()).then(|| text.to_owned()),
-            text_sha256: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
