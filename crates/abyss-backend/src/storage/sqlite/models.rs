@@ -10,7 +10,7 @@ use crate::{
     error::AppError,
     usage::{
         event_order::TimelineEvent,
-        streams::{EventFacts, RequestFacts, ResponseFacts, StreamEvent},
+        streams::{EventFacts, Label, RequestFacts, ResponseFacts, StreamEvent},
     },
 };
 
@@ -127,8 +127,6 @@ pub(super) struct EventRow {
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
-    pub(super) text: Option<String>,
-    pub(super) text_sha256: Option<Vec<u8>>,
     pub(super) input_tokens: i64,
     pub(super) output_tokens: i64,
     pub(super) cache_read_tokens: i64,
@@ -159,8 +157,6 @@ pub(super) struct NewEvent {
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
-    pub(super) text: Option<String>,
-    pub(super) text_sha256: Option<Vec<u8>>,
     pub(super) input_tokens: i64,
     pub(super) output_tokens: i64,
     pub(super) cache_read_tokens: i64,
@@ -187,6 +183,9 @@ pub(super) struct NewStreamFacts {
     pub(super) result_ids: Option<String>,
     pub(super) emitted_ids: Option<String>,
     pub(super) output_skeleton: Option<String>,
+    pub(super) label_index: Option<i32>,
+    pub(super) label_text: Option<String>,
+    pub(super) label_length: Option<i32>,
 }
 
 impl NewStreamFacts {
@@ -199,6 +198,9 @@ impl NewStreamFacts {
             last_identity: facts.last_identity.clone(),
             trailing: Some(json_text(&facts.trailing, "trailing roles")?),
             result_ids: Some(json_text(&facts.result_ids, "result ids")?),
+            label_index: facts.label.as_ref().map(|label| label.index),
+            label_text: facts.label.as_ref().map(|label| label.text.clone()),
+            label_length: facts.label.as_ref().map(|label| label.length),
             ..Self::default()
         })
     }
@@ -231,6 +233,9 @@ pub(super) struct StreamEventRow {
     pub(super) result_ids: Option<String>,
     pub(super) emitted_ids: Option<String>,
     pub(super) output_skeleton: Option<String>,
+    pub(super) label_index: Option<i32>,
+    pub(super) label_text: Option<String>,
+    pub(super) label_length: Option<i32>,
 }
 
 impl StreamEventRow {
@@ -242,6 +247,7 @@ impl StreamEventRow {
                 last_identity: self.last_identity,
                 trailing: json_list(self.trailing.as_deref(), "trailing roles")?,
                 result_ids: json_list(self.result_ids.as_deref(), "result ids")?,
+                label: Label::from_columns(self.label_index, self.label_text, self.label_length),
             })
         } else {
             EventFacts::Response(ResponseFacts {
@@ -370,8 +376,6 @@ pub(super) struct EventRecord {
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
-    pub(super) text: Option<String>,
-    pub(super) text_sha256: Option<Vec<u8>>,
     pub(super) input_tokens: i64,
     pub(super) output_tokens: i64,
     pub(super) cache_read_tokens: i64,
@@ -480,8 +484,6 @@ impl EventRow {
             llm_provider: self.llm_provider,
             llm_model: self.llm_model,
             event_type: self.event_type,
-            text: self.text,
-            text_sha256: self.text_sha256,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cache_read_tokens: self.cache_read_tokens,

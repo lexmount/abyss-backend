@@ -603,9 +603,11 @@ mod tests {
             "turn_index": 1,
             "llm": {"provider": "openai", "model": "gpt-5"},
             "event_type": "response",
-            "text": text,
             "token_usage": {"input_tokens": 0_i64, "output_tokens": 1_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 1_i64},
-            "metadata": {}
+            "metadata": {"conversation": {
+                "entries": [{"role": "assistant", "text": text}],
+                "completeness": "complete"
+            }}
         })
     }
 

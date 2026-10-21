@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 pub use self::{
     base::{BaseRule, NoBaseReason},
-    facts::{RequestFacts, ResponseFacts},
+    facts::{Label, RequestFacts, ResponseFacts},
     segmentation::SegmentKind,
 };
 use self::{
@@ -83,6 +83,22 @@ pub struct StreamSegment {
     pub end: DateTime<Utc>,
     /// Number of exchanges in the segment.
     pub exchange_count: usize,
+    /// The new user words of the segment's first request.
+    pub label: Option<EntryLabel>,
+}
+
+#[derive(Debug, Serialize)]
+/// Where a request's new user words are, and how they begin: the last
+/// `user` entry with text in its new part.
+pub struct EntryLabel {
+    /// The request event.
+    pub event_pk: Uuid,
+    /// Index of the entry among the event's entries.
+    pub entry_index: i32,
+    /// At most the first 50 UTF-16 code units of the entry's text.
+    pub text: String,
+    /// Length of the entry's whole text in UTF-16 code units.
+    pub length: i32,
 }
 
 /// Exchanges of one session, the base of each, and the segments they form.
@@ -116,6 +132,18 @@ impl Streams {
         }
     }
 
+    /// The label of an exchange's request.
+    fn label(&self, exchange: usize) -> Option<EntryLabel> {
+        let request = self.exchanges.get(exchange)?.request.as_ref()?;
+        let label = request.facts.label.as_ref()?;
+        Some(EntryLabel {
+            event_pk: request.pk,
+            entry_index: label.index,
+            text: label.text.clone(),
+            length: label.length,
+        })
+    }
+
     fn base(&self, exchange: usize) -> Option<usize> {
         self.bases[exchange].ok().map(|(base, _)| base)
     }
@@ -145,6 +173,7 @@ impl Streams {
                 .max()
                 .unwrap_or_default(),
             exchange_count: segment.exchanges.len(),
+            label: self.label(first),
         }
     }
 }
@@ -167,19 +196,22 @@ pub fn session_streams(session_pk: Uuid, events: Vec<StreamEvent>) -> SessionStr
     }
 }
 
-/// How many exchanges, turns, and segments one session's events form.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StreamCounts {
+/// How many exchanges, turns, and segments one session's events form, and
+/// the new user words of its first request.
+#[derive(Debug)]
+pub struct StreamSummary {
     pub exchanges: usize,
     /// Requests that open a turn.
     pub turns: usize,
     pub segments: usize,
+    pub title: Option<EntryLabel>,
 }
 
-/// Counts the exchanges, turns, and segments of one session's events.
-pub fn stream_counts(events: Vec<StreamEvent>) -> StreamCounts {
+/// Sums up the streams of one session's events.
+pub fn stream_summary(events: Vec<StreamEvent>) -> StreamSummary {
     let streams = Streams::derive(events);
-    StreamCounts {
+    StreamSummary {
+        title: streams.label(0),
         exchanges: streams.exchanges.len(),
         turns: streams
             .exchanges

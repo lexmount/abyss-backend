@@ -92,6 +92,60 @@ pub struct RequestFacts {
     /// Whether the new part holds a `user` entry with text and no
     /// `tool_result` entry.
     pub starts_turn: bool,
+    /// The last `user` entry with text in the new part.
+    pub label: Option<Label>,
+}
+
+/// Most UTF-16 code units of a label's text.
+const LABEL_TEXT_UNITS: usize = 50;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Where a request's new user words are, and how they begin.
+pub struct Label {
+    /// Index of the entry among the request's entries.
+    pub index: i32,
+    /// The entry's text, at most its first 50 UTF-16 code units, never
+    /// ending inside a character.
+    pub text: String,
+    /// Length of the entry's whole text in UTF-16 code units.
+    pub length: i32,
+}
+
+impl Label {
+    /// A label from its stored columns; none unless all three are there.
+    pub fn from_columns(
+        index: Option<i32>,
+        text: Option<String>,
+        length: Option<i32>,
+    ) -> Option<Self> {
+        Some(Self {
+            index: index?,
+            text: text?,
+            length: length?,
+        })
+    }
+
+    /// The last `user` entry with text from `new_from` on.
+    fn of(entries: &[Entry], new_from: usize) -> Option<Self> {
+        let offset = entries[new_from..]
+            .iter()
+            .rposition(|entry| entry.role == "user" && !entry.text.is_empty())?;
+        let index = new_from.saturating_add(offset);
+        let text = &entries[index].text;
+        let mut units = 0_usize;
+        let end = text
+            .char_indices()
+            .find(|(_, character)| {
+                units = units.saturating_add(character.len_utf16());
+                units > LABEL_TEXT_UNITS
+            })
+            .map_or(text.len(), |(at, _)| at);
+        Some(Self {
+            index: i32::try_from(index).unwrap_or(i32::MAX),
+            text: text[..end].to_owned(),
+            length: i32::try_from(text.encode_utf16().count()).unwrap_or(i32::MAX),
+        })
+    }
 }
 
 impl RequestFacts {
@@ -106,6 +160,7 @@ impl RequestFacts {
                 trailing: Vec::new(),
                 result_ids: result_ids(&entries),
                 starts_turn: starts_turn(&entries),
+                label: Label::of(&entries, 0),
             };
         };
         let start = entries[..last]
@@ -131,6 +186,7 @@ impl RequestFacts {
             trailing,
             result_ids: Vec::new(),
             starts_turn: starts_turn(&entries[new_from..]),
+            label: Label::of(&entries, new_from),
         }
     }
 }
@@ -169,7 +225,7 @@ impl ResponseFacts {
 mod tests {
     use serde_json::json;
 
-    use super::{RequestFacts, ResponseFacts};
+    use super::{Label, RequestFacts, ResponseFacts};
     use crate::usage::streams::fixtures::{
         assistant, call, conversation, ids, item, reasoning, result, skeleton, system, user,
     };
@@ -196,6 +252,7 @@ mod tests {
                 trailing: Vec::new(),
                 result_ids: Vec::new(),
                 starts_turn: false,
+                label: None,
             }
         );
         // New user text after the last answer opens a turn; the answer has no
@@ -227,6 +284,11 @@ mod tests {
                 trailing: Vec::new(),
                 result_ids: ids(&["a", "b"]),
                 starts_turn: false,
+                label: Some(Label {
+                    index: 2,
+                    text: "go".to_owned(),
+                    length: 2,
+                }),
             }
         );
         // A run without identities has nothing to align on and nothing
@@ -322,6 +384,33 @@ mod tests {
             facts.trailing,
             ["reasoning", "assistant"],
             "trailing roles keep reasoning and leave out tool results"
+        );
+    }
+
+    #[test]
+    fn a_label_is_the_last_user_text_of_the_new_part_cut_to_fifty_units() {
+        let label = |entries: &serde_json::Value| RequestFacts::read(&conversation(entries)).label;
+        // Injected context comes first; the user's own words come last.
+        let words = format!("{}😀tail", "a".repeat(49));
+        assert_eq!(
+            label(&json!([
+                user("old question"),
+                assistant("old answer"),
+                user("<system-reminder>"),
+                user(&words),
+                user("")
+            ])),
+            Some(Label {
+                index: 3,
+                text: "a".repeat(49),
+                length: 55,
+            }),
+            "the cut never splits the emoji's surrogate pair"
+        );
+        assert_eq!(
+            label(&json!([user("ask"), call("a"), result("a")])),
+            None,
+            "user text before the model output is not new"
         );
     }
 }

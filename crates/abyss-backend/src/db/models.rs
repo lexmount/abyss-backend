@@ -203,9 +203,11 @@ pub struct UsageEvent {
     pub llm_model: String,
     /// Canonical request or response value.
     pub event_type: String,
-    /// Optional prompt or response text.
+    /// Retired event text; no longer written, always empty.
+    #[expect(dead_code, reason = "the column stays in the schema; nothing reads it")]
     pub text: Option<String>,
-    /// Binary SHA-256 digest of text when present.
+    /// Retired digest of the event text; always empty.
+    #[expect(dead_code, reason = "the column stays in the schema; nothing reads it")]
     pub text_sha256: Option<Vec<u8>>,
     /// Normalized input-token count.
     pub input_tokens: i64,
@@ -324,10 +326,6 @@ pub struct NewUsageEvent {
     pub llm_model: String,
     /// Canonical request or response value.
     pub event_type: String,
-    /// Optional prompt or response text.
-    pub text: Option<String>,
-    /// Optional binary SHA-256 of text.
-    pub text_sha256: Option<Vec<u8>>,
     /// Normalized input-token count.
     pub input_tokens: i64,
     /// Normalized output-token count.
@@ -384,6 +382,12 @@ pub struct StreamEventRow {
     pub emitted_ids: Option<Value>,
     /// Response: skeleton of its entries.
     pub output_skeleton: Option<Value>,
+    /// Request: index of its label entry.
+    pub label_index: Option<i32>,
+    /// Request: start of its label entry's text.
+    pub label_text: Option<String>,
+    /// Request: length of its label entry's text in UTF-16 code units.
+    pub label_length: Option<i32>,
 }
 
 #[derive(Debug, Default, Insertable)]
@@ -406,6 +410,12 @@ pub struct NewStreamFacts {
     pub emitted_ids: Option<Value>,
     /// Response: skeleton of its entries.
     pub output_skeleton: Option<Value>,
+    /// Request: index of its label entry.
+    pub label_index: Option<i32>,
+    /// Request: start of its label entry's text.
+    pub label_text: Option<String>,
+    /// Request: length of its label entry's text in UTF-16 code units.
+    pub label_length: Option<i32>,
 }
 
 #[derive(Insertable)]

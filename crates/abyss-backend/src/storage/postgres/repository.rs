@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use diesel::{
     Connection, ExpressionMethods, IntoSql, NullableExpressionMethods, PgConnection, QueryDsl,
     QueryableByName, RunQueryDsl, SelectableHelper, define_sql_function,
-    dsl::{count_star, max, sql},
+    dsl::{count_star, max},
     result::OptionalExtension,
     sql_query,
     sql_types::{
@@ -41,10 +41,10 @@ use crate::{
     },
     error::AppError,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, OUTLINE_PREVIEW_CHARS,
-        RawEventsQuery, RawEventsResponse, SessionInfo, SessionOutlineResponse,
-        SessionTimelineResponse, SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline,
-        UsageEventOutline, UsageEventResponse, UsageEventType,
+        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
+        RawEventsResponse, SessionInfo, SessionOutlineResponse, SessionTimelineResponse,
+        SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline, UsageEventOutline,
+        UsageEventResponse, UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -53,8 +53,8 @@ use crate::{
         event_order::UsageEventTimelineOrder,
         persistence::{
             escape_like_pattern, exact_values_filter, non_empty, non_negative_count,
-            normalize_limit, normalize_text, parse_group_by, sha256_bytes, unix_epoch,
-            validate_batch, validate_event_type,
+            normalize_limit, normalize_text, parse_group_by, unix_epoch, validate_batch,
+            validate_event_type,
         },
         preview::{ConversationPreview, Window, preview},
         segments::{
@@ -62,8 +62,8 @@ use crate::{
         },
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
-            EventFacts, RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
-            segment_page, session_streams as streams_of, stream_counts,
+            EventFacts, Label, RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
+            segment_page, session_streams as streams_of, stream_summary,
         },
     },
 };
@@ -405,8 +405,6 @@ type OutlineRow = (
     i64,
     i64,
     DateTime<Utc>,
-    i64,
-    Option<String>,
 );
 
 /// Loads one owner-scoped session timeline without event content bodies.
@@ -435,11 +433,6 @@ pub fn session_outline(
             llm_usage_events::reasoning_tokens,
             llm_usage_events::total_tokens,
             llm_usage_events::observed_at,
-            sql::<BigInt>("coalesce(char_length(text), 0)::bigint"),
-            sql::<Nullable<Text>>(&format!(
-                "CASE WHEN event_type = 'request' THEN right(text, {OUTLINE_PREVIEW_CHARS}) \
-                 ELSE left(text, {OUTLINE_PREVIEW_CHARS}) END"
-            )),
         ))
         .load::<OutlineRow>(connection)?;
     let event_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
@@ -467,8 +460,6 @@ pub fn session_outline(
             reasoning_tokens: row.11,
             total_tokens: row.12,
             observed_at: row.13,
-            text_chars: row.14,
-            preview: row.15,
             attachment_count: attachment_counts.get(&row.0).copied().unwrap_or(0),
         })
         .collect::<Vec<_>>();
@@ -735,8 +726,8 @@ pub fn session_header(
             "session not found: {session_pk}"
         )));
     }
-    let counts = stream_counts(stream_events(connection, user_id, session_pk)?);
-    Ok(header_of(session_pk, events, counts))
+    let summary = stream_summary(stream_events(connection, user_id, session_pk)?);
+    Ok(header_of(session_pk, events, summary))
 }
 
 fn header_event(
@@ -859,6 +850,9 @@ fn stream_events(
             llm_usage_event_stream_facts::result_ids.nullable(),
             llm_usage_event_stream_facts::emitted_ids.nullable(),
             llm_usage_event_stream_facts::output_skeleton.nullable(),
+            llm_usage_event_stream_facts::label_index.nullable(),
+            llm_usage_event_stream_facts::label_text.nullable(),
+            llm_usage_event_stream_facts::label_length.nullable(),
         ))
         .load::<StreamEventRow>(connection)?
         .into_iter()
@@ -874,6 +868,7 @@ fn stream_event(row: StreamEventRow) -> Result<StreamEvent, AppError> {
             last_identity: row.last_identity,
             trailing: json_list(row.trailing, "trailing roles")?,
             result_ids: json_list(row.result_ids, "result ids")?,
+            label: Label::from_columns(row.label_index, row.label_text, row.label_length),
         })
     } else {
         EventFacts::Response(ResponseFacts {
@@ -922,6 +917,9 @@ fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFac
                 last_identity: facts.last_identity,
                 trailing: Some(json_value(&facts.trailing, "trailing roles")?),
                 result_ids: Some(json_value(&facts.result_ids, "result ids")?),
+                label_index: facts.label.as_ref().map(|label| label.index),
+                label_length: facts.label.as_ref().map(|label| label.length),
+                label_text: facts.label.map(|label| label.text),
                 ..NewStreamFacts::default()
             }
         }
@@ -972,7 +970,6 @@ fn ingest_one_event(
         now,
     )?;
     let tokens = &event.token_usage;
-    let text = event.text.clone();
 
     // `event_id` is the idempotency key supplied by the collector. Duplicate
     // observations are accepted as no-ops instead of failing the whole batch.
@@ -992,8 +989,6 @@ fn ingest_one_event(
             llm_provider: provider,
             llm_model: model,
             event_type: event.event_type.as_str().to_owned(),
-            text_sha256: text.as_deref().map(sha256_bytes),
-            text,
             input_tokens: tokens.input_tokens.unwrap_or_default(),
             output_tokens: tokens.output_tokens.unwrap_or_default(),
             cache_read_tokens: tokens.cache_read_tokens.unwrap_or_default(),
@@ -1490,8 +1485,6 @@ fn event_response(
         llm_provider: event.llm_provider,
         llm_model: event.llm_model,
         event_type: event.event_type,
-        text: event.text,
-        text_sha256: event.text_sha256.map(hex::encode),
         input_tokens: event.input_tokens,
         output_tokens: event.output_tokens,
         cache_read_tokens: event.cache_read_tokens,
@@ -2241,7 +2234,6 @@ mod tests {
                 model: "gpt-5.5".to_owned(),
             },
             event_type: UsageEventType::Request,
-            text: Some("hello".to_owned()),
             token_usage: TokenUsagePayload {
                 input_tokens: Some(5_i64),
                 output_tokens: Some(7_i64),
