@@ -23,6 +23,9 @@ use crate::{
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
         UsageEventResponse,
         attachments::StoredImageAttachment,
+        preview::{ConversationPreview, Window},
+        segments::{SegmentResponse, ValidatedSegmentQuery},
+        session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
         streams::SessionStreamsResponse,
     },
@@ -81,13 +84,40 @@ pub trait StorageBackend: Send + Sync {
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>>;
 
-    /// Derives the exchanges and segments of an owner-scoped session; not
-    /// found when the owner has no event in that session.
+    /// The header of an owner-scoped session; not found when the owner has
+    /// no event in it.
+    fn session_header(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionHeaderResponse, AppError>>;
+
+    /// Derives the segments of an owner-scoped session; not found when the
+    /// owner has no event in it.
     fn session_streams(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>>;
+
+    /// One page of the exchanges of the segment holding exchange `head` in
+    /// an owner-scoped session, from `head` on; not found when the session
+    /// has no such exchange.
+    fn session_segment(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        head: String,
+        query: ValidatedSegmentQuery,
+    ) -> BoxedFuture<'_, Result<SegmentResponse, AppError>>;
+
+    /// The conversation of one owner-scoped event through `window`.
+    fn event_conversation(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+        window: Window,
+    ) -> BoxedFuture<'_, Result<ConversationPreview, AppError>>;
 
     /// Lists one page of owner-scoped sessions, most recently active first.
     fn list_sessions(

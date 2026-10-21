@@ -28,6 +28,9 @@ use crate::{
         IngestEventsRequest, IngestEventsResponse, RawEventListResponse, RawEventsQuery,
         SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
         TokenUsageSummaryResponse, UsageEventResponse,
+        preview::{ConversationPreview, PreviewQuery, Window},
+        segments::{SegmentQuery, SegmentResponse},
+        session_header::SessionHeaderResponse,
         session_list::{SessionListQuery, SessionListResponse},
         streams::SessionStreamsResponse,
         trajectory::{self, SessionTrajectoryResponse},
@@ -89,8 +92,20 @@ pub fn router(state: AppState) -> Router {
             get(session_trajectory),
         )
         .route(
+            "/v1/agent-usage/sessions/{session_pk}/header",
+            get(session_header),
+        )
+        .route(
             "/v1/agent-usage/sessions/{session_pk}/streams",
             get(session_streams),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/segments/{head}",
+            get(session_segment),
+        )
+        .route(
+            "/v1/agent-usage/events/{event_pk}/conversation",
+            get(event_conversation),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -204,7 +219,7 @@ async fn session_trajectory(
     Ok(Json(trajectory::build(timeline)))
 }
 
-/// Exchanges and segments of one session, without content.
+/// Segments of one session, without content.
 async fn session_streams(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -213,6 +228,53 @@ async fn session_streams(
     let user_id = state.identity.authenticate(&headers)?;
     Ok(Json(
         state.storage.session_streams(user_id, session_pk).await?,
+    ))
+}
+
+/// Agents, time span, counts, and token totals of one session.
+async fn session_header(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionHeaderResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state.storage.session_header(user_id, session_pk).await?,
+    ))
+}
+
+/// One page of a segment's exchanges, from exchange `head` on, with a
+/// preview of each request and response.
+async fn session_segment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_pk, head)): Path<(Uuid, String)>,
+    Query(query): Query<SegmentQuery>,
+) -> Result<Json<SegmentResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let query = query.validate()?;
+    Ok(Json(
+        state
+            .storage
+            .session_segment(user_id, session_pk, head, query)
+            .await?,
+    ))
+}
+
+/// The conversation of one event, all of it or the asked entries.
+async fn event_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(event_pk): Path<Uuid>,
+    Query(query): Query<PreviewQuery>,
+) -> Result<Json<ConversationPreview>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let window = Window::parse(&query)?;
+    Ok(Json(
+        state
+            .storage
+            .event_conversation(user_id, event_pk, window)
+            .await?,
     ))
 }
 

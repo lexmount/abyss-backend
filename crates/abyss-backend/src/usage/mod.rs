@@ -12,10 +12,16 @@ mod conversation;
 pub mod diagnostics;
 pub mod event_order;
 pub mod persistence;
+/// Previews of an event's conversation entries.
+pub mod preview;
+/// One segment's exchanges for the session page.
+pub mod segments;
+/// The header of the session page.
+pub mod session_header;
 /// Owner-scoped session index contracts.
 pub mod session_list;
 pub mod session_title;
-/// Stream facts read from each event at ingest.
+/// Streams of a session: stream facts, bases, and segments.
 pub mod streams;
 pub mod trajectory;
 
