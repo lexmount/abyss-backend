@@ -10,57 +10,38 @@ use uuid::Uuid;
 use super::{
     UsageEventResponse,
     preview::{ConversationPreview, PreviewQuery, Window, preview},
-    streams::{SegmentExchange, SegmentPage},
+    streams::{SegmentExchange, SegmentRun},
 };
 use crate::error::AppError;
 
-/// Exchanges a segment page holds without `limit`.
-const DEFAULT_LIMIT: usize = 50;
-/// Most exchanges one segment page holds.
-const MAX_LIMIT: usize = 200;
-
 #[derive(Debug, Default, Deserialize)]
-/// Query of a segment page.
+/// Query of a segment: how each exchange's preview is cut.
 pub struct SegmentQuery {
     /// Runs of entries each preview gives; see [`PreviewQuery`].
     pub entries: Option<String>,
     /// Most UTF-16 code units of each previewed entry text.
     pub text_preview: Option<usize>,
-    /// Most exchanges in the page.
-    pub limit: Option<usize>,
-    /// Exchange the page continues after.
-    pub after: Option<String>,
 }
 
 #[derive(Debug)]
 /// A validated [`SegmentQuery`].
 pub struct ValidatedSegmentQuery {
     pub window: Window,
-    pub limit: usize,
-    pub after: Option<String>,
 }
 
 impl SegmentQuery {
     pub fn validate(self) -> Result<ValidatedSegmentQuery, AppError> {
-        let limit = self.limit.unwrap_or(DEFAULT_LIMIT);
-        if limit == 0 || limit > MAX_LIMIT {
-            return Err(AppError::validation(format!(
-                "limit must be between 1 and {MAX_LIMIT}"
-            )));
-        }
         Ok(ValidatedSegmentQuery {
             window: Window::parse(&PreviewQuery {
                 entries: self.entries,
                 text_preview: self.text_preview,
             })?,
-            limit,
-            after: self.after,
         })
     }
 }
 
 #[derive(Debug, Serialize)]
-/// One segment's exchanges from the asked one on.
+/// One segment's exchanges from the asked one to its end, all at once.
 pub struct SegmentResponse {
     /// Session primary key.
     pub session_pk: Uuid,
@@ -68,8 +49,6 @@ pub struct SegmentResponse {
     pub segment: String,
     /// The exchanges in order.
     pub exchanges: Vec<SegmentExchangeResponse>,
-    /// Exchange to pass as `after` for the next page, while there is one.
-    pub next: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,23 +102,23 @@ impl TokenCounts {
     }
 }
 
-/// The primary keys of the events a page's exchanges hold.
-pub fn page_event_pks(page: &SegmentPage) -> Vec<Uuid> {
-    page.exchanges
+/// The primary keys of the events a run's exchanges hold.
+pub fn run_event_pks(run: &SegmentRun) -> Vec<Uuid> {
+    run.exchanges
         .iter()
         .flat_map(|exchange| [exchange.request_pk, exchange.response_pk])
         .flatten()
         .collect()
 }
 
-/// Fills a page with its events, keyed by primary key.
+/// Fills a run with its events, keyed by primary key.
 pub fn segment_response(
     session_pk: Uuid,
-    page: SegmentPage,
+    run: SegmentRun,
     mut events: HashMap<Uuid, UsageEventResponse>,
     window: &Window,
 ) -> SegmentResponse {
-    let exchanges = page
+    let exchanges = run
         .exchanges
         .into_iter()
         .map(|exchange| {
@@ -162,8 +141,7 @@ pub fn segment_response(
         .collect();
     SegmentResponse {
         session_pk,
-        segment: page.segment,
+        segment: run.segment,
         exchanges,
-        next: page.next,
     }
 }

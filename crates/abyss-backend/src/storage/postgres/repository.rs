@@ -58,12 +58,12 @@ use crate::{
         },
         preview::{ConversationPreview, Window, preview},
         segments::{
-            SegmentResponse, TokenCounts, ValidatedSegmentQuery, page_event_pks, segment_response,
+            SegmentResponse, TokenCounts, ValidatedSegmentQuery, run_event_pks, segment_response,
         },
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
             EventFacts, Label, RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
-            segment_page, session_streams as streams_of, stream_summary,
+            segment_run, session_streams as streams_of, stream_summary,
         },
     },
 };
@@ -764,8 +764,8 @@ fn header_event(
     }
 }
 
-/// One page of the exchanges of the segment holding exchange `head`, with a
-/// preview of each event.
+/// The exchanges of the segment holding exchange `head`, from it to the
+/// segment end, with a preview of each event.
 pub fn session_segment(
     connection: &mut PgConnection,
     user_id: Uuid,
@@ -774,14 +774,13 @@ pub fn session_segment(
     query: &ValidatedSegmentQuery,
 ) -> Result<SegmentResponse, AppError> {
     let events = stream_events(connection, user_id, session_pk)?;
-    let page =
-        segment_page(events, head, query.after.as_deref(), query.limit).ok_or_else(|| {
-            AppError::not_found(format!(
-                "exchange not found in session {session_pk}: {head}"
-            ))
-        })?;
-    let events = usage_events(connection, user_id, &page_event_pks(&page))?;
-    Ok(segment_response(session_pk, page, events, &query.window))
+    let run = segment_run(events, head).ok_or_else(|| {
+        AppError::not_found(format!(
+            "exchange not found in session {session_pk}: {head}"
+        ))
+    })?;
+    let events = usage_events(connection, user_id, &run_event_pks(&run))?;
+    Ok(segment_response(session_pk, run, events, &query.window))
 }
 
 /// The conversation of one owner-scoped event through `window`.

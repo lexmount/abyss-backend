@@ -243,7 +243,7 @@ async fn session_header(
     ))
 }
 
-/// One page of a segment's exchanges, from exchange `head` on, with a
+/// A segment's exchanges from exchange `head` to the segment end, with a
 /// preview of each request and response.
 async fn session_segment(
     State(state): State<AppState>,

@@ -33,11 +33,11 @@ use crate::{
         },
         preview::{ConversationPreview, Window, preview},
         segments::{
-            SegmentResponse, TokenCounts, ValidatedSegmentQuery, page_event_pks, segment_response,
+            SegmentResponse, TokenCounts, ValidatedSegmentQuery, run_event_pks, segment_response,
         },
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
-            RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent, segment_page,
+            RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent, segment_run,
             session_streams as streams_of, stream_summary,
         },
     },
@@ -622,8 +622,8 @@ fn header_event(
     })
 }
 
-/// One page of the exchanges of the segment holding exchange `head`, with a
-/// preview of each event.
+/// The exchanges of the segment holding exchange `head`, from it to the
+/// segment end, with a preview of each event.
 pub(super) fn session_segment(
     connection: &mut SqliteConnection,
     user_id: Uuid,
@@ -632,14 +632,13 @@ pub(super) fn session_segment(
     query: &ValidatedSegmentQuery,
 ) -> Result<SegmentResponse, AppError> {
     let events = stream_events(connection, user_id, session_pk)?;
-    let page =
-        segment_page(events, head, query.after.as_deref(), query.limit).ok_or_else(|| {
-            AppError::not_found(format!(
-                "exchange not found in session {session_pk}: {head}"
-            ))
-        })?;
-    let events = usage_events(connection, user_id, &page_event_pks(&page))?;
-    Ok(segment_response(session_pk, page, events, &query.window))
+    let run = segment_run(events, head).ok_or_else(|| {
+        AppError::not_found(format!(
+            "exchange not found in session {session_pk}: {head}"
+        ))
+    })?;
+    let events = usage_events(connection, user_id, &run_event_pks(&run))?;
+    Ok(segment_response(session_pk, run, events, &query.window))
 }
 
 /// The conversation of one owner-scoped event through `window`.
@@ -1912,16 +1911,12 @@ mod tests {
         let query = SegmentQuery {
             entries: Some("0".to_owned()),
             text_preview: Some(3),
-            ..SegmentQuery::default()
         }
         .validate()
         .expect("a valid query");
         let segment = session_segment(&mut database, OWNER_ID, session_pk, "r1", &query)
-            .expect("the segment pages");
-        assert_eq!(
-            (segment.segment.as_str(), segment.next.as_deref()),
-            ("r1", None)
-        );
+            .expect("the whole segment");
+        assert_eq!(segment.segment, "r1");
         let r2 = &segment.exchanges[1];
         assert_eq!(
             (r2.exchange.base.as_deref(), r2.model.as_deref()),

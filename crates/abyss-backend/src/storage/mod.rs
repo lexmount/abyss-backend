@@ -100,8 +100,8 @@ pub trait StorageBackend: Send + Sync {
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>>;
 
-    /// One page of the exchanges of the segment holding exchange `head` in
-    /// an owner-scoped session, from `head` on; not found when the session
+    /// The exchanges of the segment holding exchange `head` in
+    /// an owner-scoped session, from `head` to the segment end; not found when the session
     /// has no such exchange.
     fn session_segment(
         &self,

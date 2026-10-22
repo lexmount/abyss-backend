@@ -246,72 +246,54 @@ pub struct SegmentExchange {
 }
 
 /// Exchanges of one segment from a given exchange on.
-pub struct SegmentPage {
+pub struct SegmentRun {
     /// Head of the segment that now holds the asked exchange.
     pub segment: String,
     /// The exchanges in order.
     pub exchanges: Vec<SegmentExchange>,
-    /// Exchange to continue after when the segment holds more.
-    pub next: Option<String>,
 }
 
-/// The exchanges of the segment holding exchange `from`, from it on, or
-/// after `after` when given, at most `limit`. `None` when the session has no
-/// such exchange, or `after` is not in that segment from `from` on.
-pub fn segment_page(
-    events: Vec<StreamEvent>,
-    from: &str,
-    after: Option<&str>,
-    limit: usize,
-) -> Option<SegmentPage> {
+/// The exchanges of the segment holding exchange `from`, from it to the
+/// segment's end. `None` when the session has no such exchange.
+pub fn segment_run(events: Vec<StreamEvent>, from: &str) -> Option<SegmentRun> {
     let streams = Streams::derive(events);
-    let id = |exchange: usize| streams.exchanges[exchange].id.clone();
     let from = streams
         .exchanges
         .iter()
         .position(|exchange| exchange.id == from)?;
-    let segment = &streams.segmentation.segments[streams.segmentation.segment_of[from]];
-    let mut rest = &segment.exchanges[segment
-        .exchanges
-        .iter()
-        .position(|&exchange| exchange == from)?..];
-    if let Some(after) = after {
-        let at = rest
-            .iter()
-            .position(|&exchange| streams.exchanges[exchange].id == after)?;
-        rest = &rest[at.saturating_add(1)..];
-    }
-    let shown = &rest[..limit.min(rest.len())];
-    Some(SegmentPage {
-        segment: id(segment.exchanges.first().copied().unwrap_or_default()),
-        exchanges: shown
+    let segment = streams.segmentation.segment_of[from];
+    let members = &streams.segmentation.segments[segment].exchanges;
+    let at = members.iter().position(|&exchange| exchange == from)?;
+    Some(SegmentRun {
+        segment: streams.segment_head(segment),
+        exchanges: members[at..]
             .iter()
             .map(|&exchange| streams.exchange(exchange))
             .collect(),
-        next: (shown.len() < rest.len())
-            .then(|| shown.last().copied().map(id))
-            .flatten(),
     })
 }
 
 impl Streams {
+    /// Id of a segment's first exchange.
+    fn segment_head(&self, segment: usize) -> String {
+        let head = self.segmentation.segments[segment]
+            .exchanges
+            .first()
+            .copied()
+            .unwrap_or_default();
+        self.exchanges[head].id.clone()
+    }
+
     fn exchange(&self, index: usize) -> SegmentExchange {
         let exchange = &self.exchanges[index];
         let base = self.base(index);
-        let segment_head = |segment: usize| {
-            let head = self.segmentation.segments[segment]
-                .exchanges
-                .first()
-                .copied();
-            head.map(|head| self.exchanges[head].id.clone())
-        };
         let request = exchange.request.as_ref();
         SegmentExchange {
             id: exchange.id.clone(),
             request_pk: request.map(|request| request.pk),
             response_pk: exchange.response.as_ref().map(|response| response.pk),
             base: base.map(|base| self.exchanges[base].id.clone()),
-            base_segment: base.and_then(|base| segment_head(self.segmentation.segment_of[base])),
+            base_segment: base.map(|base| self.segment_head(self.segmentation.segment_of[base])),
             rule: self.bases[index].ok().map(|(_, rule)| rule),
             no_base_reason: self.bases[index].err(),
             new_from: request.map(|request| request.facts.new_from),
@@ -326,7 +308,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{BaseRule, SegmentKind, segment_page, session_streams};
+    use super::{BaseRule, SegmentKind, segment_run, session_streams};
     use crate::usage::streams::fixtures::{Session, assistant, call, item, result, user};
 
     #[test]
@@ -387,7 +369,7 @@ mod tests {
         );
     }
     #[test]
-    fn a_segment_page_runs_from_its_exchange_to_the_segment_end() {
+    fn a_segment_run_goes_from_its_exchange_to_the_segment_end() {
         let mut session = Session::new();
         session.exchange("e1", 1, &json!([user("go")]), &json!([call("a")]));
         session.exchange(
@@ -402,35 +384,26 @@ mod tests {
             &json!([user("go"), call("a"), result("a"), call("b"), result("b")]),
             &json!([assistant("done")]),
         );
-        let page = |from: &str, after: Option<&str>, limit: usize| {
-            segment_page(session.events.clone(), from, after, limit).map(|page| {
-                let ids = page
+        let run = |from: &str| {
+            segment_run(session.events.clone(), from).map(|run| {
+                let ids = run
                     .exchanges
                     .iter()
                     .map(|exchange| exchange.id.as_str())
                     .collect::<Vec<_>>()
                     .join(",");
-                (page.segment, ids, page.next)
+                (run.segment, ids)
             })
         };
-        let some = |segment: &str, ids: &str, next: Option<&str>| {
-            Some((segment.to_owned(), ids.to_owned(), next.map(str::to_owned)))
-        };
-        assert_eq!(page("e1", None, 2), some("e1", "e1,e2", Some("e2")));
-        assert_eq!(page("e1", Some("e2"), 2), some("e1", "e3", None));
+        assert_eq!(run("e1"), Some(("e1".to_owned(), "e1,e2,e3".to_owned())));
         assert_eq!(
-            page("e2", None, 50),
-            some("e1", "e2,e3", None),
-            "an exchange inside a segment pages from itself and names the head"
+            run("e2"),
+            Some(("e1".to_owned(), "e2,e3".to_owned())),
+            "an exchange inside a segment runs from itself and names the head"
         );
-        assert_eq!(page("zz", None, 50), None);
-        assert_eq!(
-            page("e2", Some("e1"), 50),
-            None,
-            "the cursor lies before the page"
-        );
+        assert_eq!(run("zz"), None);
 
-        let segment = segment_page(session.events.clone(), "e1", None, 50).expect("a page");
+        let segment = segment_run(session.events.clone(), "e1").expect("a run");
         let e2 = &segment.exchanges[1];
         assert_eq!(
             (
