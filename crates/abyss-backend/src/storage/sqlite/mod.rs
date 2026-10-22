@@ -2,6 +2,7 @@
 //! the same transactions.
 
 mod connection;
+mod day_offsets;
 mod migrations;
 mod models;
 mod repository;

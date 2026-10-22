@@ -6,9 +6,11 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use diesel::{
     ExpressionMethods, IntoSql, NullableExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl,
     SelectableHelper, SqliteConnection,
+    dsl::{max, min},
     result::OptionalExtension,
     sql_query,
     sql_types::{BigInt, Bool, Nullable, Text},
@@ -40,10 +42,12 @@ use crate::{
             EventLocationResponse, RequestFacts, ResponseFacts, SessionStreamsResponse,
             SessionStructure, StreamEvent,
         },
+        time_zone::parse_time_zone,
     },
 };
 
 use super::{
+    day_offsets::day_offsets_json,
     models::{
         AttachmentRow, DeviceRecord, DeviceRow, EventRecord, EventRow, NewAttachment, NewDevice,
         NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewStreamFacts,
@@ -885,6 +889,7 @@ pub(super) fn usage_summary(
 ) -> Result<SummaryResponse, AppError> {
     let group_by = parse_group_by(query.group_by.as_deref());
     let dimensions = SummaryDimensions::from_group_by(&group_by);
+    let zone = parse_time_zone(query.tz.as_deref())?;
     let owner = load_owner(connection, user_id)?;
     if !owner_matches_filter(user_id, &owner, query.user_filter.as_deref()) {
         return Ok(empty_summary(query, group_by));
@@ -906,6 +911,13 @@ pub(super) fn usage_summary(
         .map(validate_event_type)
         .transpose()?;
     let limit = normalize_limit(query.limit, default_limit, 100_000);
+    let from = query.from.map_or(i64::MIN, timestamp_to_micros);
+    let to = query.to.map_or(i64::MAX, timestamp_to_micros);
+    let day_offsets = if dimensions.enabled(SummaryDimension::Day) {
+        day_offsets(connection, user_id, zone, from, to)?
+    } else {
+        "[]".to_owned()
+    };
 
     // Bind order mirrors the numbered placeholders in the query.
     let rows = sql_query(SUMMARY_AGGREGATE_SQL)
@@ -916,8 +928,8 @@ pub(super) fn usage_summary(
         .bind::<Bool, _>(dimensions.enabled(SummaryDimension::Model))
         .bind::<Bool, _>(dimensions.enabled(SummaryDimension::EventType))
         .bind::<Text, _>(user_id.to_string())
-        .bind::<BigInt, _>(query.from.map_or(i64::MIN, timestamp_to_micros))
-        .bind::<BigInt, _>(query.to.map_or(i64::MAX, timestamp_to_micros))
+        .bind::<BigInt, _>(from)
+        .bind::<BigInt, _>(to)
         .bind::<Bool, _>(has_agents)
         .bind::<Text, _>(&agent_names)
         .bind::<Bool, _>(has_sessions)
@@ -929,6 +941,7 @@ pub(super) fn usage_summary(
         .bind::<Bool, _>(event_type.is_some())
         .bind::<Text, _>(event_type.unwrap_or_default())
         .bind::<BigInt, _>(limit)
+        .bind::<Text, _>(&day_offsets)
         .load::<SummaryAggregateRow>(connection)?;
     let include_user = dimensions.enabled(SummaryDimension::User);
     let rows = rows
@@ -944,6 +957,30 @@ pub(super) fn usage_summary(
     })
 }
 
+/// Day offsets for `zone` across the owner's events observed in `[from, to)`;
+/// see [`day_offsets_json`].
+fn day_offsets(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    zone: Tz,
+    from: i64,
+    to: i64,
+) -> Result<String, AppError> {
+    if zone == Tz::UTC {
+        return day_offsets_json(zone, None);
+    }
+    let (first, last) = llm_usage_events::table
+        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
+        .filter(llm_usage_events::observed_at.ge(from))
+        .filter(llm_usage_events::observed_at.lt(to))
+        .select((
+            min(llm_usage_events::observed_at),
+            max(llm_usage_events::observed_at),
+        ))
+        .first::<(Option<i64>, Option<i64>)>(connection)?;
+    day_offsets_json(zone, first.zip(last))
+}
+
 /// Usage totals grouped in SQL, reading only the columns a summary reports.
 ///
 /// Event text and metadata hold whole request bodies, so loading rows to sum
@@ -955,10 +992,21 @@ pub(super) fn usage_summary(
 /// unconditional so the owner-time index bounds the scan; `?10`..`?17` flags
 /// and JSON value lists for the Agent, session, provider, and model filters,
 /// each matching any listed value; `?18`/`?19` event-type filter; `?20` row
-/// limit.
+/// limit; `?21` the day offsets from [`day_offsets`], read only for the day
+/// dimension.
 const SUMMARY_AGGREGATE_SQL: &str = "\
+    WITH day_offsets(start_us, offset_us) AS MATERIALIZED ( \
+        SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?21) \
+    ) \
     SELECT \
-        CASE WHEN ?1 THEN strftime('%Y-%m-%d', e.observed_at / 1000000, 'unixepoch') END AS day, \
+        CASE WHEN ?1 THEN strftime( \
+            '%Y-%m-%d', \
+            (e.observed_at + ( \
+                SELECT o.offset_us FROM day_offsets o WHERE o.start_us <= e.observed_at \
+                ORDER BY o.start_us DESC LIMIT 1 \
+            )) / 1000000, \
+            'unixepoch' \
+        ) END AS day, \
         CASE WHEN ?2 THEN d.host_name END AS host_name, \
         CASE WHEN ?2 THEN d.platform END AS platform, \
         CASE WHEN ?2 THEN d.os_version END AS os_version, \
@@ -1882,6 +1930,90 @@ mod tests {
             vec![
                 (json!("claude-desktop"), json!(1_i64)),
                 (json!("codex"), json!(1_i64)),
+            ]
+        );
+    }
+
+    /// Token totals of each `day` row, in day order.
+    fn day_totals(rows: &serde_json::Value) -> Vec<(serde_json::Value, serde_json::Value)> {
+        let mut days = rows
+            .as_array()
+            .expect("rows should be an array")
+            .iter()
+            .map(|row| (row["day"].clone(), row["total_tokens"].clone()))
+            .collect::<Vec<_>>();
+        days.sort_by_key(|day| day.0.to_string());
+        days
+    }
+
+    #[test]
+    fn summary_groups_days_in_the_requested_time_zone() {
+        let mut database = summary_seeded();
+
+        let utc = summary(&mut database, json!({"group_by": "day"}));
+        let shanghai = summary(
+            &mut database,
+            json!({"group_by": "day", "tz": "Asia/Shanghai"}),
+        );
+
+        assert_eq!(
+            day_totals(&utc),
+            vec![
+                (json!("2026-09-01"), json!(19_i64)),
+                (json!("2026-09-02"), json!(19_i64)),
+                (json!("2026-09-03"), json!(14_i64)),
+            ]
+        );
+        assert_eq!(
+            day_totals(&shanghai),
+            vec![
+                (json!("2026-09-02"), json!(38_i64)),
+                (json!("2026-09-03"), json!(14_i64)),
+            ]
+        );
+        let query: SummaryQuery = serde_json::from_value(json!({"group_by": "day", "tz": "UTC+8"}))
+            .expect("query should deserialize");
+        assert!(usage_summary(&mut database, &query, OWNER_ID, 500).is_err());
+    }
+
+    #[test]
+    fn summary_days_follow_daylight_saving_changes() {
+        let mut database = database();
+        let event = |id: &str, observed_at: &str| {
+            json!({
+                "event_id": id,
+                "observed_at": observed_at,
+                "device": {"host_name": "alice-mbp", "platform": "macos", "os_version": "15.1"},
+                "agent": {"name": "Codex"},
+                "session_id": "dst",
+                "llm": {"provider": "OpenAI", "model": "gpt-5"},
+                "event_type": "request",
+                "token_usage": {"input_tokens": 1_i64, "total_tokens": 1_i64},
+                "metadata": {"turn_id": id}
+            })
+        };
+        // Los Angeles moves from PST (-8) to PDT (-7) at 2026-03-08T10:00Z.
+        let request: IngestEventsRequest = serde_json::from_value(json!({
+            "events": [
+                event("before", "2026-03-08T07:30:00Z"), // 03-07 23:30 PST
+                event("late", "2026-03-09T06:30:00Z"),   // 03-08 23:30 PDT
+                event("after", "2026-03-09T07:30:00Z"),  // 03-09 00:30 PDT
+            ]
+        }))
+        .expect("request should deserialize");
+        ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+
+        let rows = summary(
+            &mut database,
+            json!({"group_by": "day", "tz": "America/Los_Angeles"}),
+        );
+
+        assert_eq!(
+            day_totals(&rows),
+            vec![
+                (json!("2026-03-07"), json!(1_i64)),
+                (json!("2026-03-08"), json!(1_i64)),
+                (json!("2026-03-09"), json!(1_i64)),
             ]
         );
     }
