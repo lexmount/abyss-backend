@@ -1,7 +1,7 @@
 //! Diesel row and insert models owned by the Agent event service.
 //!
-//! Query models mirror complete table rows because Diesel uses them for typed
-//! selection. Insert models make server-assigned fields explicit and prevent
+//! Query models select the fields each consumer needs through Diesel.
+//! Insert models make server-assigned fields explicit and prevent
 //! HTTP payloads from being written directly without normalization.
 
 use chrono::{DateTime, Utc};
@@ -10,9 +10,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::schema::{
-    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-    devices, llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
-    search_outbox,
+    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, devices,
+    llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events, search_outbox,
 };
 
 #[derive(Clone, Debug, Queryable, Selectable)]
@@ -67,14 +66,10 @@ pub struct NewDevice {
 #[derive(Clone, Debug, Queryable, Selectable)]
 #[diesel(table_name = agent_sessions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-/// Persisted Agent session containing many normalized turns.
+/// Persisted Agent session containing request and response events.
 pub struct AgentSession {
     /// Server-generated session primary key.
     pub id: Uuid,
-    /// Owning user identifier.
-    pub user_id: Uuid,
-    /// Most recently associated device-context key.
-    pub device_context_id: Uuid,
     /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Most recently observed Agent version.
@@ -85,12 +80,6 @@ pub struct AgentSession {
     pub started_at: DateTime<Utc>,
     /// Latest event observation in the session.
     pub ended_at: Option<DateTime<Utc>>,
-    /// Stable allowlisted session metadata.
-    pub metadata: Value,
-    /// Row creation time.
-    pub created_at: DateTime<Utc>,
-    /// Last session metadata update time.
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Insertable)]
@@ -119,57 +108,8 @@ pub struct NewAgentSession {
     pub created_at: DateTime<Utc>,
     /// Initial metadata update time.
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Queryable, Selectable)]
-#[diesel(table_name = agent_turns)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-/// Persisted logical turn within one Agent session.
-pub struct AgentTurn {
-    /// Server-generated turn primary key.
-    pub id: Uuid,
-    /// Owning user identifier.
-    pub user_id: Uuid,
-    /// Parent session primary key.
-    pub session_pk: Uuid,
-    /// Position of the turn in its session by start time.
-    pub turn_index: i32,
-    /// Turn the Agent named for its requests; `None` for the turn opened by
-    /// requests naming none.
-    pub turn_key: Option<String>,
-    /// Earliest event observation in the turn.
-    pub started_at: DateTime<Utc>,
-    /// Latest event observation in the turn.
-    pub ended_at: Option<DateTime<Utc>>,
-    /// Row creation time.
-    pub created_at: DateTime<Utc>,
-    /// Last turn-boundary update time.
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Insertable)]
-#[diesel(table_name = agent_turns)]
-/// Values used to create a logical Agent turn.
-pub struct NewAgentTurn {
-    /// Server-generated turn primary key.
-    pub id: Uuid,
-    /// Owning user identifier.
-    pub user_id: Uuid,
-    /// Parent session primary key.
-    pub session_pk: Uuid,
-    /// Position of the turn in its session by start time.
-    pub turn_index: i32,
-    /// Turn the Agent named for its requests; `None` for the turn opened by
-    /// requests naming none.
-    pub turn_key: Option<String>,
-    /// Initial earliest observation time.
-    pub started_at: DateTime<Utc>,
-    /// Initial latest observation time.
-    pub ended_at: Option<DateTime<Utc>>,
-    /// Row creation time.
-    pub created_at: DateTime<Utc>,
-    /// Initial boundary update time.
-    pub updated_at: DateTime<Utc>,
+    /// Changes whenever ingestion adds an event to the session.
+    pub structure_revision: i64,
 }
 
 #[derive(Clone, Debug, Queryable, Selectable)]
@@ -185,8 +125,6 @@ pub struct UsageEvent {
     pub device_context_id: Uuid,
     /// Parent session primary key.
     pub session_pk: Uuid,
-    /// Parent normalized-turn primary key.
-    pub turn_pk: Uuid,
     /// Collector-generated idempotency key.
     pub event_id: String,
     /// Agent name as reported by the collector.
@@ -195,8 +133,6 @@ pub struct UsageEvent {
     pub agent_version: Option<String>,
     /// Agent-native session identifier copied for direct filtering.
     pub session_id: String,
-    /// Normalized turn number copied for direct filtering.
-    pub turn_index: i32,
     /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
@@ -308,8 +244,6 @@ pub struct NewUsageEvent {
     pub device_context_id: Uuid,
     /// Parent session primary key.
     pub session_pk: Uuid,
-    /// Parent normalized-turn primary key.
-    pub turn_pk: Uuid,
     /// Collector-generated idempotency key.
     pub event_id: String,
     /// Agent name as reported by the collector.
@@ -318,8 +252,6 @@ pub struct NewUsageEvent {
     pub agent_version: Option<String>,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// Backend-normalized turn number.
-    pub turn_index: i32,
     /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.

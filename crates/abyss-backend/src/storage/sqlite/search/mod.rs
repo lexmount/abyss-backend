@@ -31,13 +31,15 @@ use crate::{
             ranking::{MatchedEvent, SearchHit, SessionDetails, is_new, rank_sessions},
         },
     },
-    usage::{UsageEventType, streams::event_segments},
+    storage::stream_cache::StreamCache,
+    usage::UsageEventType,
 };
 
 use super::{
     models::{parse_uuid, timestamp_from_micros},
-    repository::{stream_events, timestamp_to_micros},
+    repository::{session_structure, timestamp_to_micros},
     schema::{agent_sessions, devices, llm_usage_events, search_texts},
+    session_titles,
 };
 
 pub(super) use self::index::{backfill, index_event};
@@ -78,7 +80,17 @@ pub(super) fn session_search(
             .into_iter()
             .filter_map(|(id, text)| Some((id, fragment(&text, &pattern.occurrences(&text))?)))
             .collect();
-        Ok(page.into_response(query, details, &events, &fragments))
+        let mut response = page.into_response(query, details, &events, &fragments);
+        let sessions = response
+            .items
+            .iter()
+            .map(|item| item.session_pk)
+            .collect::<Vec<_>>();
+        let mut titles = session_titles::titles(connection, user_id, &sessions)?;
+        for item in &mut response.items {
+            item.title = titles.remove(&item.session_pk);
+        }
+        Ok(response)
     })
 }
 
@@ -89,6 +101,7 @@ pub(super) fn search_in_session(
     user_id: Uuid,
     session_pk: Uuid,
     query: &InSessionSearchQuery,
+    cache: &StreamCache,
 ) -> Result<InSessionSearchResponse, AppError> {
     let text = query.validate()?;
     let pattern = Pattern::new(&text);
@@ -120,9 +133,9 @@ pub(super) fn search_in_session(
         let matching = ranges.keys().copied().collect::<Vec<_>>();
         let mut hits = hits_in_session(connection, &owner, &session, &matching)?;
         if !hits.is_empty() {
-            let segments = event_segments(stream_events(connection, user_id, session_pk)?);
+            let structure = session_structure(connection, user_id, session_pk, cache)?;
             for hit in &mut hits {
-                hit.segment = segments.get(&hit.event_pk).cloned();
+                hit.segment = structure.event_segment(hit.event_pk).map(str::to_owned);
             }
         }
         Ok(InSessionSearchResponse::from_hits(text, hits, ranges))
@@ -384,28 +397,22 @@ fn matched_events(
         .filter(llm_usage_events::id.eq_any(event_pks.iter().map(Uuid::to_string)))
         .select((
             llm_usage_events::id,
-            llm_usage_events::turn_pk,
-            llm_usage_events::turn_index,
             llm_usage_events::event_type,
             llm_usage_events::llm_provider,
             llm_usage_events::llm_model,
         ))
-        .load::<(String, String, i32, String, String, String)>(connection)?
+        .load::<(String, String, String, String)>(connection)?
         .into_iter()
-        .map(
-            |(id, turn_pk, turn_index, event_type, llm_provider, llm_model)| {
-                Ok((
-                    parse_uuid(&id, "search event id")?,
-                    MatchedEvent {
-                        turn_pk: parse_uuid(&turn_pk, "search turn id")?,
-                        turn_index,
-                        event_type,
-                        llm_provider,
-                        llm_model,
-                    },
-                ))
-            },
-        )
+        .map(|(id, event_type, llm_provider, llm_model)| {
+            Ok((
+                parse_uuid(&id, "search event id")?,
+                MatchedEvent {
+                    event_type,
+                    llm_provider,
+                    llm_model,
+                },
+            ))
+        })
         .collect()
 }
 

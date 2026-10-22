@@ -66,7 +66,7 @@ pub struct SessionStreamsResponse {
     pub segments: Vec<StreamSegment>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// A run of exchanges along one stream.
 pub struct StreamSegment {
     /// Id of the segment's first exchange, which identifies the segment.
@@ -87,7 +87,7 @@ pub struct StreamSegment {
     pub label: Option<EntryLabel>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 /// Where a request's new user words are, and how they begin: the last
 /// `user` entry with text in its new part.
 pub struct EntryLabel {
@@ -101,20 +101,43 @@ pub struct EntryLabel {
     pub length: i32,
 }
 
-/// Exchanges of one session, the base of each, and the segments they form.
-struct Streams {
+impl EntryLabel {
+    /// A session title or segment label from the same stored request facts.
+    pub fn from_columns(
+        event_pk: Option<Uuid>,
+        entry_index: Option<i32>,
+        text: Option<String>,
+        length: Option<i32>,
+    ) -> Option<Self> {
+        let label = Label::from_columns(entry_index, text, length)?;
+        Some(Self {
+            event_pk: event_pk?,
+            entry_index: label.index,
+            text: label.text,
+            length: label.length,
+        })
+    }
+}
+
+/// Immutable structure of one session at one stored revision. Contains stream
+/// facts and short labels, never event bodies. Share it through `Arc`.
+pub struct SessionStructure {
     exchanges: Vec<Exchange>,
     bases: Vec<Result<(usize, BaseRule), NoBaseReason>>,
     segmentation: Segmentation,
+    segments: Vec<StreamSegment>,
+    summary: StreamSummary,
+    exchange_by_id: HashMap<String, usize>,
+    event_to_exchange: HashMap<Uuid, usize>,
 }
 
-impl Streams {
+impl SessionStructure {
     /// Derives the streams of one session from its events.
     ///
     /// `events` are the session's events in session order: observation time,
     /// request before response, then primary key.
-    fn derive(events: Vec<StreamEvent>) -> Self {
-        let exchanges = group_exchanges(events);
+    pub fn derive(events: Vec<StreamEvent>) -> Self {
+        let mut exchanges = group_exchanges(events);
         let by_response_id = exchanges
             .iter()
             .enumerate()
@@ -125,11 +148,118 @@ impl Streams {
             .map(|index| find_base(index, &exchanges, &by_response_id, &by_id))
             .collect::<Vec<_>>();
         let segmentation = Segmentation::cut(&exchanges, &bases);
-        Self {
+        let summary = StreamSummary {
+            exchanges: exchanges.len(),
+            turns: exchanges
+                .iter()
+                .filter(|exchange| exchange.starts_turn())
+                .count(),
+            segments: segmentation.segments.len(),
+        };
+        let mut exchange_by_id = HashMap::with_capacity(exchanges.len());
+        for (index, exchange) in exchanges.iter().enumerate() {
+            exchange_by_id.entry(exchange.id.clone()).or_insert(index);
+        }
+        let event_to_exchange = exchanges
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(index, exchange)| {
+                std::mem::take(&mut exchange.event_pks)
+                    .into_iter()
+                    .map(move |pk| (pk, index))
+            })
+            .collect();
+        let mut structure = Self {
             exchanges,
             bases,
             segmentation,
+            segments: Vec::new(),
+            summary,
+            exchange_by_id,
+            event_to_exchange,
+        };
+        structure.segments = structure
+            .segmentation
+            .segments
+            .iter()
+            .map(|segment| structure.segment(segment))
+            .collect();
+        structure
+    }
+
+    /// The cached counts; no exchange traversal is needed.
+    pub const fn summary(&self) -> StreamSummary {
+        self.summary
+    }
+
+    /// Copies only the segment metadata returned by the stream endpoint.
+    pub fn session_streams(&self, session_pk: Uuid) -> SessionStreamsResponse {
+        SessionStreamsResponse {
+            session_pk,
+            segments: self.segments.clone(),
         }
+    }
+
+    /// Exchanges from `from` to the end of the segment currently holding it.
+    pub fn segment_run(&self, from: &str) -> Option<SegmentRun> {
+        let from = *self.exchange_by_id.get(from)?;
+        let segment = self.segmentation.segment_of[from];
+        let members = &self.segmentation.segments[segment].exchanges;
+        let at = members.iter().position(|&exchange| exchange == from)?;
+        Some(SegmentRun {
+            segment: self.segment_head(segment).to_owned(),
+            exchanges: members[at..]
+                .iter()
+                .map(|&exchange| self.exchange(exchange))
+                .collect(),
+        })
+    }
+
+    /// Current segment and exchange of a stable event anchor.
+    pub fn event_position(&self, event_pk: Uuid) -> Option<EventLocation> {
+        let exchange = *self.event_to_exchange.get(&event_pk)?;
+        let segment = self.segmentation.segment_of[exchange];
+        Some(EventLocation {
+            segment: self.segment_head(segment).to_owned(),
+            segment_index: segment.saturating_add(1),
+            segment_kind: self.segments[segment].kind,
+            exchange: self.exchanges[exchange].id.clone(),
+        })
+    }
+
+    /// Location endpoint response, with the event and session identities.
+    pub fn event_location(
+        &self,
+        session_pk: Uuid,
+        event_pk: Uuid,
+    ) -> Option<EventLocationResponse> {
+        Some(EventLocationResponse {
+            session_pk,
+            event_pk,
+            location: self.event_position(event_pk)?,
+        })
+    }
+
+    /// Segment of one event, without building a map for unrelated events.
+    #[cfg(feature = "sqlite-fts")]
+    pub fn event_segment(&self, event_pk: Uuid) -> Option<&str> {
+        let exchange = *self.event_to_exchange.get(&event_pk)?;
+        Some(self.segment_head(self.segmentation.segment_of[exchange]))
+    }
+
+    /// Segment heads of the events that participate in the derived exchanges.
+    #[cfg(test)]
+    pub fn event_segments(&self) -> HashMap<Uuid, String> {
+        self.event_to_exchange
+            .iter()
+            .map(|(&pk, &exchange)| {
+                (
+                    pk,
+                    self.segment_head(self.segmentation.segment_of[exchange])
+                        .to_owned(),
+                )
+            })
+            .collect()
     }
 
     /// The label of an exchange's request.
@@ -182,44 +312,40 @@ impl Streams {
 ///
 /// `events` are the session's events in session order: observation time,
 /// request before response, then primary key.
+#[cfg(test)]
 pub fn session_streams(session_pk: Uuid, events: Vec<StreamEvent>) -> SessionStreamsResponse {
-    let streams = Streams::derive(events);
-    let segments = streams
-        .segmentation
-        .segments
-        .iter()
-        .map(|segment| streams.segment(segment))
-        .collect();
-    SessionStreamsResponse {
-        session_pk,
-        segments,
-    }
+    SessionStructure::derive(events).session_streams(session_pk)
 }
 
-/// How many exchanges, turns, and segments one session's events form, and
-/// the new user words of its first request.
-#[derive(Debug)]
+/// How many exchanges, turns, and segments one session's events form.
+#[derive(Clone, Copy, Debug)]
 pub struct StreamSummary {
     pub exchanges: usize,
     /// Requests that open a turn.
     pub turns: usize,
     pub segments: usize,
-    pub title: Option<EntryLabel>,
 }
 
-/// Sums up the streams of one session's events.
-pub fn stream_summary(events: Vec<StreamEvent>) -> StreamSummary {
-    let streams = Streams::derive(events);
-    StreamSummary {
-        title: streams.label(0),
-        exchanges: streams.exchanges.len(),
-        turns: streams
-            .exchanges
-            .iter()
-            .filter(|exchange| exchange.starts_turn())
-            .count(),
-        segments: streams.segmentation.segments.len(),
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// The current position of an event in its session's stream view.
+pub struct EventLocation {
+    /// The current segment head; it can change when a later fork is observed.
+    pub segment: String,
+    /// One-based position in the session's `streams.segments` array.
+    pub segment_index: usize,
+    /// Why this segment begins.
+    pub segment_kind: SegmentKind,
+    /// The exchange containing the event.
+    pub exchange: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+/// The current location of an event in its owner's session structure.
+pub struct EventLocationResponse {
+    pub session_pk: Uuid,
+    pub event_pk: Uuid,
+    #[serde(flatten)]
+    pub location: EventLocation,
 }
 
 #[derive(Debug, Serialize)]
@@ -255,57 +381,27 @@ pub struct SegmentRun {
 
 /// The exchanges of the segment holding exchange `from`, from it to the
 /// segment's end. `None` when the session has no such exchange.
+#[cfg(test)]
 pub fn segment_run(events: Vec<StreamEvent>, from: &str) -> Option<SegmentRun> {
-    let streams = Streams::derive(events);
-    let from = streams
-        .exchanges
-        .iter()
-        .position(|exchange| exchange.id == from)?;
-    let segment = streams.segmentation.segment_of[from];
-    let members = &streams.segmentation.segments[segment].exchanges;
-    let at = members.iter().position(|&exchange| exchange == from)?;
-    Some(SegmentRun {
-        segment: streams.segment_head(segment),
-        exchanges: members[at..]
-            .iter()
-            .map(|&exchange| streams.exchange(exchange))
-            .collect(),
-    })
+    SessionStructure::derive(events).segment_run(from)
 }
 
 /// The head of the segment holding each event's exchange, by event primary
-/// key, as [`session_streams`] and [`segment_run`] derive them. An event in no
-/// exchange is left out.
-#[cfg_attr(
-    all(feature = "postgres-es", not(test)),
-    expect(
-        dead_code,
-        reason = "only the SQLite profile searches within a session"
-    )
-)]
+/// key, including additional events of an exchange's already populated side.
+#[cfg(test)]
 pub fn event_segments(events: Vec<StreamEvent>) -> HashMap<Uuid, String> {
-    let streams = Streams::derive(events);
-    let mut segments = HashMap::new();
-    for (index, exchange) in streams.exchanges.iter().enumerate() {
-        let head = streams.segment_head(streams.segmentation.segment_of[index]);
-        let request = exchange.request.as_ref().map(|request| request.pk);
-        let response = exchange.response.as_ref().map(|response| response.pk);
-        for pk in request.into_iter().chain(response) {
-            segments.insert(pk, head.clone());
-        }
-    }
-    segments
+    SessionStructure::derive(events).event_segments()
 }
 
-impl Streams {
+impl SessionStructure {
     /// Id of a segment's first exchange.
-    fn segment_head(&self, segment: usize) -> String {
+    fn segment_head(&self, segment: usize) -> &str {
         let head = self.segmentation.segments[segment]
             .exchanges
             .first()
             .copied()
             .unwrap_or_default();
-        self.exchanges[head].id.clone()
+        &self.exchanges[head].id
     }
 
     fn exchange(&self, index: usize) -> SegmentExchange {
@@ -317,7 +413,10 @@ impl Streams {
             request_pk: request.map(|request| request.pk),
             response_pk: exchange.response.as_ref().map(|response| response.pk),
             base: base.map(|base| self.exchanges[base].id.clone()),
-            base_segment: base.map(|base| self.segment_head(self.segmentation.segment_of[base])),
+            base_segment: base.map(|base| {
+                self.segment_head(self.segmentation.segment_of[base])
+                    .to_owned()
+            }),
             rule: self.bases[index].ok().map(|(_, rule)| rule),
             no_base_reason: self.bases[index].err(),
             new_from: request.map(|request| request.facts.new_from),
@@ -463,7 +562,7 @@ mod tests {
             &json!([user("unrelated")]),
             &json!([assistant("ok")]),
         );
-        // A second request of exchange e3 joins no exchange.
+        // A second request maps to e3 even though its content is not selected.
         session.ask("e3", 4, None, &json!([user("again")]));
         let segments = event_segments(session.events.clone());
         let heads = session
@@ -480,7 +579,7 @@ mod tests {
                 Some("e1"),
                 Some("e3"),
                 Some("e3"),
-                None
+                Some("e3")
             ]
         );
     }

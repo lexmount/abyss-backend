@@ -54,6 +54,9 @@ pub(super) struct Side<F> {
 pub(super) struct Exchange {
     pub(super) id: String,
     pub(super) response_id: Option<String>,
+    /// Every event grouped into the exchange, including duplicate sides.
+    /// Consumed when the session structure builds its event lookup.
+    pub(super) event_pks: Vec<Uuid>,
     /// Request time, else response time.
     pub(super) at: DateTime<Utc>,
     /// Latest event time.
@@ -66,6 +69,7 @@ impl Exchange {
     /// Adds `event` unless the exchange already has an event of its side.
     fn add(&mut self, event: StreamEvent) {
         let (pk, previous_response_id) = (event.pk, event.previous_response_id);
+        self.event_pks.push(pk);
         self.end = self.end.max(event.observed_at);
         match event.facts {
             EventFacts::Request(facts) if self.request.is_none() => {
@@ -115,6 +119,7 @@ pub(super) fn group_exchanges(events: Vec<StreamEvent>) -> Vec<Exchange> {
             exchanges.push(Exchange {
                 id,
                 response_id: event.response_id.clone(),
+                event_pks: Vec::new(),
                 at: event.observed_at,
                 end: event.observed_at,
                 request: None,

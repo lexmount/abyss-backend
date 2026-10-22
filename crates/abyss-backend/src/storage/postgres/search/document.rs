@@ -25,10 +25,6 @@ pub struct SearchDocument {
     pub session_pk: Uuid,
     /// Agent-native session identifier searchable as text and keyword.
     pub session_id: String,
-    /// Parent turn primary key.
-    pub turn_pk: Uuid,
-    /// Backend-normalized turn number.
-    pub turn_index: i32,
     /// Agent name as reported by the collector, used for exact filtering.
     pub agent_name: String,
     /// LLM provider as reported by the collector, used for exact filtering.
@@ -60,8 +56,6 @@ impl SearchDocument {
             user_id: event.user_id,
             session_pk: event.session_pk,
             session_id: sanitize_search_text(&event.session_id),
-            turn_pk: event.turn_pk,
-            turn_index: event.turn_index,
             agent_name: event.agent_name,
             llm_provider: event.llm_provider,
             llm_model: event.llm_model,
@@ -157,12 +151,10 @@ mod tests {
             user_id: Uuid::now_v7(),
             device_context_id: Uuid::now_v7(),
             session_pk: Uuid::now_v7(),
-            turn_pk: Uuid::now_v7(),
             event_id: "event-1".to_owned(),
             agent_name: "codex".to_owned(),
             agent_version: None,
             session_id: "session-1".to_owned(),
-            turn_index: 1,
             llm_provider: "openai".to_owned(),
             llm_model: "gpt-5".to_owned(),
             event_type: "request".to_owned(),

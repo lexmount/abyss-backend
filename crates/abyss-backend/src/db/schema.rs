@@ -28,7 +28,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::{Jsonb, Nullable, Text, Timestamptz, Uuid};
+    use diesel::sql_types::{BigInt, Jsonb, Nullable, Text, Timestamptz, Uuid};
 
     agent_sessions (id) {
         id -> Uuid,
@@ -42,22 +42,7 @@ diesel::table! {
         metadata -> Jsonb,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid};
-
-    agent_turns (id) {
-        id -> Uuid,
-        user_id -> Uuid,
-        session_pk -> Uuid,
-        turn_index -> Integer,
-        turn_key -> Nullable<Text>,
-        started_at -> Timestamptz,
-        ended_at -> Nullable<Timestamptz>,
-        created_at -> Timestamptz,
-        updated_at -> Timestamptz,
+        structure_revision -> BigInt,
     }
 }
 
@@ -69,12 +54,10 @@ diesel::table! {
         user_id -> Uuid,
         device_context_id -> Uuid,
         session_pk -> Uuid,
-        turn_pk -> Uuid,
         event_id -> Text,
         agent_name -> Text,
         agent_version -> Nullable<Text>,
         session_id -> Text,
-        turn_index -> Integer,
         llm_provider -> Text,
         llm_model -> Text,
         event_type -> Text,
@@ -191,11 +174,8 @@ diesel::table! {
 
 diesel::joinable!(agent_sessions -> app_users (user_id));
 diesel::joinable!(agent_sessions -> devices (device_context_id));
-diesel::joinable!(agent_turns -> agent_sessions (session_pk));
-diesel::joinable!(agent_turns -> app_users (user_id));
 diesel::joinable!(devices -> app_users (user_id));
 diesel::joinable!(llm_usage_events -> agent_sessions (session_pk));
-diesel::joinable!(llm_usage_events -> agent_turns (turn_pk));
 diesel::joinable!(llm_usage_events -> app_users (user_id));
 diesel::joinable!(llm_usage_events -> devices (device_context_id));
 diesel::joinable!(llm_usage_event_attachments -> app_users (user_id));
@@ -212,7 +192,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_capture_events,
     agent_diagnostic_captures,
     agent_sessions,
-    agent_turns,
     app_users,
     devices,
     llm_usage_events,

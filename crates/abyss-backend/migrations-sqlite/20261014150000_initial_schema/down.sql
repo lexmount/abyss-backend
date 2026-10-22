@@ -4,7 +4,6 @@ DROP TABLE agent_diagnostic_capture_events;
 DROP TABLE agent_diagnostic_captures;
 DROP TABLE llm_usage_event_attachments;
 DROP TABLE llm_usage_events;
-DROP TABLE agent_turns;
 DROP TABLE agent_sessions;
 DROP TABLE devices;
 DROP TABLE app_users;

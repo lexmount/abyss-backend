@@ -27,9 +27,6 @@ pub struct Entry {
     /// Identifier pairing a tool call with its result; tool entries only.
     #[serde(default)]
     pub call_id: Option<String>,
-    /// Tool name; tool calls only.
-    #[serde(default)]
-    pub name: Option<String>,
     /// Identity of the item the entry belongs to, as the traffic carries it.
     #[serde(default)]
     pub item_id: Option<String>,
@@ -70,10 +67,7 @@ mod tests {
             ["reasoning", "some_new_role", "tool_call", "user"]
         );
         let call = &conversation.entries[2];
-        assert_eq!(
-            (call.call_id.as_deref(), call.name.as_deref()),
-            (Some("call_1"), Some("exec"))
-        );
+        assert_eq!(call.call_id.as_deref(), Some("call_1"));
     }
 
     #[test]

@@ -3,13 +3,16 @@
 use chrono::{DateTime, Utc};
 use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
-    sql_types::{Array, BigInt, Bool, Nullable, Text, Timestamptz, Uuid as SqlUuid},
+    sql_types::{Array, BigInt, Bool, Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid},
 };
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    usage::session_list::{SessionListItem, SessionListResponse, ValidatedSessionListQuery},
+    usage::{
+        session_list::{SessionListItem, SessionListResponse, ValidatedSessionListQuery},
+        streams::EntryLabel,
+    },
 };
 
 /// Per-session activity with the filters that apply before paging.
@@ -29,14 +32,20 @@ const ACTIVITY_CTE: &str = "\
             s.started_at AS started_at, \
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
-            (SELECT COUNT(*) FROM agent_turns t WHERE t.session_pk = s.id)::bigint AS turns, \
+            (SELECT COUNT(*) FROM llm_usage_events te \
+             JOIN llm_usage_event_stream_facts tf ON tf.event_pk = te.id \
+             WHERE te.session_pk = s.id AND tf.starts_turn)::bigint AS turns, \
             COUNT(e.id)::bigint AS events, \
             COALESCE(SUM(e.total_tokens), 0)::bigint AS total_tokens, \
-            st.title AS title, \
+            st.title_event_pk AS title_event_pk, \
+            title_facts.label_index AS title_entry_index, \
+            title_facts.label_text AS title_text, \
+            title_facts.label_length AS title_length, \
             st.purpose AS purpose \
         FROM agent_sessions s \
         JOIN devices d ON d.id = s.device_context_id \
         LEFT JOIN session_titles st ON st.session_pk = s.id \
+        LEFT JOIN llm_usage_event_stream_facts title_facts ON title_facts.event_pk = st.title_event_pk \
         LEFT JOIN llm_usage_events e ON e.session_pk = s.id \
         WHERE s.user_id = $1 \
             AND ($2 = false OR s.agent_name = ANY($3)) \
@@ -46,7 +55,8 @@ const ACTIVITY_CTE: &str = "\
             AND ($10 = false OR EXISTS ( \
                 SELECT 1 FROM llm_usage_events m \
                 WHERE m.session_pk = s.id AND m.llm_model = ANY($11))) \
-        GROUP BY s.id, d.host_name, d.platform, st.title, st.purpose \
+        GROUP BY s.id, d.host_name, d.platform, st.title_event_pk, \
+                 title_facts.label_index, title_facts.label_text, title_facts.label_length, st.purpose \
     ), \
     filtered AS ( \
         SELECT * FROM activity \
@@ -80,8 +90,14 @@ struct SessionListRow {
     events: i64,
     #[diesel(sql_type = BigInt)]
     total_tokens: i64,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    title_event_pk: Option<Uuid>,
+    #[diesel(sql_type = Nullable<Integer>)]
+    title_entry_index: Option<i32>,
     #[diesel(sql_type = Nullable<Text>)]
-    title: Option<String>,
+    title_text: Option<String>,
+    #[diesel(sql_type = Nullable<Integer>)]
+    title_length: Option<i32>,
     #[diesel(sql_type = Nullable<Text>)]
     purpose: Option<String>,
 }
@@ -152,7 +168,12 @@ pub(super) fn list_sessions(
             turns: row.turns,
             events: row.events,
             total_tokens: row.total_tokens,
-            title: row.title,
+            title: EntryLabel::from_columns(
+                row.title_event_pk,
+                row.title_entry_index,
+                row.title_text,
+                row.title_length,
+            ),
             purpose: row.purpose,
         })
         .collect();

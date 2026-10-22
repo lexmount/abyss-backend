@@ -43,22 +43,7 @@ diesel::table! {
         metadata -> Text,
         created_at -> BigInt,
         updated_at -> BigInt,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::{BigInt, Integer, Nullable, Text};
-
-    agent_turns (id) {
-        id -> Text,
-        user_id -> Text,
-        session_pk -> Text,
-        turn_index -> Integer,
-        turn_key -> Nullable<Text>,
-        started_at -> BigInt,
-        ended_at -> Nullable<BigInt>,
-        created_at -> BigInt,
-        updated_at -> BigInt,
+        structure_revision -> BigInt,
     }
 }
 
@@ -70,12 +55,10 @@ diesel::table! {
         user_id -> Text,
         device_context_id -> Text,
         session_pk -> Text,
-        turn_pk -> Text,
         event_id -> Text,
         agent_name -> Text,
         agent_version -> Nullable<Text>,
         session_id -> Text,
-        turn_index -> Integer,
         llm_provider -> Text,
         llm_model -> Text,
         event_type -> Text,
@@ -195,11 +178,8 @@ diesel::table! {
 
 diesel::joinable!(agent_sessions -> app_users (user_id));
 diesel::joinable!(agent_sessions -> devices (device_context_id));
-diesel::joinable!(agent_turns -> agent_sessions (session_pk));
-diesel::joinable!(agent_turns -> app_users (user_id));
 diesel::joinable!(devices -> app_users (user_id));
 diesel::joinable!(llm_usage_events -> agent_sessions (session_pk));
-diesel::joinable!(llm_usage_events -> agent_turns (turn_pk));
 diesel::joinable!(llm_usage_events -> app_users (user_id));
 diesel::joinable!(llm_usage_events -> devices (device_context_id));
 diesel::joinable!(llm_usage_event_attachments -> app_users (user_id));
@@ -216,7 +196,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_capture_events,
     agent_diagnostic_captures,
     agent_sessions,
-    agent_turns,
     app_users,
     devices,
     llm_usage_events,

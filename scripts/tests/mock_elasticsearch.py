@@ -198,8 +198,6 @@ def collapsed_hit(
             {
                 "_source": {
                     "event_pk": event["event_pk"],
-                    "turn_pk": event["turn_pk"],
-                    "turn_index": event["turn_index"],
                     "event_type": event["event_type"],
                     "llm_provider": event["llm_provider"],
                     "llm_model": event["llm_model"],

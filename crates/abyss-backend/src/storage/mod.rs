@@ -5,10 +5,12 @@
 //! connection pools, SQL dialects, search projection, and worker lifecycle out
 //! of the API layer.
 
+mod event_locations;
 #[cfg(feature = "postgres-es")]
 mod postgres;
 #[cfg(feature = "sqlite-fts")]
 mod sqlite;
+mod stream_cache;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -21,15 +23,14 @@ use crate::{
         InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
     },
     usage::{
-        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        UsageEventResponse,
+        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse, SummaryQuery,
+        SummaryResponse, UsageEventResponse,
         attachments::StoredImageAttachment,
         preview::{ConversationPreview, Window},
         segments::{SegmentResponse, ValidatedSegmentQuery},
         session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
-        streams::SessionStreamsResponse,
+        streams::{EventLocationResponse, SessionStreamsResponse},
     },
 };
 
@@ -64,6 +65,13 @@ pub trait StorageBackend: Send + Sync {
         event_pk: Uuid,
     ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>>;
 
+    /// Resolves a stable event identifier to its current session segment and exchange.
+    fn event_location(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<EventLocationResponse, AppError>>;
+
     /// Aggregates owner-scoped event and token usage.
     fn usage_summary(
         &self,
@@ -71,20 +79,6 @@ pub trait StorageBackend: Send + Sync {
         query: SummaryQuery,
         summary_limit: i64,
     ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>>;
-
-    /// Loads one owner-scoped session timeline.
-    fn session_timeline(
-        &self,
-        user_id: Uuid,
-        session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>>;
-
-    /// Loads one owner-scoped session timeline without event content bodies.
-    fn session_outline(
-        &self,
-        user_id: Uuid,
-        session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>>;
 
     /// The header of an owner-scoped session; not found when the owner has
     /// no event in it.

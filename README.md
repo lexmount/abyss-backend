@@ -2,7 +2,7 @@
 
 `abyss-backend` is the open-source, self-hostable Agent event store for Abyss.
 It accepts normalized Agent events and exposes APIs for event history,
-summaries, session timelines, attachments, and session search.
+summaries, session streams, attachments, and session search.
 
 This repository is intentionally focused on standalone event storage, queries,
 and search.
@@ -10,22 +10,56 @@ and search.
 ## Capabilities
 
 - Idempotent Agent event ingestion and raw event queries.
-- Token-usage summaries and ordered session timelines.
+- Token-usage summaries and derived session streams.
 - Validated image attachment storage and authorized download.
 - Session search through Elasticsearch or an embedded SQLite trigram index,
   and, with SQLite, search within one session.
 - Health and storage-readiness probes.
 - Embedded migrations for both supported storage profiles.
 
-A session is titled by the `session_title` the collector reports for a call in
-which the Agent names its own session (Claude Code); otherwise by its first
-nonempty user input, collapsed to one line and truncated to 80 characters with
-an ellipsis. An Agent title is never replaced by a default title. Requests whose
-`purpose` marks them as naming calls are not user input. Codex names tasks from
-separate threads that do not say which session they name; those threads are
-marked `title_generation` from their `thread_source` and are not linked to a
-task. Naming calls retain their own events and usage. Existing sessions receive
-default titles through a one-time backfill.
+Every session view uses the same stored title: the first nonempty `user` entry
+of the earliest readable request, ordered by observation time and event primary
+key. Whitespace is collapsed to one line. The title is at most 80 Unicode scalar
+values; longer input becomes its first 79 characters plus `…`. Empty or
+incomplete conversations provide no title, and later delivery of an earlier
+request corrects it. Collector-generated titles and naming flags do not change
+this rule. Stream segment labels retain their separate role of showing the new
+user text of that segment; they do not name sessions.
+
+The session header's `title` is a string or `null`, just like the session list
+and legacy session APIs. Upgrade the dashboard alongside the backend.
+
+The schema changes are consolidated into the existing migrations:
+`20261014150000_initial_schema` defines sessions with `structure_revision` and
+omits the retired turn hierarchy; `20261019120000_event_stream_facts` still
+creates stream facts and the search projection. There are no separate title or
+turn-removal migration versions.
+
+When the backend first applies `20261019120000_event_stream_facts`, its Rust
+migration runner also rebuilds the title cache with the same function as ingest.
+Run this migration through the backend; applying its SQL alone does not rebuild
+titles. The facts migration marker, its SQL, and the title rebuild share a
+transaction, so failure preserves the previous cache and schema and retries on
+next startup. Only one event body is read at a time, stopping at the first
+readable user input in each session. Existing titles and naming classifications
+are replaced; sessions without complete `conversation.entries` remain untitled.
+Subsequent startup and page reads do not rescan event bodies for titles.
+
+Existing databases require separate handling: an already recorded migration is
+not reapplied when its source SQL changes. A database with the old turn schema
+must have its physical schema updated, including the event columns, dependent
+indexes and foreign keys, the retired turn table, and the session revision
+column. Its stored titles must also be explicitly rebuilt if the facts
+migration is already recorded. Changing migration-history rows alone performs
+neither operation; deleting the facts record while its tables still exist makes
+its table-creation SQL fail. Shared databases using the old schema are not
+upgraded by this consolidation and must not be pointed at the new backend until
+that schema and title maintenance is complete.
+
+For databases already upgraded to the final schema with their titles rebuilt,
+removing the obsolete `20261022130000` and `20261022140000` history rows is only
+bookkeeping. Confirm those physical changes first and retain the initial-schema
+and facts migration records.
 
 Exactly one storage profile is compiled into a binary:
 
@@ -98,14 +132,58 @@ curl \
 | `GET` | `/readyz` | Selected storage readiness. |
 | `POST` | `/v1/agent-usage/events` | Ingest events and correlated diagnostic captures. |
 | `GET` | `/v1/agent-usage/events` | Query raw events. |
+| `GET` | `/v1/agent-usage/events/{event_pk}/location` | Resolve an event to its current session, segment, and exchange. |
 | `GET` | `/v1/agent-usage/attachments/{id}` | Download stored image content. |
 | `GET` | `/v1/agent-usage/summary` | Aggregate event and token usage. |
-| `GET` | `/v1/agent-usage/sessions/{id}` | Read an ordered session timeline. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/header` | Session title, counts, and token totals. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/streams` | Read the session’s derived segments. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/segments/{head}` | Read one segment’s exchanges. |
 | `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session (SQLite). |
 
+The retired session timeline, outline, and trajectory endpoints have been removed.
+Events and search matches no longer carry `turn_pk` or `turn_index`, and raw
+queries no longer filter on a stored turn number. Turn counts use the request’s
+persisted `starts_turn` fact. The initial schema now omits the old turn hierarchy
+and its event columns and includes the session revision that advances when
+ingestion adds an event. Event IDs, content, attachments, stream facts, and
+search references retain their roles. Existing databases need the explicit
+schema and title maintenance described above; there is no automatic standalone
+turn-removal migration.
+
 Every `/v1/agent-usage/*` endpoint requires the bearer token. Health and
 readiness endpoints are unauthenticated for orchestrator probes.
+
+### Session structure and event links
+
+The header, streams, segment details, in-session search, and event location
+share one immutable derived structure for an owner/session/revision. The
+process retains up to 128 idle revisions with LRU eviction. Concurrent reads
+of the same revision share the load and derivation; a cache hit reads the
+session revision without loading stream facts again. Event bodies are not
+stored in this cache.
+
+Ingestion advances `agent_sessions.structure_revision` within its existing
+session update and event transaction. Structure readers load the revision and
+facts from the same database snapshot (a read transaction in SQLite, read-only
+repeatable read in PostgreSQL). On a new revision or after eviction/restart,
+the first read derives the full structure again. This is a shared query cache,
+not an incremental derivation at ingest time.
+
+Stable links retain `event_pk`. The location endpoint returns
+`{"session_pk", "event_pk", "segment", "segment_index", "segment_kind", "exchange"}` using the current structure,
+and returns 404 for an event outside the authenticated owner's data. A later
+fork can change an event's segment, so links resolve the event when opened.
+Segment IDs remain their first exchange IDs; a segment is not a turn number.
+
+`GET /events?locate=true` includes a `location` object on each returned event;
+the list projection also preserves it. Session-search matches and the single
+event endpoint include the same object: `{segment, segment_index, segment_kind,
+exchange}`. `segment_index` is the current one-based position in the session's
+segment list, for display only. A response page looks up each session structure
+once, sharing the cache with the detail view. The dashboard uses these values
+in its segment column, search-hit labels, and inspector properties without
+sending a separate location request for every row.
 
 ### Search
 
@@ -313,4 +391,4 @@ make k8s-render
 The PostgreSQL case starts an ephemeral container and an Elasticsearch contract
 double; the SQLite case uses only a temporary local database file. Both verify
 schema creation, authentication, event ingestion, attachment retrieval, raw
-diagnostic retention, summary, timeline, and search behavior.
+diagnostic retention, summary, streams, and search behavior.

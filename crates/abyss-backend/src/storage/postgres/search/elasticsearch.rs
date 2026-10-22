@@ -239,10 +239,6 @@ pub struct SessionMatches {
 pub struct MatchedEvent {
     /// Backend event primary key.
     pub event_pk: Uuid,
-    /// Backend turn primary key.
-    pub turn_pk: Uuid,
-    /// Normalized turn number.
-    pub turn_index: i32,
     /// Request or response side.
     pub event_type: String,
     /// LLM provider as reported by the collector.
@@ -290,8 +286,6 @@ fn index_definition() -> Value {
                 "user_id": {"type": "keyword"},
                 "session_pk": {"type": "keyword"},
                 "session_id": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
-                "turn_pk": {"type": "keyword"},
-                "turn_index": {"type": "integer"},
                 "agent_name": {"type": "keyword"},
                 "llm_provider": {"type": "keyword"},
                 "llm_model": {"type": "keyword"},
@@ -356,8 +350,6 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
                 "size": 3,
                 "_source": [
                     "event_pk",
-                    "turn_pk",
-                    "turn_index",
                     "event_type",
                     "llm_provider",
                     "llm_model",
@@ -540,8 +532,6 @@ struct RawMatchedHit {
 #[derive(Deserialize)]
 struct RawMatchedSource {
     event_pk: Uuid,
-    turn_pk: Uuid,
-    turn_index: i32,
     event_type: String,
     llm_provider: String,
     llm_model: String,
@@ -572,8 +562,6 @@ impl TryFrom<RawSearchResponse> for SearchMatchPage {
                     .iter()
                     .map(|event| MatchedEvent {
                         event_pk: event.source.event_pk,
-                        turn_pk: event.source.turn_pk,
-                        turn_index: event.source.turn_index,
                         event_type: event.source.event_type.clone(),
                         llm_provider: event.source.llm_provider.clone(),
                         llm_model: event.source.llm_model.clone(),
@@ -672,7 +660,6 @@ mod tests {
     fn parses_collapsed_hits_and_highlights() {
         let session_pk = Uuid::now_v7();
         let event_pk = Uuid::now_v7();
-        let turn_pk = Uuid::now_v7();
         let response = serde_json::from_value::<RawSearchResponse>(json!({
             "aggregations": {"session_count": {"value": 1_u64}},
             "hits": {"hits": [{
@@ -682,8 +669,6 @@ mod tests {
                     "hits": [{
                         "_source": {
                             "event_pk": event_pk,
-                            "turn_pk": turn_pk,
-                            "turn_index": 4_i32,
                             "event_type": "response",
                             "llm_provider": "openai",
                             "llm_model": "gpt-5",

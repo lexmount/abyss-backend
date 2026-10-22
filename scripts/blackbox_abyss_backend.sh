@@ -155,8 +155,8 @@ cargo "${CARGO_RUN_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 wait_for_backend
 
-EXPECTED_TABLES="$(query_database "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('app_users', 'devices', 'agent_sessions', 'agent_turns', 'llm_usage_events', 'llm_usage_event_attachments', 'agent_diagnostic_captures', 'agent_diagnostic_capture_events', 'search_outbox');")"
-[[ "${EXPECTED_TABLES}" == "9" ]] || fail "the consolidated migration did not create all event-store tables"
+EXPECTED_TABLES="$(query_database "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('app_users', 'devices', 'agent_sessions', 'llm_usage_events', 'llm_usage_event_attachments', 'agent_diagnostic_captures', 'agent_diagnostic_capture_events', 'search_outbox');")"
+[[ "${EXPECTED_TABLES}" == "8" ]] || fail "the consolidated migration did not create all event-store tables"
 
 python3 scripts/tests/blackbox_api.py \
   --base-url "${BASE_URL}" \

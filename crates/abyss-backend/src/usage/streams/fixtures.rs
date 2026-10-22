@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    BaseRule, EventFacts, NoBaseReason, RequestFacts, ResponseFacts, StreamEvent, Streams,
+    BaseRule, EventFacts, NoBaseReason, RequestFacts, ResponseFacts, SessionStructure, StreamEvent,
 };
 
 pub(super) fn conversation(entries: &Value) -> Value {
@@ -112,7 +112,7 @@ impl Session {
 
     /// The base and rule of exchange `name`, or why it has none.
     pub(super) fn base(&self, name: &str) -> Result<(String, BaseRule), NoBaseReason> {
-        let streams = Streams::derive(self.events.clone());
+        let streams = SessionStructure::derive(self.events.clone());
         let index = streams
             .exchanges
             .iter()

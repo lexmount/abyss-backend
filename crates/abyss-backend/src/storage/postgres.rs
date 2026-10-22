@@ -1,11 +1,12 @@
 //! PostgreSQL source-of-truth and Elasticsearch projection implementation.
 
+mod migrations;
 mod repository;
 mod search;
 mod session_list;
 mod session_titles;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use diesel::PgConnection;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -18,17 +19,20 @@ use crate::{
     search::{
         InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
     },
-    storage::{BoxedFuture, StorageBackend},
+    storage::{
+        BoxedFuture, StorageBackend,
+        event_locations::{locate_events, locate_search_matches},
+        stream_cache::StreamCache,
+    },
     usage::{
-        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        UsageEventResponse,
+        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse, SummaryQuery,
+        SummaryResponse, UsageEventResponse,
         attachments::StoredImageAttachment,
         preview::{ConversationPreview, Window},
         segments::{SegmentResponse, ValidatedSegmentQuery},
         session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
-        streams::SessionStreamsResponse,
+        streams::{EventLocationResponse, SessionStreamsResponse},
     },
 };
 
@@ -42,6 +46,7 @@ struct SearchWorker {
 /// Existing PostgreSQL and optional Elasticsearch storage stack.
 pub struct PostgresEsBackend {
     pool: DbPool,
+    structures: Arc<StreamCache>,
     search: Option<SearchService>,
     search_worker: Option<SearchWorker>,
 }
@@ -50,9 +55,8 @@ impl PostgresEsBackend {
     pub(super) fn new(config: &Config) -> Result<Self, AppError> {
         let pool = db::create_pool(config)?;
         if config.run_migrations {
-            db::run_migrations(&pool).map_err(|error| {
-                AppError::internal(format!("run PostgreSQL migrations: {error}"))
-            })?;
+            let mut connection = pool.get()?;
+            migrations::run(&mut connection)?;
         }
 
         let search = config.search.as_ref().map(SearchService::new).transpose()?;
@@ -71,6 +75,7 @@ impl PostgresEsBackend {
 
         Ok(Self {
             pool,
+            structures: Arc::new(StreamCache::default()),
             search,
             search_worker,
         })
@@ -116,9 +121,29 @@ impl StorageBackend for PostgresEsBackend {
         query: RawEventsQuery,
         default_page_size: i64,
     ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::raw_events(connection, &query, user_id, default_page_size)
+                if !query.locate {
+                    return repository::raw_events(connection, &query, user_id, default_page_size);
+                }
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        let mut response =
+                            repository::raw_events(connection, &query, user_id, default_page_size)?;
+                        locate_events(&mut response.events, |session_pk| {
+                            repository::session_structure(
+                                connection,
+                                user_id,
+                                session_pk,
+                                &structures,
+                            )
+                        })?;
+                        Ok(response)
+                    })
             })
             .await
         })
@@ -129,9 +154,47 @@ impl StorageBackend for PostgresEsBackend {
         user_id: Uuid,
         event_pk: Uuid,
     ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
-            self.run_db(move |connection| repository::usage_event(connection, user_id, event_pk))
-                .await
+            self.run_db(move |connection| {
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        let mut event = repository::usage_event(connection, user_id, event_pk)?;
+                        locate_events(std::slice::from_mut(&mut event), |session_pk| {
+                            repository::session_structure(
+                                connection,
+                                user_id,
+                                session_pk,
+                                &structures,
+                            )
+                        })?;
+                        Ok(event)
+                    })
+            })
+            .await
+        })
+    }
+
+    fn event_location(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<EventLocationResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        repository::event_location(connection, user_id, event_pk, &structures)
+                    })
+            })
+            .await
         })
     }
 
@@ -149,40 +212,21 @@ impl StorageBackend for PostgresEsBackend {
         })
     }
 
-    fn session_timeline(
-        &self,
-        user_id: Uuid,
-        session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>> {
-        Box::pin(async move {
-            self.run_db(move |connection| {
-                repository::session_timeline(connection, user_id, session_pk)
-            })
-            .await
-        })
-    }
-
-    fn session_outline(
-        &self,
-        user_id: Uuid,
-        session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>> {
-        Box::pin(async move {
-            self.run_db(move |connection| {
-                repository::session_outline(connection, user_id, session_pk)
-            })
-            .await
-        })
-    }
-
     fn session_header(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionHeaderResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::session_header(connection, user_id, session_pk)
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        repository::session_header(connection, user_id, session_pk, &structures)
+                    })
             })
             .await
         })
@@ -193,9 +237,16 @@ impl StorageBackend for PostgresEsBackend {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::session_streams(connection, user_id, session_pk)
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        repository::session_streams(connection, user_id, session_pk, &structures)
+                    })
             })
             .await
         })
@@ -208,9 +259,23 @@ impl StorageBackend for PostgresEsBackend {
         head: String,
         query: ValidatedSegmentQuery,
     ) -> BoxedFuture<'_, Result<SegmentResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::session_segment(connection, user_id, session_pk, &head, &query)
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        repository::session_segment(
+                            connection,
+                            user_id,
+                            session_pk,
+                            &head,
+                            &query,
+                            &structures,
+                        )
+                    })
             })
             .await
         })
@@ -259,18 +324,37 @@ impl StorageBackend for PostgresEsBackend {
         user_id: Uuid,
         query: SessionSearchQuery,
     ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             let search = self.search.clone().ok_or_else(|| {
                 AppError::unavailable("session search is not configured".to_owned())
             })?;
             let execution = search.search(user_id, query).await?;
             let session_ids = execution.session_ids();
-            let details = self
-                .run_db(move |connection| {
-                    SearchOutboxRepository::session_details(connection, user_id, &session_ids)
-                })
-                .await?;
-            Ok(execution.hydrate(details))
+            self.run_db(move |connection| {
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        let details = SearchOutboxRepository::session_details(
+                            connection,
+                            user_id,
+                            &session_ids,
+                        )?;
+                        let mut response = execution.hydrate(details);
+                        locate_search_matches(&mut response, |session_pk| {
+                            repository::session_structure(
+                                connection,
+                                user_id,
+                                session_pk,
+                                &structures,
+                            )
+                        })?;
+                        Ok(response)
+                    })
+            })
+            .await
         })
     }
 

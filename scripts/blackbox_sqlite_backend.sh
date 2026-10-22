@@ -79,7 +79,6 @@ expected = {
     "app_users",
     "devices",
     "agent_sessions",
-    "agent_turns",
     "llm_usage_events",
     "llm_usage_event_attachments",
     "agent_diagnostic_captures",
