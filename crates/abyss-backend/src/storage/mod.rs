@@ -1,4 +1,4 @@
-//! Compile-time-selected persistence and full-text search compatibility boundary.
+//! Compile-time-selected persistence and search compatibility boundary.
 //!
 //! HTTP handlers depend only on [`StorageBackend`]. Exactly one concrete
 //! implementation is compiled into a binary, while dynamic dispatch keeps
@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::AppError,
-    search::{SessionSearchQuery, SessionSearchResponse},
+    search::{
+        InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
+    },
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
@@ -133,12 +135,21 @@ pub trait StorageBackend: Send + Sync {
         attachment_id: Uuid,
     ) -> BoxedFuture<'_, Result<StoredImageAttachment, AppError>>;
 
-    /// Executes one owner-scoped full-text session search.
+    /// Executes one owner-scoped session search.
     fn session_search(
         &self,
         user_id: Uuid,
         query: SessionSearchQuery,
     ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>>;
+
+    /// Finds every hit of a query in one owner-scoped session, with the
+    /// segment of each; not found when the owner has no such session.
+    fn search_in_session(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: InSessionSearchQuery,
+    ) -> BoxedFuture<'_, Result<InSessionSearchResponse, AppError>>;
 
     /// Stops backend-owned background work and releases lifecycle resources.
     fn shutdown(&self) -> BoxedFuture<'_, ()>;

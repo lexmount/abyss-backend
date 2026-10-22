@@ -273,6 +273,30 @@ pub fn segment_run(events: Vec<StreamEvent>, from: &str) -> Option<SegmentRun> {
     })
 }
 
+/// The head of the segment holding each event's exchange, by event primary
+/// key, as [`session_streams`] and [`segment_run`] derive them. An event in no
+/// exchange is left out.
+#[cfg_attr(
+    all(feature = "postgres-es", not(test)),
+    expect(
+        dead_code,
+        reason = "only the SQLite profile searches within a session"
+    )
+)]
+pub fn event_segments(events: Vec<StreamEvent>) -> HashMap<Uuid, String> {
+    let streams = Streams::derive(events);
+    let mut segments = HashMap::new();
+    for (index, exchange) in streams.exchanges.iter().enumerate() {
+        let head = streams.segment_head(streams.segmentation.segment_of[index]);
+        let request = exchange.request.as_ref().map(|request| request.pk);
+        let response = exchange.response.as_ref().map(|response| response.pk);
+        for pk in request.into_iter().chain(response) {
+            segments.insert(pk, head.clone());
+        }
+    }
+    segments
+}
+
 impl Streams {
     /// Id of a segment's first exchange.
     fn segment_head(&self, segment: usize) -> String {
@@ -308,7 +332,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{BaseRule, SegmentKind, segment_run, session_streams};
+    use super::{BaseRule, SegmentKind, event_segments, segment_run, session_streams};
     use crate::usage::streams::fixtures::{Session, assistant, call, item, result, user};
 
     #[test]
@@ -421,5 +445,43 @@ mod tests {
         );
         assert!(e2.request_pk.is_some() && e2.response_pk.is_some());
         assert!(segment.exchanges[0].starts_turn && !e2.starts_turn);
+    }
+
+    #[test]
+    fn every_event_of_an_exchange_maps_to_its_segment_head() {
+        let mut session = Session::new();
+        session.exchange("e1", 1, &json!([user("go")]), &json!([call("a")]));
+        session.exchange(
+            "e2",
+            2,
+            &json!([user("go"), call("a"), result("a")]),
+            &json!([assistant("done")]),
+        );
+        session.exchange(
+            "e3",
+            3,
+            &json!([user("unrelated")]),
+            &json!([assistant("ok")]),
+        );
+        // A second request of exchange e3 joins no exchange.
+        session.ask("e3", 4, None, &json!([user("again")]));
+        let segments = event_segments(session.events.clone());
+        let heads = session
+            .events
+            .iter()
+            .map(|event| segments.get(&event.pk).map(String::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            heads,
+            [
+                Some("e1"),
+                Some("e1"),
+                Some("e1"),
+                Some("e1"),
+                Some("e3"),
+                Some("e3"),
+                None
+            ]
+        );
     }
 }

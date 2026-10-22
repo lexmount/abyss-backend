@@ -1,4 +1,5 @@
-//! Self-contained SQLite source-of-truth with transactional FTS5 projection.
+//! Self-contained SQLite source-of-truth with its search index written in
+//! the same transactions.
 
 mod connection;
 mod migrations;
@@ -15,7 +16,9 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::AppError,
-    search::{SessionSearchQuery, SessionSearchResponse},
+    search::{
+        InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
+    },
     storage::{BoxedFuture, StorageBackend},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
@@ -32,7 +35,7 @@ use crate::{
 
 use self::connection::SqlitePool;
 
-/// SQLite event store with an FTS5 projection committed beside each event.
+/// SQLite event store with a search index committed beside each event.
 pub(super) struct SqliteFtsBackend {
     pool: SqlitePool,
 }
@@ -45,6 +48,7 @@ impl SqliteFtsBackend {
             connection::configure_database(&mut database)?;
             if config.run_migrations {
                 migrations::run(&mut database)?;
+                search::backfill(&mut database)?;
             }
         }
         Ok(Self { pool })
@@ -244,6 +248,20 @@ impl StorageBackend for SqliteFtsBackend {
         Box::pin(async move {
             self.run_db(move |connection| search::session_search(connection, user_id, query))
                 .await
+        })
+    }
+
+    fn search_in_session(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: InSessionSearchQuery,
+    ) -> BoxedFuture<'_, Result<InSessionSearchResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                search::search_in_session(connection, user_id, session_pk, &query)
+            })
+            .await
         })
     }
 

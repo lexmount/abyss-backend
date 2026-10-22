@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    search::projection::SearchProjection,
     usage::{
         IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
         RawEventsResponse, SessionInfo, SessionOutlineResponse, SessionTimelineResponse,
@@ -55,6 +54,7 @@ use super::{
         app_users, devices, llm_usage_event_attachments, llm_usage_event_stream_facts,
         llm_usage_events,
     },
+    search::index_event,
     session_titles,
 };
 
@@ -183,7 +183,12 @@ fn ingest_one_event(
 
     insert_stream_facts(connection, event_pk, event)?;
     insert_attachments(connection, user_id, event_pk, attachments, now)?;
-    insert_search_projection(connection, event_pk, user_id, session_pk, event)?;
+    index_event(
+        connection,
+        &user_id.to_string(),
+        &event_pk.to_string(),
+        &event.metadata,
+    )?;
     session_titles::capture(
         connection,
         &session_titles::CapturedEvent {
@@ -493,33 +498,6 @@ fn number_turns(connection: &mut SqliteConnection, session: &str) -> Result<bool
     Ok(true)
 }
 
-/// Writes the SQLite FTS5 projection. Virtual tables are intentionally outside
-/// Diesel's relational schema and use a fully bound raw statement.
-fn insert_search_projection(
-    connection: &mut SqliteConnection,
-    event_pk: Uuid,
-    user_id: Uuid,
-    session_pk: Uuid,
-    event: &IngestUsageEvent,
-) -> Result<(), AppError> {
-    let projection = SearchProjection::from_source(&event.metadata);
-    sql_query(
-        "INSERT INTO usage_events_fts (
-             event_pk, user_id, session_pk, session_id, content, tool_names,
-             tool_content
-         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind::<Text, _>(event_pk.to_string())
-    .bind::<Text, _>(user_id.to_string())
-    .bind::<Text, _>(session_pk.to_string())
-    .bind::<Text, _>(&event.session_id)
-    .bind::<diesel::sql_types::Nullable<Text>, _>(projection.content)
-    .bind::<Text, _>(projection.tool_names.join("\n"))
-    .bind::<Text, _>(projection.tool_content.join("\n"))
-    .execute(connection)?;
-    Ok(())
-}
-
 /// Derives the streams of one session's events from their stream facts,
 /// without reading any request body.
 pub(super) fn session_streams(
@@ -683,7 +661,7 @@ fn usage_events(
 
 /// The events of one session in session order, with their stream facts and
 /// without any request body.
-fn stream_events(
+pub(super) fn stream_events(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
@@ -1641,11 +1619,11 @@ mod tests {
         assert_eq!(duplicate.accepted, 0);
         assert_eq!(duplicate.duplicates, 1);
 
-        let projection_count = sql_query("SELECT count(*) AS count FROM usage_events_fts")
+        let reference_count = sql_query("SELECT count(*) AS count FROM search_refs")
             .get_result::<Count>(&mut database)
-            .expect("FTS projection should be queryable")
+            .expect("search references should be queryable")
             .count;
-        assert_eq!(projection_count, 1);
+        assert_eq!(reference_count, 1, "one piece, indexed once");
         let results = search::session_search(
             &mut database,
             OWNER_ID,
@@ -1671,12 +1649,12 @@ mod tests {
                 .iter()
                 .flat_map(|fragment| &fragment.segments)
                 .any(|segment| segment.highlighted),
-            "FTS result should contain a structured highlight"
+            "a search result should contain a structured highlight"
         );
     }
 
     #[test]
-    fn validation_failure_leaves_relational_and_fts_tables_empty() {
+    fn validation_failure_leaves_relational_and_search_tables_empty() {
         let mut database = database();
         let request = request_with_text("invalid event");
 
@@ -1688,11 +1666,14 @@ mod tests {
             .expect("relational table should be queryable");
         assert_eq!(relational_count, 0);
 
-        let fts_count = sql_query("SELECT count(*) AS count FROM usage_events_fts")
-            .get_result::<Count>(&mut database)
-            .expect("FTS table should be queryable")
-            .count;
-        assert_eq!(fts_count, 0);
+        let search_count = sql_query(
+            "SELECT (SELECT count(*) FROM search_texts) + (SELECT count(*) FROM search_refs) \
+             AS count",
+        )
+        .get_result::<Count>(&mut database)
+        .expect("search tables should be queryable")
+        .count;
+        assert_eq!(search_count, 0);
     }
 
     #[test]

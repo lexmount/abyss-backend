@@ -84,17 +84,34 @@ expected = {
     "llm_usage_event_attachments",
     "agent_diagnostic_captures",
     "agent_diagnostic_capture_events",
-    "usage_events_fts",
+    "search_texts",
+    "search_texts_trigram",
+    "search_refs",
 }
 missing = expected - tables
 if missing:
     raise SystemExit(f"SQLite migration is missing tables: {sorted(missing)}")
+if "usage_events_fts" in tables:
+    raise SystemExit("SQLite migration still creates usage_events_fts")
+text_columns = [row[1] for row in database.execute("PRAGMA table_info(search_texts)")]
+if text_columns != ["id", "user_id", "sha256", "text"]:
+    raise SystemExit(f"search_texts columns are wrong: {text_columns}")
+ref_columns = [row[1] for row in database.execute("PRAGMA table_info(search_refs)")]
+if ref_columns != ["event_pk", "entry_index", "field", "text_id"]:
+    raise SystemExit(f"search_refs columns are wrong: {ref_columns}")
+trigram_sql = database.execute(
+    "SELECT sql FROM sqlite_master WHERE name = 'search_texts_trigram'"
+).fetchone()[0]
+for option in ("content = ''", "detail = none", "tokenize = 'trigram case_sensitive 1'"):
+    if option not in trigram_sql:
+        raise SystemExit(f"search_texts_trigram lacks {option}: {trigram_sql}")
 PY
 
 python3 scripts/tests/blackbox_api.py \
   --base-url "${BASE_URL}" \
   --token "${API_TOKEN}" \
-  --run-id "${RUN_ID}"
+  --run-id "${RUN_ID}" \
+  --in-session-search
 
 python3 - "${DATABASE_PATH}" "capture-${RUN_ID}" <<'PY'
 import sqlite3
@@ -123,4 +140,4 @@ if link_count != 2:
     raise SystemExit("diagnostic capture was not linked to both events")
 PY
 
-echo "blackbox: standalone SQLite, HTTP, attachment, diagnostics, and FTS contracts passed"
+echo "blackbox: standalone SQLite, HTTP, attachment, diagnostics, and search contracts passed"
