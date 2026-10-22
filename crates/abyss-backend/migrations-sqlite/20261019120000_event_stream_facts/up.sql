@@ -23,3 +23,39 @@ CREATE TABLE llm_usage_event_stream_facts (
     label_text TEXT,
     label_length INTEGER
 ) STRICT;
+
+-- Search reads the text and the name of every conversation entry. Each
+-- distinct piece of text is stored once per owner, and every piece of an
+-- event refers to its text; replayed history therefore adds references, not
+-- text. A trigram index over the folded texts, without positions, narrows
+-- the candidates the backend verifies.
+DROP TABLE usage_events_fts;
+
+CREATE TABLE search_texts (
+    id INTEGER PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    -- SHA-256 of the text's UTF-8 bytes.
+    sha256 BLOB NOT NULL,
+    text TEXT NOT NULL,
+    UNIQUE (user_id, sha256)
+) STRICT;
+
+-- Contentless and without positions; it indexes the folded text of each
+-- row of search_texts under that row's id.
+CREATE VIRTUAL TABLE search_texts_trigram USING fts5(
+    folded,
+    content = '',
+    detail = none,
+    tokenize = 'trigram case_sensitive 1'
+);
+
+-- One row per nonempty `text` or `name` of an entry of an event.
+CREATE TABLE search_refs (
+    event_pk TEXT NOT NULL,
+    entry_index INTEGER NOT NULL,
+    field TEXT NOT NULL CHECK (field IN ('text', 'name')),
+    text_id INTEGER NOT NULL,
+    PRIMARY KEY (event_pk, entry_index, field)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX search_refs_text ON search_refs (text_id);

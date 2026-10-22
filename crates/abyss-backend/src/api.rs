@@ -22,7 +22,9 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     identity::IdentityAuthenticator,
-    search::{SessionSearchQuery, SessionSearchResponse},
+    search::{
+        InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
+    },
     storage::StorageBackend,
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventListResponse, RawEventsQuery,
@@ -52,7 +54,7 @@ pub struct AppState {
     pub default_page_size: i64,
     /// Deployment-wide bearer-token validator.
     pub identity: IdentityAuthenticator,
-    /// Compile-time-selected event storage and full-text search implementation.
+    /// Compile-time-selected event storage and search implementation.
     pub storage: std::sync::Arc<dyn StorageBackend>,
 }
 
@@ -102,6 +104,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/agent-usage/sessions/{session_pk}/segments/{head}",
             get(session_segment),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/search",
+            get(search_in_session),
         )
         .route(
             "/v1/agent-usage/events/{event_pk}/conversation",
@@ -228,6 +234,23 @@ async fn session_streams(
     let user_id = state.identity.authenticate(&headers)?;
     Ok(Json(
         state.storage.session_streams(user_id, session_pk).await?,
+    ))
+}
+
+/// Every hit of a query in one session, each with the head of the segment
+/// holding its event.
+async fn search_in_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+    Query(query): Query<InSessionSearchQuery>,
+) -> Result<Json<InSessionSearchResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state
+            .storage
+            .search_in_session(user_id, session_pk, query)
+            .await?,
     ))
 }
 

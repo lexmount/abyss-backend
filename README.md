@@ -2,17 +2,18 @@
 
 `abyss-backend` is the open-source, self-hostable Agent event store for Abyss.
 It accepts normalized Agent events and exposes APIs for event history,
-summaries, session timelines, attachments, and full-text session search.
+summaries, session timelines, attachments, and session search.
 
 This repository is intentionally focused on standalone event storage, queries,
-and optional full-text search.
+and search.
 
 ## Capabilities
 
 - Idempotent Agent event ingestion and raw event queries.
 - Token-usage summaries and ordered session timelines.
 - Validated image attachment storage and authorized download.
-- Full-text session search through Elasticsearch or embedded SQLite FTS5.
+- Session search through Elasticsearch or an embedded SQLite trigram index,
+  and, with SQLite, search within one session.
 - Health and storage-readiness probes.
 - Embedded migrations for both supported storage profiles.
 
@@ -30,9 +31,9 @@ Exactly one storage profile is compiled into a binary:
 
 - `postgres-es` uses PostgreSQL as the source of truth and optionally projects
   search documents to Elasticsearch. It is the default profile.
-- `sqlite-fts` stores both authoritative data and its transactional FTS5 index
-  in one local SQLite file through Diesel, with FTS5 operations expressed as
-  SQL. It does not compile PostgreSQL, reqwest, or Elasticsearch worker code
+- `sqlite-fts` stores both authoritative data and its search index, written in
+  the same transactions, in one local SQLite file through Diesel, with FTS5
+  operations expressed as SQL. It does not compile PostgreSQL, reqwest, or Elasticsearch worker code
   into the binary.
 
 ## Authentication
@@ -59,9 +60,10 @@ cargo run --locked --package abyss-backend \
   --no-default-features --features sqlite-fts
 ```
 
-The backend creates the parent directory, database, schema, and FTS5 index on
-startup. A `sqlite://` prefix is also accepted, for example
-`sqlite://./data/abyss.sqlite`.
+The backend creates the parent directory, database, schema, and search index
+on startup. After its migrations it indexes, once and in logged batches, the
+stored events the search index does not cover yet. A `sqlite://` prefix is
+also accepted, for example `sqlite://./data/abyss.sqlite`.
 
 ## Run with PostgreSQL
 
@@ -99,10 +101,47 @@ curl \
 | `GET` | `/v1/agent-usage/attachments/{id}` | Download stored image content. |
 | `GET` | `/v1/agent-usage/summary` | Aggregate event and token usage. |
 | `GET` | `/v1/agent-usage/sessions/{id}` | Read an ordered session timeline. |
-| `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite FTS5. |
+| `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session (SQLite). |
 
 Every `/v1/agent-usage/*` endpoint requires the bearer token. Health and
 readiness endpoints are unauthenticated for orchestrator probes.
+
+### Search
+
+In the SQLite profile, search reads the pieces of each event's
+`metadata.conversation.entries`: the `text` of every entry, whatever its
+role, and its `name`, the tool name of a tool call. Entries are never joined,
+an empty value is not a piece, and nothing else is searched. The query is one
+literal substring, matched after folding every character to its lowercase
+form when that is exactly one character. A hit is a piece of an event whose
+folded text holds the folded query, so each event that replays history hits
+again. A hit is new when its event is a response, or when its entry index is
+at least the request's `new_from`; otherwise it is in the inherited context.
+
+`GET /v1/agent-usage/search?q=…` also takes `from`, `to`, `agent_name`,
+`llm_provider`, `llm_model`, `event_type`, `page` (from 1), and `page_size`
+(at most 50). Sessions are ordered by their latest matching event, newest
+first. Each item carries `match_count`, its matching events,
+`new_match_count`, those with a new hit, and up to three `matches`: the events
+with a new hit, earliest first, then the earliest events whose hits are all
+inherited. A match says whether it is `new` and carries up to two `fragments`
+of distinct matching texts, new hits first, each about 240 characters around
+the first occurrence, `…` on a cut side, as `{"text", "highlighted"}`
+segments.
+
+`GET /v1/agent-usage/sessions/{session_pk}/search?q=…` returns every hit in
+one session as `hits`, each `{"event_pk", "entry_index", "field", "new",
+"text_id", "segment"}` with `field` `text` or `name` and `segment` the head of
+the segment holding the event's exchange, as `/streams` gives it, or null. Hits
+are in observation order, then by event, entry, and `name` before `text`.
+`texts` lists each named text once as `{"id", "ranges"}`, the non-overlapping
+occurrences as half-open ranges of the original text's UTF-16 code units. At
+most 100,000 hits are returned; `truncated` says whether more were left out.
+
+The PostgreSQL profile searches through Elasticsearch, requires every
+whitespace-separated term to match, counts every match as new, and does not
+support search within a session.
 
 ## Configuration
 
@@ -128,7 +167,7 @@ readiness endpoints are unauthenticated for orchestrator probes.
 Elasticsearch settings exist only in `postgres-es` builds. Username and
 password must be provided together. Search remains disabled in that profile
 when no URL is configured; event storage and queries continue to work. The
-`sqlite-fts` profile always provides search through the local FTS5 index.
+`sqlite-fts` profile always provides search through its local index.
 
 ## Native releases
 

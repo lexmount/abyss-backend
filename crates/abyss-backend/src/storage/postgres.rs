@@ -15,7 +15,9 @@ use crate::{
     config::Config,
     db::{self, DbPool},
     error::AppError,
-    search::{SessionSearchQuery, SessionSearchResponse},
+    search::{
+        InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
+    },
     storage::{BoxedFuture, StorageBackend},
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
@@ -269,6 +271,22 @@ impl StorageBackend for PostgresEsBackend {
                 })
                 .await?;
             Ok(execution.hydrate(details))
+        })
+    }
+
+    /// Elasticsearch holds each event's text as one document without entry
+    /// positions, so this profile cannot list the hits within a session.
+    fn search_in_session(
+        &self,
+        _user_id: Uuid,
+        _session_pk: Uuid,
+        query: InSessionSearchQuery,
+    ) -> BoxedFuture<'_, Result<InSessionSearchResponse, AppError>> {
+        Box::pin(async move {
+            query.validate()?;
+            Err(AppError::unavailable(
+                "search within a session is not supported by this storage backend".to_owned(),
+            ))
         })
     }
 

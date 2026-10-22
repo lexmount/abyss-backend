@@ -1,4 +1,5 @@
-//! Diesel schema for SQLite relational tables; the FTS5 virtual table stays raw SQL.
+//! Diesel schema for SQLite relational tables; the FTS5 trigram index is a
+//! virtual table outside it.
 
 diesel::table! {
     use diesel::sql_types::{BigInt, Nullable, Text};
@@ -170,6 +171,28 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::{BigInt, Binary, Text};
+
+    search_texts (id) {
+        id -> BigInt,
+        user_id -> Text,
+        sha256 -> Binary,
+        text -> Text,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::{BigInt, Integer, Text};
+
+    search_refs (event_pk, entry_index, field) {
+        event_pk -> Text,
+        entry_index -> Integer,
+        field -> Text,
+        text_id -> BigInt,
+    }
+}
+
 diesel::joinable!(agent_sessions -> app_users (user_id));
 diesel::joinable!(agent_sessions -> devices (device_context_id));
 diesel::joinable!(agent_turns -> agent_sessions (session_pk));
@@ -199,5 +222,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     llm_usage_events,
     llm_usage_event_attachments,
     llm_usage_event_stream_facts,
+    search_refs,
+    search_texts,
     session_titles,
 );

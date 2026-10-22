@@ -8,6 +8,7 @@
 mod document;
 mod elasticsearch;
 mod outbox;
+mod projection;
 mod worker;
 
 use std::collections::{HashMap, HashSet};
@@ -18,14 +19,15 @@ use crate::{
     config::SearchConfig,
     error::AppError,
     search::{
-        SearchFragment, SessionSearchMatch, SessionSearchQuery, SessionSearchResponse,
-        SessionSearchResult, ValidatedSearchQuery,
+        SessionSearchMatch, SessionSearchQuery, SessionSearchResponse, SessionSearchResult,
+        ValidatedSearchQuery,
     },
 };
 
 use self::{
     elasticsearch::{ElasticsearchClient, SearchMatchPage},
     outbox::SearchSessionDetails,
+    projection::parse_fragment,
 };
 
 pub(super) use self::{outbox::SearchOutboxRepository, worker::SearchIndexer};
@@ -85,7 +87,9 @@ impl SearchExecution {
     /// Combines search matches with authoritative session/device details.
     ///
     /// Stale index entries whose session no longer exists are omitted instead
-    /// of returning partially authorized or incomplete data.
+    /// of returning partially authorized or incomplete data. Elasticsearch
+    /// indexes an event's text as one document and cannot tell a new hit from
+    /// one in the inherited context, so every match counts as new.
     #[must_use]
     pub(super) fn hydrate(
         self,
@@ -125,6 +129,7 @@ impl SearchExecution {
                     providers,
                     models,
                     match_count: matches.match_count,
+                    new_match_count: matches.match_count,
                     matches: matches
                         .events
                         .into_iter()
@@ -136,10 +141,11 @@ impl SearchExecution {
                             llm_provider: event.llm_provider,
                             llm_model: event.llm_model,
                             observed_at: event.observed_at,
+                            new: true,
                             fragments: event
                                 .fragments
-                                .into_iter()
-                                .map(|fragment| SearchFragment::parse(&fragment))
+                                .iter()
+                                .map(|fragment| parse_fragment(fragment))
                                 .collect(),
                         })
                         .collect(),

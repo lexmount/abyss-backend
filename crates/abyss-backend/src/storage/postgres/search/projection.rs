@@ -1,8 +1,14 @@
-//! Bounded, allowlisted extraction shared by every full-text implementation.
+//! Bounded Elasticsearch projection of an event's conversation entries, and
+//! the marker pair Elasticsearch places around highlighted text.
 
 use serde_json::Value;
 
-use super::{HIGHLIGHT_END, HIGHLIGHT_START};
+use crate::search::{SearchFragment, SearchFragmentSegment};
+
+/// Sentinel Elasticsearch inserts before highlighted text.
+pub const HIGHLIGHT_START: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]";
+/// Sentinel Elasticsearch inserts after highlighted text.
+pub const HIGHLIGHT_END: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]";
 
 pub const MAX_CONTENT_CHARACTERS: usize = 1_000_000;
 const MAX_METADATA_FIELD_CHARACTERS: usize = 100_000;
@@ -51,6 +57,43 @@ impl SearchProjection {
     }
 }
 
+/// Splits an Elasticsearch fragment at its highlight markers.
+pub fn parse_fragment(fragment: &str) -> SearchFragment {
+    let mut segments = Vec::new();
+    let mut remainder = fragment;
+    while let Some(start) = remainder.find(HIGHLIGHT_START) {
+        let (plain, tagged) = remainder.split_at(start);
+        push_fragment_segment(&mut segments, plain, false);
+        let highlighted = tagged
+            .strip_prefix(HIGHLIGHT_START)
+            .expect("the marker position came from find");
+        // Treat malformed or truncated marker pairs as plain text. The API
+        // never emits raw HTML and therefore does not trust ES fragments.
+        let Some(end) = highlighted.find(HIGHLIGHT_END) else {
+            push_fragment_segment(&mut segments, tagged, false);
+            remainder = "";
+            break;
+        };
+        let (matched, after_match) = highlighted.split_at(end);
+        push_fragment_segment(&mut segments, matched, true);
+        remainder = after_match
+            .strip_prefix(HIGHLIGHT_END)
+            .expect("the marker position came from find");
+    }
+    push_fragment_segment(&mut segments, remainder, false);
+    SearchFragment { segments }
+}
+
+fn push_fragment_segment(segments: &mut Vec<SearchFragmentSegment>, text: &str, highlighted: bool) {
+    if text.is_empty() {
+        return;
+    }
+    segments.push(SearchFragmentSegment {
+        text: text.to_owned(),
+        highlighted,
+    });
+}
+
 fn push_bounded(values: &mut Vec<String>, value: &str) {
     let value = sanitize_search_text(value);
     let value = value.trim();
@@ -75,4 +118,20 @@ fn truncate_characters(mut value: String, maximum: usize) -> String {
     };
     value.truncate(byte_index);
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HIGHLIGHT_END, HIGHLIGHT_START, parse_fragment};
+
+    #[test]
+    fn parses_highlights_without_rendering_html() {
+        let fragment = parse_fragment(&format!(
+            "before {HIGHLIGHT_START}timeout{HIGHLIGHT_END} after"
+        ));
+
+        assert_eq!(fragment.segments.len(), 3);
+        assert_eq!(fragment.segments[1].text, "timeout");
+        assert!(fragment.segments[1].highlighted);
+    }
 }

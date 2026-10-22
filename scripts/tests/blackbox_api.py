@@ -131,7 +131,7 @@ def event(
     return value
 
 
-def run(base_url: str, token: str, run_id: str) -> None:
+def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     session_id = f"session-blackbox-{run_id}"
     request_event_id = f"event-request-{run_id}"
     response_event_id = f"event-response-{run_id}"
@@ -532,6 +532,21 @@ def run(base_url: str, token: str, run_id: str) -> None:
         any(segment["highlighted"] for segment in segments),
         "search must return structured highlights",
     )
+    found = next(item for item in search_result["items"] if item["session_pk"] == session_pk)
+    require(
+        (found["match_count"], found["new_match_count"]) == (1, 1),
+        f"the response matches once, outside any inherited context: {found}",
+    )
+    require(
+        all(
+            match["new"] is True and match["event_pk"] == timeline_events[1]["id"]
+            for match in found["matches"]
+        ),
+        f"each match says whether it is new: {found['matches']}",
+    )
+    run_in_session_search_contract(
+        base_url, token, session_pk, [item["id"] for item in timeline_events], in_session
+    )
 
     from session_titles_api import run_title_contract
 
@@ -543,13 +558,78 @@ def run(base_url: str, token: str, run_id: str) -> None:
     print(f"blackbox API contract passed for {session_id}")
 
 
+def in_session_search_path(session_pk: str, query: str) -> str:
+    return (
+        f"/v1/agent-usage/sessions/{session_pk}/search?"
+        + urllib.parse.urlencode([("q", query)])
+    )
+
+
+def run_in_session_search_contract(
+    base_url: str, token: str, session_pk: str, event_pks: list[str], supported: bool
+) -> None:
+    """Every hit of a query in one session, with UTF-16 occurrence ranges and
+    the segment of each hit's event."""
+    path = in_session_search_path(session_pk, "BLACKBOX")
+    if not supported:
+        response = request(base_url, "GET", path, token=token)
+        require_status(response, 503, "search within a session is not supported")
+        return
+    response = request(base_url, "GET", path, token=token)
+    require_status(response, 200, "search within a session")
+    found = response.json()
+    require(
+        set(found) == {"query", "texts", "hits", "truncated"} and found["truncated"] is False,
+        f"in-session search response shape: {found}",
+    )
+    streams = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/streams", token=token
+    )
+    require_status(streams, 200, "session streams")
+    heads = [segment["head"] for segment in streams.json()["segments"]]
+    require(len(heads) == 1, f"the session is one segment: {heads}")
+    hits = [
+        (hit["event_pk"], hit["entry_index"], hit["field"], hit["new"], hit["segment"])
+        for hit in found["hits"]
+    ]
+    require(
+        hits
+        == [
+            (event_pks[0], 0, "text", True, heads[0]),
+            (event_pks[1], 0, "text", True, heads[0]),
+        ],
+        f"hits of every piece in session order, in their segment: {hits}",
+    )
+    texts = {text["id"]: text["ranges"] for text in found["texts"]}
+    require(
+        set(texts) == {hit["text_id"] for hit in found["hits"]} and len(texts) == 2,
+        f"each distinct text once: {found['texts']}",
+    )
+    require(
+        all(ranges == [[0, len("blackbox")]] for ranges in texts.values()),
+        f"ranges are UTF-16 offsets of the original text: {texts}",
+    )
+    missing = request(
+        base_url, "GET", in_session_search_path(str(uuid.uuid4()), "blackbox"), token=token
+    )
+    require_status(missing, 404, "search within an unknown session")
+    empty = request(base_url, "GET", in_session_search_path(session_pk, " "), token=token)
+    require_status(empty, 400, "search within a session without a query")
+    require_status(request(base_url, "GET", path), 401, "unauthenticated in-session search")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--in-session-search",
+        action="store_true",
+        help="the storage profile supports search within a session",
+    )
     args = parser.parse_args()
-    run(args.base_url.rstrip("/"), args.token, args.run_id)
+    run(args.base_url.rstrip("/"), args.token, args.run_id, args.in_session_search)
 
 
 if __name__ == "__main__":

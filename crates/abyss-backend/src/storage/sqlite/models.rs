@@ -17,6 +17,7 @@ use crate::{
 use super::schema::{
     agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
     devices, llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
+    search_refs, search_texts,
 };
 
 #[derive(Queryable, Selectable)]
@@ -334,6 +335,25 @@ pub(super) struct NewDiagnosticCapture {
 pub(super) struct NewDiagnosticCaptureEvent {
     pub(super) capture_pk: String,
     pub(super) event_pk: String,
+}
+
+/// A distinct text of one owner.
+#[derive(Insertable)]
+#[diesel(table_name = search_texts)]
+pub(super) struct NewSearchText<'a> {
+    pub(super) user_id: &'a str,
+    pub(super) sha256: &'a [u8],
+    pub(super) text: &'a str,
+}
+
+/// One piece of one event, referring to its text.
+#[derive(Insertable)]
+#[diesel(table_name = search_refs)]
+pub(super) struct NewSearchRef<'a> {
+    pub(super) event_pk: &'a str,
+    pub(super) entry_index: i32,
+    pub(super) field: &'static str,
+    pub(super) text_id: i64,
 }
 
 pub(super) struct DeviceRecord {

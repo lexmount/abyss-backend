@@ -8,13 +8,11 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{
-    db::models::UsageEvent,
-    search::projection::{SearchProjection, sanitize_search_text},
-};
+use super::projection::{SearchProjection, sanitize_search_text};
+use crate::db::models::UsageEvent;
 
 #[cfg(test)]
-use crate::search::{HIGHLIGHT_END, HIGHLIGHT_START, projection::MAX_CONTENT_CHARACTERS};
+use super::projection::{HIGHLIGHT_END, HIGHLIGHT_START, MAX_CONTENT_CHARACTERS};
 
 /// Full-text search document for one immutable usage event.
 #[derive(Serialize)]
