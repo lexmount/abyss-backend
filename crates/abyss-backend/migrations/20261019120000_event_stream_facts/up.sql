@@ -21,3 +21,7 @@ CREATE TABLE llm_usage_event_stream_facts (
     label_text text,
     label_length integer
 );
+
+-- The backend also registers each session's earliest request in session_titles,
+-- in the same transaction that records this migration. It reads no old event
+-- bodies; the title remains absent unless that request already has label facts.

@@ -59,3 +59,7 @@ CREATE TABLE search_refs (
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX search_refs_text ON search_refs (text_id);
+
+-- The backend also rebuilds session_titles first-request anchors in the same
+-- transaction that records this migration. Titles read existing label facts;
+-- missing facts are not reconstructed from historical event bodies.

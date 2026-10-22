@@ -28,14 +28,12 @@ use crate::{
     storage::StorageBackend,
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventListResponse, RawEventsQuery,
-        SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
-        TokenUsageSummaryResponse, UsageEventResponse,
+        SummaryFields, SummaryQuery, TokenUsageSummaryResponse, UsageEventResponse,
         preview::{ConversationPreview, PreviewQuery, Window},
         segments::{SegmentQuery, SegmentResponse},
         session_header::SessionHeaderResponse,
         session_list::{SessionListQuery, SessionListResponse},
-        streams::SessionStreamsResponse,
-        trajectory::{self, SessionTrajectoryResponse},
+        streams::{EventLocationResponse, SessionStreamsResponse},
     },
 };
 
@@ -75,24 +73,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/agent-usage/events/{event_pk}", get(usage_event))
         .route(
+            "/v1/agent-usage/events/{event_pk}/location",
+            get(event_location),
+        )
+        .route(
             "/v1/agent-usage/attachments/{attachment_id}",
             get(image_attachment),
         )
         .route("/v1/agent-usage/summary", get(usage_summary))
         .route("/v1/agent-usage/search", get(session_search))
         .route("/v1/agent-usage/sessions", get(list_sessions))
-        .route(
-            "/v1/agent-usage/sessions/{session_pk}",
-            get(session_timeline),
-        )
-        .route(
-            "/v1/agent-usage/sessions/{session_pk}/outline",
-            get(session_outline),
-        )
-        .route(
-            "/v1/agent-usage/sessions/{session_pk}/trajectory",
-            get(session_trajectory),
-        )
         .route(
             "/v1/agent-usage/sessions/{session_pk}/header",
             get(session_header),
@@ -194,37 +184,6 @@ async fn list_sessions(
     Ok(Json(state.storage.list_sessions(user_id, query).await?))
 }
 
-async fn session_timeline(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(session_pk): Path<Uuid>,
-) -> Result<Json<SessionTimelineResponse>, AppError> {
-    let user_id = state.identity.authenticate(&headers)?;
-    let response = state.storage.session_timeline(user_id, session_pk).await?;
-    Ok(Json(response))
-}
-
-async fn session_outline(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(session_pk): Path<Uuid>,
-) -> Result<Json<SessionOutlineResponse>, AppError> {
-    let user_id = state.identity.authenticate(&headers)?;
-    Ok(Json(
-        state.storage.session_outline(user_id, session_pk).await?,
-    ))
-}
-
-async fn session_trajectory(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(session_pk): Path<Uuid>,
-) -> Result<Json<SessionTrajectoryResponse>, AppError> {
-    let user_id = state.identity.authenticate(&headers)?;
-    let timeline = state.storage.session_timeline(user_id, session_pk).await?;
-    Ok(Json(trajectory::build(timeline)))
-}
-
 /// Segments of one session, without content.
 async fn session_streams(
     State(state): State<AppState>,
@@ -299,6 +258,16 @@ async fn event_conversation(
             .event_conversation(user_id, event_pk, window)
             .await?,
     ))
+}
+
+/// Resolves an event anchor against the current session structure.
+async fn event_location(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(event_pk): Path<Uuid>,
+) -> Result<Json<EventLocationResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(state.storage.event_location(user_id, event_pk).await?))
 }
 
 async fn usage_event(

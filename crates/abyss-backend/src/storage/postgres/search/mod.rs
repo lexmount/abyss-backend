@@ -120,6 +120,7 @@ impl SearchExecution {
                 Some(SessionSearchResult {
                     session_pk: details.session.id,
                     session_id: details.session.session_id,
+                    title: details.title,
                     agent_name: details.session.agent_name,
                     agent_version: details.session.agent_version,
                     host_name: details.device.host_name,
@@ -135,8 +136,7 @@ impl SearchExecution {
                         .into_iter()
                         .map(|event| SessionSearchMatch {
                             event_pk: event.event_pk,
-                            turn_pk: event.turn_pk,
-                            turn_index: event.turn_index,
+                            location: None,
                             event_type: event.event_type,
                             llm_provider: event.llm_provider,
                             llm_model: event.llm_model,

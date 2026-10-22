@@ -85,10 +85,6 @@ pub struct RankedMatch {
 
 /// Event columns a shown match reports.
 pub struct MatchedEvent {
-    /// Backend turn primary key.
-    pub turn_pk: Uuid,
-    /// Normalized turn number.
-    pub turn_index: i32,
     /// Request or response side.
     pub event_type: String,
     /// LLM provider as reported.
@@ -310,8 +306,7 @@ impl RankedPage {
                         let event = events.get(&matched.event_pk)?;
                         Some(SessionSearchMatch {
                             event_pk: matched.event_pk,
-                            turn_pk: event.turn_pk,
-                            turn_index: event.turn_index,
+                            location: None,
                             event_type: event.event_type.clone(),
                             llm_provider: event.llm_provider.clone(),
                             llm_model: event.llm_model.clone(),
@@ -327,6 +322,7 @@ impl RankedPage {
                     .collect::<Vec<_>>();
                 Some(SessionSearchResult {
                     session_pk: ranked.session_pk,
+                    title: None,
                     session_id: details.session_id,
                     agent_name: details.agent_name,
                     agent_version: details.agent_version,
@@ -587,8 +583,6 @@ mod tests {
         let events = HashMap::from([(
             uuid::Uuid::from_u128(1),
             MatchedEvent {
-                turn_pk: Uuid::from_u128(9),
-                turn_index: 1,
                 event_type: "request".to_owned(),
                 llm_provider: "openai".to_owned(),
                 llm_model: "gpt-5".to_owned(),

@@ -21,7 +21,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::AppError;
+use crate::{
+    error::AppError,
+    usage::streams::{EntryLabel, EventLocation},
+};
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const MAX_PAGE_SIZE: u32 = 50;
@@ -161,6 +164,8 @@ pub struct SessionSearchResult {
     pub session_pk: Uuid,
     /// Agent-native session identifier.
     pub session_id: String,
+    /// The same earliest-request label returned by the session list and header.
+    pub title: Option<EntryLabel>,
     /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Most recently observed Agent version.
@@ -191,10 +196,9 @@ pub struct SessionSearchResult {
 pub struct SessionSearchMatch {
     /// Backend event primary key.
     pub event_pk: Uuid,
-    /// Backend turn primary key.
-    pub turn_pk: Uuid,
-    /// Normalized turn number.
-    pub turn_index: i32,
+    /// Current position in this session's stream view, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<EventLocation>,
     /// Request or response side.
     pub event_type: String,
     /// LLM provider as reported by the collector.

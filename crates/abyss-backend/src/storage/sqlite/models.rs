@@ -8,16 +8,13 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    usage::{
-        event_order::TimelineEvent,
-        streams::{EventFacts, Label, RequestFacts, ResponseFacts, StreamEvent},
-    },
+    usage::streams::{EventFacts, Label, RequestFacts, ResponseFacts, StreamEvent},
 };
 
 use super::schema::{
-    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-    devices, llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
-    search_refs, search_texts,
+    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, devices,
+    llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events, search_refs,
+    search_texts,
 };
 
 #[derive(Queryable, Selectable)]
@@ -54,16 +51,9 @@ pub(super) struct NewDevice {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub(super) struct SessionRow {
     pub(super) id: String,
-    pub(super) user_id: String,
-    pub(super) device_context_id: String,
-    pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
-    pub(super) session_id: String,
     pub(super) started_at: i64,
     pub(super) ended_at: Option<i64>,
-    pub(super) metadata: String,
-    pub(super) created_at: i64,
-    pub(super) updated_at: i64,
 }
 
 #[derive(Insertable)]
@@ -80,35 +70,8 @@ pub(super) struct NewSession {
     pub(super) metadata: String,
     pub(super) created_at: i64,
     pub(super) updated_at: i64,
-}
-
-#[derive(Queryable, Selectable)]
-#[diesel(table_name = agent_turns)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub(super) struct TurnRow {
-    pub(super) id: String,
-    pub(super) user_id: String,
-    pub(super) session_pk: String,
-    pub(super) turn_index: i32,
-    pub(super) turn_key: Option<String>,
-    pub(super) started_at: i64,
-    pub(super) ended_at: Option<i64>,
-    pub(super) created_at: i64,
-    pub(super) updated_at: i64,
-}
-
-#[derive(Insertable)]
-#[diesel(table_name = agent_turns)]
-pub(super) struct NewTurn {
-    pub(super) id: String,
-    pub(super) user_id: String,
-    pub(super) session_pk: String,
-    pub(super) turn_index: i32,
-    pub(super) turn_key: Option<String>,
-    pub(super) started_at: i64,
-    pub(super) ended_at: Option<i64>,
-    pub(super) created_at: i64,
-    pub(super) updated_at: i64,
+    /// Changes whenever ingestion adds an event to the session.
+    pub(super) structure_revision: i64,
 }
 
 #[derive(Clone, Queryable, Selectable)]
@@ -119,12 +82,10 @@ pub(super) struct EventRow {
     pub(super) user_id: String,
     pub(super) device_context_id: String,
     pub(super) session_pk: String,
-    pub(super) turn_pk: String,
     pub(super) event_id: String,
     pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
     pub(super) session_id: String,
-    pub(super) turn_index: i32,
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
@@ -149,12 +110,10 @@ pub(super) struct NewEvent {
     pub(super) user_id: String,
     pub(super) device_context_id: String,
     pub(super) session_pk: String,
-    pub(super) turn_pk: String,
     pub(super) event_id: String,
     pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
     pub(super) session_id: String,
-    pub(super) turn_index: i32,
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
@@ -362,37 +321,15 @@ pub(super) struct DeviceRecord {
     pub(super) platform: String,
 }
 
-pub(super) struct SessionRecord {
-    pub(super) id: Uuid,
-    pub(super) user_id: Uuid,
-    pub(super) device_context_id: Uuid,
-    pub(super) agent_name: String,
-    pub(super) agent_version: Option<String>,
-    pub(super) session_id: String,
-    pub(super) started_at: DateTime<Utc>,
-    pub(super) ended_at: Option<DateTime<Utc>>,
-    pub(super) metadata: Value,
-}
-
-pub(super) struct TurnRecord {
-    pub(super) id: Uuid,
-    pub(super) turn_index: i32,
-    pub(super) started_at: DateTime<Utc>,
-    pub(super) ended_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Clone)]
 pub(super) struct EventRecord {
     pub(super) id: Uuid,
     pub(super) user_id: Uuid,
     pub(super) device_context_id: Uuid,
     pub(super) session_pk: Uuid,
-    pub(super) turn_pk: Uuid,
     pub(super) event_id: String,
     pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
     pub(super) session_id: String,
-    pub(super) turn_index: i32,
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
@@ -407,24 +344,6 @@ pub(super) struct EventRecord {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
-}
-
-impl TimelineEvent for EventRecord {
-    fn turn_index(&self) -> i32 {
-        self.turn_index
-    }
-
-    fn observed_at(&self) -> DateTime<Utc> {
-        self.observed_at
-    }
-
-    fn event_type(&self) -> &str {
-        &self.event_type
-    }
-
-    fn event_id(&self) -> &str {
-        &self.event_id
-    }
 }
 
 pub(super) struct AttachmentRecord {
@@ -453,40 +372,6 @@ impl DeviceRow {
     }
 }
 
-impl SessionRow {
-    pub(super) fn into_record(self) -> Result<SessionRecord, AppError> {
-        let _ = (self.created_at, self.updated_at);
-        Ok(SessionRecord {
-            id: parse_uuid(&self.id, "session id")?,
-            user_id: parse_uuid(&self.user_id, "session user id")?,
-            device_context_id: parse_uuid(&self.device_context_id, "session device id")?,
-            agent_name: self.agent_name,
-            agent_version: self.agent_version,
-            session_id: self.session_id,
-            started_at: timestamp_from_micros(self.started_at)?,
-            ended_at: self.ended_at.map(timestamp_from_micros).transpose()?,
-            metadata: parse_json(&self.metadata, "session metadata")?,
-        })
-    }
-}
-
-impl TurnRow {
-    pub(super) fn into_record(self) -> Result<TurnRecord, AppError> {
-        let _ = (
-            &self.user_id,
-            &self.session_pk,
-            self.created_at,
-            self.updated_at,
-        );
-        Ok(TurnRecord {
-            id: parse_uuid(&self.id, "turn id")?,
-            turn_index: self.turn_index,
-            started_at: timestamp_from_micros(self.started_at)?,
-            ended_at: self.ended_at.map(timestamp_from_micros).transpose()?,
-        })
-    }
-}
-
 impl EventRow {
     pub(super) fn into_record(self) -> Result<EventRecord, AppError> {
         let _ = self.created_at;
@@ -495,12 +380,10 @@ impl EventRow {
             user_id: parse_uuid(&self.user_id, "event user id")?,
             device_context_id: parse_uuid(&self.device_context_id, "event device id")?,
             session_pk: parse_uuid(&self.session_pk, "event session id")?,
-            turn_pk: parse_uuid(&self.turn_pk, "event turn id")?,
             event_id: self.event_id,
             agent_name: self.agent_name,
             agent_version: self.agent_version,
             session_id: self.session_id,
-            turn_index: self.turn_index,
             llm_provider: self.llm_provider,
             llm_model: self.llm_model,
             event_type: self.event_type,

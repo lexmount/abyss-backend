@@ -385,103 +385,28 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     )
 
     session_pk = raw_events[0]["session_pk"]
-    timeline = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{session_pk}",
-        token=token,
+    session_events = sorted(
+        raw_events,
+        key=lambda item: (item["observed_at"], item["event_type"], item["id"]),
     )
-    require_status(timeline, 200, "session timeline")
-    timeline_events = [
-        item
-        for turn in timeline.json()["turns"]
-        for item in turn["events"]
-    ]
-    trajectory = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{session_pk}/trajectory",
-        token=token,
-    )
-    require_status(trajectory, 200, "session trajectory")
-    usage_events = trajectory.json()["events"]
-    require(
-        [item["event_pk"] for item in usage_events]
-        == [item["id"] for item in timeline_events],
-        "trajectory usage must preserve every event in authoritative order",
-    )
-    for usage_event, timeline_event in zip(usage_events, timeline_events):
-        for field in (
-            "turn_index", "event_type", "observed_at", "llm_model",
-            "input_tokens", "output_tokens", "cache_read_tokens",
-            "cache_write_tokens", "reasoning_tokens", "total_tokens",
-        ):
-            require(
-                usage_event[field] == timeline_event[field],
-                f"trajectory usage {field} must match the authoritative event",
-            )
-        require(usage_event["token_usage_available"], "nonzero usage must be available")
-        require("text" not in usage_event and "metadata" not in usage_event,
-                "trajectory usage summaries must omit content bodies")
-    require(
-        [item["event_id"] for item in timeline_events]
-        == [request_event_id, response_event_id],
-        "session timeline must preserve request-before-response ordering",
-    )
-
-    outline = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{session_pk}/outline",
-        token=token,
-    )
-    require_status(outline, 200, "session outline")
-    outline_body = outline.json()
-    require(
-        outline_body["session"] == timeline.json()["session"],
-        "session outline must return the timeline session information",
-    )
-    outline_events = [
-        item for turn in outline_body["turns"] for item in turn["events"]
-    ]
-    require(
-        [item["id"] for item in outline_events]
-        == [item["id"] for item in timeline_events],
-        "session outline must preserve the timeline event order",
-    )
-    for outline_event, timeline_event in zip(outline_events, timeline_events):
-        require(
-            "text" not in outline_event and "metadata" not in outline_event,
-            "session outline events must omit content bodies",
-        )
-        for field in ("event_type", "llm_model", "total_tokens", "observed_at"):
-            require(
-                outline_event[field] == timeline_event[field],
-                f"session outline {field} must match the timeline event",
-            )
-        require(
-            outline_event["attachment_count"] == len(timeline_event["attachments"]),
-            "session outline must count event attachments",
-        )
-    missing_outline = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{uuid.uuid4()}/outline",
-        token=token,
-    )
-    require_status(missing_outline, 404, "unknown session outline")
-
-    for timeline_event in timeline_events:
+    for session_event in session_events:
         single = request(
             base_url,
             "GET",
-            f"/v1/agent-usage/events/{timeline_event['id']}",
+            f"/v1/agent-usage/events/{session_event['id']}",
             token=token,
         )
         require_status(single, 200, "single event query")
+        # A single event also says where it currently is in its session.
+        single_event = single.json()
+        location = single_event.pop("location", None)
         require(
-            single.json() == timeline_event,
-            "single event query must match the timeline event exactly",
+            single_event == session_event,
+            "single event query must match the raw event exactly",
+        )
+        require(
+            isinstance(location, dict) and location.get("segment"),
+            "single event query must carry the event's current segment",
         )
         require(
             IMAGE_BASE64.encode() not in single.body,
@@ -497,7 +422,7 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     unauthenticated_event = request(
         base_url,
         "GET",
-        f"/v1/agent-usage/events/{timeline_events[0]['id']}",
+        f"/v1/agent-usage/events/{session_events[0]['id']}",
     )
     require_status(unauthenticated_event, 401, "unauthenticated single event query")
 
@@ -539,22 +464,19 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     )
     require(
         all(
-            match["new"] is True and match["event_pk"] == timeline_events[1]["id"]
+            match["new"] is True and match["event_pk"] == session_events[1]["id"]
             for match in found["matches"]
         ),
         f"each match says whether it is new: {found['matches']}",
     )
     run_in_session_search_contract(
-        base_url, token, session_pk, [item["id"] for item in timeline_events], in_session
+        base_url, token, session_pk, [item["id"] for item in session_events], in_session
     )
 
     from session_titles_api import run_title_contract
 
     run_title_contract(base_url, token, run_id)
 
-    from turns_api import run_turn_contract
-
-    run_turn_contract(base_url, token, run_id)
     print(f"blackbox API contract passed for {session_id}")
 
 

@@ -41,43 +41,23 @@ CREATE TABLE agent_sessions (
     metadata TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    -- Advances on event ingestion so derived stream caches share one revision.
+    structure_revision INTEGER NOT NULL DEFAULT 0,
     UNIQUE (user_id, agent_name, session_id)
 ) STRICT;
 
 CREATE INDEX agent_sessions_user_time_idx
     ON agent_sessions (user_id, started_at DESC);
 
--- turn_key is the turn the Agent named for its requests, unique within the
--- session; it is NULL for the turn opened by requests naming none. turn_index
--- is the turn's position in the session by start time.
-CREATE TABLE agent_turns (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
-    session_pk TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
-    turn_index INTEGER NOT NULL CHECK (turn_index >= 1),
-    turn_key TEXT,
-    started_at INTEGER NOT NULL,
-    ended_at INTEGER,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE (session_pk, turn_index),
-    UNIQUE (session_pk, turn_key)
-) STRICT;
-
-CREATE INDEX agent_turns_user_session_idx
-    ON agent_turns (user_id, session_pk, turn_index);
-
 CREATE TABLE llm_usage_events (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
     device_context_id TEXT NOT NULL REFERENCES devices(id),
     session_pk TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
-    turn_pk TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE,
     event_id TEXT NOT NULL UNIQUE,
     agent_name TEXT NOT NULL,
     agent_version TEXT,
     session_id TEXT NOT NULL,
-    turn_index INTEGER NOT NULL CHECK (turn_index >= 1),
     llm_provider TEXT NOT NULL,
     llm_model TEXT NOT NULL,
     event_type TEXT NOT NULL CHECK (event_type IN ('request', 'response')),
@@ -103,8 +83,8 @@ CREATE TABLE llm_usage_events (
 CREATE INDEX llm_usage_events_user_time_idx
     ON llm_usage_events (user_id, observed_at DESC, id DESC);
 
-CREATE INDEX llm_usage_events_session_turn_idx
-    ON llm_usage_events (session_pk, turn_index, observed_at, id);
+CREATE INDEX llm_usage_events_session_order_idx
+    ON llm_usage_events (session_pk, observed_at, event_type, id);
 
 CREATE INDEX llm_usage_events_agent_model_time_idx
     ON llm_usage_events (agent_name, llm_provider, llm_model, observed_at DESC);
@@ -169,10 +149,9 @@ CREATE VIRTUAL TABLE usage_events_fts USING fts5(
 );
 
 
--- Session names read back from the Agents' own title-generation calls, kept
--- apart from agent_sessions so session rows keep their shape. purpose marks
--- sessions that exist only to generate a title, such as Codex naming threads,
--- and parent_session_pk the task session such a thread was matched to.
+-- The earliest request is the title anchor, including requests without a label.
+-- API titles read this event's existing stream facts; the historical title
+-- string is unused. purpose and parent_session_pk remain separate metadata.
 CREATE TABLE session_titles (
     session_pk TEXT PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -191,7 +170,7 @@ CREATE TABLE session_titles (
 CREATE INDEX llm_usage_events_summary_cover_idx
     ON llm_usage_events (
         user_id, observed_at, agent_name, llm_provider, llm_model, event_type,
-        device_context_id, session_pk, turn_pk, session_id,
+        device_context_id, session_pk, session_id,
         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
         reasoning_tokens, total_tokens
     );

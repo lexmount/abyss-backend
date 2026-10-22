@@ -1,12 +1,14 @@
 //! Diesel ORM implementation of SQLite usage ingest and relational queries.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 use diesel::{
     ExpressionMethods, IntoSql, NullableExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl,
     SelectableHelper, SqliteConnection,
-    dsl::{count_star, max},
     result::OptionalExtension,
     sql_query,
     sql_types::{BigInt, Bool, Nullable, Text},
@@ -15,17 +17,16 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
+    storage::stream_cache::StreamCache,
     usage::{
         IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
-        RawEventsResponse, SessionInfo, SessionOutlineResponse, SessionTimelineResponse,
-        SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline, UsageEventOutline,
-        UsageEventResponse, UsageEventType,
+        RawEventsResponse, SummaryQuery, SummaryResponse, SummaryRow, UsageEventResponse,
+        UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
         },
         diagnostics::IngestDiagnosticCapture,
-        event_order::UsageEventTimelineOrder,
         persistence::{
             exact_values_filter, non_empty, normalize_limit, normalize_text, parse_group_by,
             validate_batch, validate_event_type,
@@ -36,8 +37,8 @@ use crate::{
         },
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
-            RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent, segment_run,
-            session_streams as streams_of, stream_summary,
+            EventLocationResponse, RequestFacts, ResponseFacts, SessionStreamsResponse,
+            SessionStructure, StreamEvent,
         },
     },
 };
@@ -46,13 +47,11 @@ use super::{
     models::{
         AttachmentRow, DeviceRecord, DeviceRow, EventRecord, EventRow, NewAttachment, NewDevice,
         NewDiagnosticCapture, NewDiagnosticCaptureEvent, NewEvent, NewSession, NewStreamFacts,
-        NewTurn, SessionRecord, SessionRow, StreamEventRow, TurnRecord, TurnRow, parse_uuid,
-        timestamp_from_micros,
+        SessionRow, StreamEventRow, parse_uuid, timestamp_from_micros,
     },
     schema::{
-        agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-        app_users, devices, llm_usage_event_attachments, llm_usage_event_stream_facts,
-        llm_usage_events,
+        agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, app_users,
+        devices, llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
     },
     search::index_event,
     session_titles,
@@ -65,7 +64,7 @@ pub(super) fn ingest_events(
     max_batch_size: usize,
 ) -> Result<IngestEventsResponse, AppError> {
     let validated_attachments = validate_batch(request, max_batch_size)?;
-    // Reserve the single SQLite writer before allocating turn indexes.
+    // Reserve the single SQLite writer before updating session metadata.
     let (accepted, duplicates, accepted_captures, duplicate_captures) = connection
         .immediate_transaction(|transaction| {
             let mut accepted = 0_usize;
@@ -134,14 +133,6 @@ fn ingest_one_event(
         observed_at,
         now,
     )?;
-    let (turn_pk, turn_index) = place_in_turn(
-        connection,
-        user_id,
-        session_pk,
-        event.turn_id.as_deref(),
-        observed_at,
-        now,
-    )?;
     let tokens = &event.token_usage;
     let event_pk = Uuid::now_v7();
     let metadata = serialize_json(&event.metadata, "event metadata")?;
@@ -152,12 +143,10 @@ fn ingest_one_event(
             user_id: user_id.to_string(),
             device_context_id: device_id.to_string(),
             session_pk: session_pk.to_string(),
-            turn_pk: turn_pk.to_string(),
             event_id,
             agent_name: agent_name.clone(),
             agent_version,
             session_id: event.session_id.clone(),
-            turn_index,
             llm_provider: provider,
             llm_model: model,
             event_type: event.event_type.as_str().to_owned(),
@@ -196,8 +185,6 @@ fn ingest_one_event(
             session_pk,
             event_pk,
             event_type: event.event_type.as_str(),
-            metadata: &event.metadata,
-            naming_thread: event.naming_thread,
             observed_at,
         },
     )?;
@@ -286,6 +273,10 @@ fn upsert_device(
     clippy::too_many_arguments,
     reason = "The session upsert receives one explicit value for every evolving boundary."
 )]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Diesel builds an atomic SQL increment, not a Rust integer addition."
+)]
 fn upsert_session(
     connection: &mut SqliteConnection,
     user_id: Uuid,
@@ -317,6 +308,7 @@ fn upsert_session(
                     existing.ended_at.unwrap_or(observed_at).max(observed_at),
                 )),
                 agent_sessions::updated_at.eq(now),
+                agent_sessions::structure_revision.eq(agent_sessions::structure_revision + 1_i64),
             ))
             .execute(connection)?;
         return Ok(id);
@@ -336,166 +328,10 @@ fn upsert_session(
             metadata: "{}".to_owned(),
             created_at: now,
             updated_at: now,
+            structure_revision: 1,
         })
         .execute(connection)?;
     Ok(id)
-}
-
-/// Places an event in a turn of its session and returns the turn's id and
-/// position.
-///
-/// Events naming the same turn share it, and an event naming none joins the
-/// turn in progress when it was observed. Turns are numbered by when they
-/// started, so a turn that arrives late moves the turns after it.
-fn place_in_turn(
-    connection: &mut SqliteConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-    turn_id: Option<&str>,
-    observed_at: i64,
-    now: i64,
-) -> Result<(Uuid, i32), AppError> {
-    let session = session_pk.to_string();
-    let found = match turn_id {
-        Some(key) => named_turn(connection, &session, key)?,
-        None => turn_in_progress(connection, &session, observed_at)?,
-    };
-    let (turn_pk, turn_index, reordered) = if let Some(turn) = found {
-        diesel::update(agent_turns::table.find(&turn.id))
-            .set((
-                agent_turns::started_at.eq(turn.started_at.min(observed_at)),
-                agent_turns::ended_at
-                    .eq(Some(turn.ended_at.unwrap_or(observed_at).max(observed_at))),
-                agent_turns::updated_at.eq(now),
-            ))
-            .execute(connection)?;
-        (turn.id, turn.turn_index, observed_at < turn.started_at)
-    } else {
-        let last = agent_turns::table
-            .filter(agent_turns::session_pk.eq(&session))
-            .select(max(agent_turns::turn_index))
-            .first::<Option<i32>>(connection)?;
-        let id = Uuid::now_v7().to_string();
-        let turn_index = last.unwrap_or(0_i32).saturating_add(1_i32);
-        diesel::insert_into(agent_turns::table)
-            .values(NewTurn {
-                id: id.clone(),
-                user_id: user_id.to_string(),
-                session_pk: session.clone(),
-                turn_index,
-                turn_key: turn_id.map(str::to_owned),
-                started_at: observed_at,
-                ended_at: Some(observed_at),
-                created_at: now,
-                updated_at: now,
-            })
-            .execute(connection)?;
-        (id, turn_index, last.is_some())
-    };
-    let turn_index = if reordered && number_turns(connection, &session)? {
-        agent_turns::table
-            .find(&turn_pk)
-            .select(agent_turns::turn_index)
-            .first::<i32>(connection)?
-    } else {
-        turn_index
-    };
-    Ok((parse_uuid(&turn_pk, "turn id")?, turn_index))
-}
-
-/// The turn named `key` in a session. The first named turn adopts the turn
-/// that events naming none opened at the start of the session.
-fn named_turn(
-    connection: &mut SqliteConnection,
-    session: &str,
-    key: &str,
-) -> Result<Option<TurnRow>, AppError> {
-    let named = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session))
-        .filter(agent_turns::turn_key.eq(key))
-        .select(TurnRow::as_select())
-        .first::<TurnRow>(connection)
-        .optional()?;
-    if named.is_some() {
-        return Ok(named);
-    }
-    let mut turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session))
-        .select(TurnRow::as_select())
-        .limit(2_i64)
-        .load::<TurnRow>(connection)?;
-    let opening = match turns.as_slice() {
-        [turn] if turn.turn_key.is_none() => turns.pop(),
-        _ => None,
-    };
-    if let Some(turn) = &opening {
-        diesel::update(agent_turns::table.find(&turn.id))
-            .set(agent_turns::turn_key.eq(key))
-            .execute(connection)?;
-    }
-    Ok(opening)
-}
-
-/// The turn in progress when an event naming no turn was observed: the latest
-/// turn started by then, else the first turn of the session.
-fn turn_in_progress(
-    connection: &mut SqliteConnection,
-    session: &str,
-    observed_at: i64,
-) -> Result<Option<TurnRow>, AppError> {
-    let started = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session))
-        .filter(agent_turns::started_at.le(observed_at))
-        .order_by((agent_turns::started_at.desc(), agent_turns::id.desc()))
-        .select(TurnRow::as_select())
-        .first::<TurnRow>(connection)
-        .optional()?;
-    if started.is_some() {
-        return Ok(started);
-    }
-    agent_turns::table
-        .filter(agent_turns::session_pk.eq(session))
-        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
-        .select(TurnRow::as_select())
-        .first::<TurnRow>(connection)
-        .optional()
-        .map_err(AppError::from)
-}
-
-/// Numbers the turns of a session, and their events, by when the turns
-/// started. Writes nothing and returns `false` while the numbers already
-/// follow that order.
-fn number_turns(connection: &mut SqliteConnection, session: &str) -> Result<bool, AppError> {
-    let turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session))
-        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
-        .select((agent_turns::id, agent_turns::turn_index))
-        .load::<(String, i32)>(connection)?;
-    let moved = turns
-        .iter()
-        .zip(1_i32..)
-        .filter(|((_, index), position)| index != position)
-        .collect::<Vec<_>>();
-    if moved.is_empty() {
-        return Ok(false);
-    }
-    // Moved turns first step above every current number, so no single-row
-    // update collides with another turn's number or goes below one.
-    let above = turns.iter().map(|(_, index)| *index).max().unwrap_or(0_i32);
-    for ((id, _), position) in &moved {
-        diesel::update(agent_turns::table.find(id))
-            .set(agent_turns::turn_index.eq(above.saturating_add(*position)))
-            .execute(connection)?;
-    }
-    for ((id, _), position) in moved {
-        diesel::update(agent_turns::table.find(id))
-            .set(agent_turns::turn_index.eq(position))
-            .execute(connection)?;
-        diesel::update(llm_usage_events::table.filter(llm_usage_events::turn_pk.eq(id)))
-            .set(llm_usage_events::turn_index.eq(position))
-            .execute(connection)?;
-    }
-    Ok(true)
 }
 
 /// Derives the streams of one session's events from their stream facts,
@@ -504,14 +340,56 @@ pub(super) fn session_streams(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
+    cache: &StreamCache,
 ) -> Result<SessionStreamsResponse, AppError> {
-    let events = stream_events(connection, user_id, session_pk)?;
-    if events.is_empty() {
-        return Err(AppError::not_found(format!(
-            "session not found: {session_pk}"
-        )));
-    }
-    Ok(streams_of(session_pk, events))
+    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    Ok(structure.session_streams(session_pk))
+}
+
+/// Uses the caller's read transaction so the revision and facts are one snapshot.
+/// A cache hit reads only the session revision; it does not load the event facts.
+pub(super) fn session_structure(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+    cache: &StreamCache,
+) -> Result<Arc<SessionStructure>, AppError> {
+    let revision = agent_sessions::table
+        .filter(agent_sessions::user_id.eq(user_id.to_string()))
+        .filter(agent_sessions::id.eq(session_pk.to_string()))
+        .select(agent_sessions::structure_revision)
+        .first::<i64>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
+    cache.get_or_load(user_id, session_pk, revision, || {
+        let events = stream_events(connection, user_id, session_pk)?;
+        if events.is_empty() {
+            return Err(AppError::not_found(format!(
+                "session not found: {session_pk}"
+            )));
+        }
+        Ok(events)
+    })
+}
+
+/// Resolves an authorized event without reading its body or attachments.
+pub(super) fn event_location(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+    cache: &StreamCache,
+) -> Result<EventLocationResponse, AppError> {
+    let session_pk = llm_usage_events::table
+        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
+        .filter(llm_usage_events::id.eq(event_pk.to_string()))
+        .select(llm_usage_events::session_pk)
+        .first::<String>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))?;
+    let session_pk = parse_uuid(&session_pk, "session primary key")?;
+    session_structure(connection, user_id, session_pk, cache)?
+        .event_location(session_pk, event_pk)
+        .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))
 }
 
 /// Columns of one session event the header reads.
@@ -535,6 +413,7 @@ pub(super) fn session_header(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
+    cache: &StreamCache,
 ) -> Result<SessionHeaderResponse, AppError> {
     let events = llm_usage_events::table
         .filter(llm_usage_events::user_id.eq(user_id.to_string()))
@@ -562,8 +441,9 @@ pub(super) fn session_header(
             "session not found: {session_pk}"
         )));
     }
-    let summary = stream_summary(stream_events(connection, user_id, session_pk)?);
-    Ok(header_of(session_pk, events, summary))
+    let summary = session_structure(connection, user_id, session_pk, cache)?.summary();
+    let title = session_titles::title(connection, session_pk)?;
+    Ok(header_of(session_pk, events, &summary, title))
 }
 
 fn header_event(
@@ -608,9 +488,10 @@ pub(super) fn session_segment(
     session_pk: Uuid,
     head: &str,
     query: &ValidatedSegmentQuery,
+    cache: &StreamCache,
 ) -> Result<SegmentResponse, AppError> {
-    let events = stream_events(connection, user_id, session_pk)?;
-    let run = segment_run(events, head).ok_or_else(|| {
+    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let run = structure.segment_run(head).ok_or_else(|| {
         AppError::not_found(format!(
             "exchange not found in session {session_pk}: {head}"
         ))
@@ -807,7 +688,6 @@ pub(super) fn raw_events(
             agent_names: &query.agent_name,
             session_ids: &query.session_id,
             session_pk: query.session_pk,
-            turn_index: query.turn_index,
             llm_providers: &query.llm_provider,
             llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
@@ -852,7 +732,6 @@ struct EventFilters<'a> {
     agent_names: &'a [String],
     session_ids: &'a [String],
     session_pk: Option<Uuid>,
-    turn_index: Option<i32>,
     llm_providers: &'a [String],
     llm_models: &'a [String],
     event_type: Option<&'a str>,
@@ -887,9 +766,6 @@ fn load_filtered_events(
     if let Some(session_pk) = filters.session_pk {
         query = query.filter(llm_usage_events::session_pk.eq(session_pk.to_string()));
     }
-    if let Some(turn_index) = filters.turn_index {
-        query = query.filter(llm_usage_events::turn_index.eq(turn_index));
-    }
     let providers = exact_values_filter(filters.llm_providers);
     if !providers.is_empty() {
         query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
@@ -904,6 +780,7 @@ fn load_filtered_events(
     let query = query
         .order_by((
             llm_usage_events::observed_at.desc(),
+            llm_usage_events::event_type.asc(),
             llm_usage_events::id.desc(),
         ))
         .limit(filters.limit)
@@ -919,12 +796,10 @@ fn load_filtered_events(
                 llm_usage_events::user_id,
                 llm_usage_events::device_context_id,
                 llm_usage_events::session_pk,
-                llm_usage_events::turn_pk,
                 llm_usage_events::event_id,
                 llm_usage_events::agent_name,
                 llm_usage_events::agent_version,
                 llm_usage_events::session_id,
-                llm_usage_events::turn_index,
                 llm_usage_events::llm_provider,
                 llm_usage_events::llm_model,
                 llm_usage_events::event_type,
@@ -944,188 +819,6 @@ fn load_filtered_events(
             .load::<EventRow>(connection)?
     };
     rows.into_iter().map(EventRow::into_record).collect()
-}
-
-pub(super) fn session_timeline(
-    connection: &mut SqliteConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-) -> Result<SessionTimelineResponse, AppError> {
-    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
-    let mut events = llm_usage_events::table
-        .filter(llm_usage_events::session_pk.eq(session.id.to_string()))
-        .order_by((
-            llm_usage_events::turn_index.asc(),
-            llm_usage_events::observed_at.asc(),
-            llm_usage_events::id.asc(),
-        ))
-        .select(EventRow::as_select())
-        .load::<EventRow>(connection)?
-        .into_iter()
-        .map(EventRow::into_record)
-        .collect::<Result<Vec<_>, _>>()?;
-    UsageEventTimelineOrder::sort(&mut events);
-    let devices = load_device_contexts(connection, &events)?;
-    let mut attachments = load_attachments(connection, &events)?;
-    let mut events_by_turn: HashMap<Uuid, Vec<UsageEventResponse>> = HashMap::new();
-    for event in events {
-        let event_pk = event.id;
-        let device_id = event.device_context_id;
-        events_by_turn
-            .entry(event.turn_pk)
-            .or_default()
-            .push(event_response(
-                event,
-                devices.get(&device_id),
-                attachments.remove(&event_pk).unwrap_or_default(),
-            ));
-    }
-    let mut timeline = assemble_timeline(session, turns, events_by_turn);
-    session_titles::fill(connection, &mut timeline.session)?;
-    Ok(timeline)
-}
-
-type OutlineRow = (
-    String,
-    String,
-    String,
-    i32,
-    String,
-    String,
-    String,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-);
-
-pub(super) fn session_outline(
-    connection: &mut SqliteConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-) -> Result<SessionOutlineResponse, AppError> {
-    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
-    // Only fixed-size columns are selected, so the outline stays small no
-    // matter how large event metadata grows.
-    let rows = llm_usage_events::table
-        .filter(llm_usage_events::session_pk.eq(session.id.to_string()))
-        .select((
-            llm_usage_events::id,
-            llm_usage_events::event_id,
-            llm_usage_events::turn_pk,
-            llm_usage_events::turn_index,
-            llm_usage_events::llm_provider,
-            llm_usage_events::llm_model,
-            llm_usage_events::event_type,
-            llm_usage_events::input_tokens,
-            llm_usage_events::output_tokens,
-            llm_usage_events::cache_read_tokens,
-            llm_usage_events::cache_write_tokens,
-            llm_usage_events::reasoning_tokens,
-            llm_usage_events::total_tokens,
-            llm_usage_events::observed_at,
-        ))
-        .load::<OutlineRow>(connection)?;
-    let event_ids = rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>();
-    let attachment_counts = llm_usage_event_attachments::table
-        .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
-        .group_by(llm_usage_event_attachments::event_pk)
-        .select((llm_usage_event_attachments::event_pk, count_star()))
-        .load::<(String, i64)>(connection)?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-    let mut events = rows
-        .into_iter()
-        .map(|row| {
-            let attachment_count = attachment_counts.get(&row.0).copied().unwrap_or(0);
-            Ok(UsageEventOutline {
-                id: parse_uuid(&row.0, "event id")?,
-                event_id: row.1,
-                turn_pk: parse_uuid(&row.2, "event turn id")?,
-                turn_index: row.3,
-                llm_provider: row.4,
-                llm_model: row.5,
-                event_type: row.6,
-                input_tokens: row.7,
-                output_tokens: row.8,
-                cache_read_tokens: row.9,
-                cache_write_tokens: row.10,
-                reasoning_tokens: row.11,
-                total_tokens: row.12,
-                observed_at: timestamp_from_micros(row.13)?,
-                attachment_count,
-            })
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
-    UsageEventTimelineOrder::sort(&mut events);
-    let mut events_by_turn: HashMap<Uuid, Vec<UsageEventOutline>> = HashMap::new();
-    for event in events {
-        events_by_turn.entry(event.turn_pk).or_default().push(event);
-    }
-    let mut timeline = assemble_timeline(session, turns, events_by_turn);
-    session_titles::fill(connection, &mut timeline.session)?;
-    Ok(timeline)
-}
-
-fn load_session_turns(
-    connection: &mut SqliteConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-) -> Result<(SessionRecord, Vec<TurnRecord>), AppError> {
-    let session = agent_sessions::table
-        .filter(agent_sessions::id.eq(session_pk.to_string()))
-        .filter(agent_sessions::user_id.eq(user_id.to_string()))
-        .select(SessionRow::as_select())
-        .first::<SessionRow>(connection)
-        .optional()?
-        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?
-        .into_record()?;
-    let turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session.id.to_string()))
-        .order_by(agent_turns::turn_index.asc())
-        .select(TurnRow::as_select())
-        .load::<TurnRow>(connection)?
-        .into_iter()
-        .map(TurnRow::into_record)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((session, turns))
-}
-
-fn assemble_timeline<E>(
-    session: SessionRecord,
-    turns: Vec<TurnRecord>,
-    mut events_by_turn: HashMap<Uuid, Vec<E>>,
-) -> SessionTimelineResponse<E> {
-    let turn_timelines = turns
-        .into_iter()
-        .map(|turn| TurnTimeline {
-            turn_pk: turn.id,
-            turn_index: turn.turn_index,
-            started_at: turn.started_at,
-            ended_at: turn.ended_at,
-            events: events_by_turn.remove(&turn.id).unwrap_or_default(),
-        })
-        .collect();
-    SessionTimelineResponse {
-        session: SessionInfo {
-            session_pk: session.id,
-            user_id: session.user_id,
-            device_context_id: session.device_context_id,
-            agent_name: session.agent_name,
-            agent_version: session.agent_version,
-            session_id: session.session_id,
-            started_at: session.started_at,
-            ended_at: session.ended_at,
-            metadata: session.metadata,
-            title: None,
-            purpose: None,
-            parent_session_pk: None,
-        },
-        turns: turn_timelines,
-    }
 }
 
 pub(super) fn usage_event(
@@ -1274,7 +967,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         CASE WHEN ?5 THEN e.llm_model END AS llm_model, \
         CASE WHEN ?6 THEN e.event_type END AS event_type, \
         COUNT(DISTINCT e.session_pk) AS sessions, \
-        COUNT(DISTINCT e.turn_pk) AS turns, \
+        COUNT(*) FILTER (WHERE f.starts_turn = 1) AS turns, \
         COUNT(*) FILTER (WHERE e.event_type = 'request') AS requests, \
         COUNT(*) FILTER (WHERE e.event_type = 'response') AS responses, \
         COALESCE(SUM(e.input_tokens), 0) AS input_tokens, \
@@ -1284,6 +977,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         COALESCE(SUM(e.reasoning_tokens), 0) AS reasoning_tokens, \
         COALESCE(SUM(e.total_tokens), 0) AS total_tokens \
     FROM llm_usage_events e \
+    LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
     LEFT JOIN devices d ON ?2 AND d.id = e.device_context_id \
     WHERE e.user_id = ?7 \
         AND e.observed_at >= ?8 \
@@ -1531,11 +1225,10 @@ fn event_response(
         host_name: device.map(|value| value.host_name.clone()),
         platform: device.map(|value| value.platform.clone()),
         session_pk: event.session_pk,
-        turn_pk: event.turn_pk,
+        location: None,
         agent_name: event.agent_name,
         agent_version: event.agent_version,
         session_id: event.session_id,
-        turn_index: event.turn_index,
         llm_provider: event.llm_provider,
         llm_model: event.llm_model,
         event_type: event.event_type,
@@ -1565,6 +1258,7 @@ pub(super) const fn timestamp_to_micros(value: DateTime<Utc>) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::stream_cache::StreamCache;
     use diesel::{
         Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star,
         sql_query,
@@ -1584,7 +1278,7 @@ mod tests {
     use super::{
         super::{
             migrations,
-            schema::{agent_sessions, agent_turns, llm_usage_event_stream_facts, llm_usage_events},
+            schema::{agent_sessions, llm_usage_event_stream_facts, llm_usage_events},
             search,
         },
         event_conversation, ingest_events, raw_events, session_header, session_segment,
@@ -1677,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_body_archive_survives_ingest_retries_and_trajectory_projection() {
+    fn raw_body_archive_survives_ingest_retries_and_preview_projection() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use sha2::Digest as _;
         let original =
@@ -1692,13 +1386,13 @@ mod tests {
         let expected = request.events[0].metadata.clone();
         ingest_events(&mut database, &request, OWNER_ID, 100).unwrap();
         ingest_events(&mut database, &request, OWNER_ID, 100).unwrap();
-        let session_pk = llm_usage_events::table
-            .select(llm_usage_events::session_pk)
+        let event_pk = llm_usage_events::table
+            .select(llm_usage_events::id)
             .first::<String>(&mut database)
             .unwrap();
-        let session_pk = Uuid::parse_str(&session_pk).unwrap();
-        let timeline = super::session_timeline(&mut database, OWNER_ID, session_pk).unwrap();
-        let stored = &timeline.turns[0].events[0].metadata;
+        let event_pk = Uuid::parse_str(&event_pk).unwrap();
+        let event = super::usage_event(&mut database, OWNER_ID, event_pk).unwrap();
+        let stored = &event.metadata;
         assert_eq!(*stored, expected);
         assert_eq!(
             STANDARD
@@ -1710,11 +1404,11 @@ mod tests {
                 .unwrap(),
             original
         );
-        let trajectory = crate::usage::trajectory::build(timeline);
-        assert_eq!(trajectory.items[0].text.as_deref(), Some("hello"));
-        let after = super::session_timeline(&mut database, OWNER_ID, session_pk).unwrap();
-        assert_eq!(after.turns[0].events.len(), 1);
-        assert_eq!(after.turns[0].events[0].metadata, expected);
+        let preview =
+            event_conversation(&mut database, OWNER_ID, event_pk, &Window::default()).unwrap();
+        assert_eq!(preview.chunks[0].entries[0]["text"].as_str(), Some("hello"));
+        let after = super::usage_event(&mut database, OWNER_ID, event_pk).unwrap();
+        assert_eq!(after.metadata, expected);
     }
 
     #[test]
@@ -1864,7 +1558,7 @@ mod tests {
     #[test]
     fn session_streams_link_stored_exchanges() {
         let (mut database, session_pk) = streams_database();
-        let streams = session_streams(&mut database, OWNER_ID, session_pk)
+        let streams = session_streams(&mut database, OWNER_ID, session_pk, &StreamCache::default())
             .expect("the session's streams derive");
         let segments = streams
             .segments
@@ -1881,7 +1575,13 @@ mod tests {
             (0_i32, "fix the bug", 11_i32)
         );
         assert!(
-            session_streams(&mut database, OWNER_ID, Uuid::nil()).is_err(),
+            session_streams(
+                &mut database,
+                OWNER_ID,
+                Uuid::nil(),
+                &StreamCache::default()
+            )
+            .is_err(),
             "a session without events is not found"
         );
     }
@@ -1895,8 +1595,15 @@ mod tests {
         }
         .validate()
         .expect("a valid query");
-        let segment = session_segment(&mut database, OWNER_ID, session_pk, "r1", &query)
-            .expect("the whole segment");
+        let segment = session_segment(
+            &mut database,
+            OWNER_ID,
+            session_pk,
+            "r1",
+            &query,
+            &StreamCache::default(),
+        )
+        .expect("the whole segment");
         assert_eq!(segment.segment, "r1");
         let r2 = &segment.exchanges[1];
         assert_eq!(
@@ -1916,7 +1623,17 @@ mod tests {
             request.chunks[0].entries[0],
             json!({"role": "user", "text": "fix", "text_length": 11_usize})
         );
-        assert!(session_segment(&mut database, OWNER_ID, session_pk, "zz", &query).is_err());
+        assert!(
+            session_segment(
+                &mut database,
+                OWNER_ID,
+                session_pk,
+                "zz",
+                &query,
+                &StreamCache::default()
+            )
+            .is_err()
+        );
 
         let window = Window::parse(&PreviewQuery {
             entries: Some("-1".to_owned()),
@@ -1937,7 +1654,8 @@ mod tests {
     #[test]
     fn the_session_header_sums_its_events() {
         let (mut database, session_pk) = streams_database();
-        let header = session_header(&mut database, OWNER_ID, session_pk).expect("the header");
+        let header = session_header(&mut database, OWNER_ID, session_pk, &StreamCache::default())
+            .expect("the header");
         assert_eq!(
             (
                 header.event_count,
@@ -1956,11 +1674,19 @@ mod tests {
             chrono::TimeDelta::seconds(3)
         );
         assert_eq!(
-            header.title.as_ref().map(|title| title.text.as_str()),
+            header.title.as_ref().map(|label| label.text.as_str()),
             Some("fix the bug"),
-            "the title is the first request's label"
+            "the title is the first request label"
         );
-        assert!(session_header(&mut database, OWNER_ID, Uuid::nil()).is_err());
+        assert!(
+            session_header(
+                &mut database,
+                OWNER_ID,
+                Uuid::nil(),
+                &StreamCache::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1989,7 +1715,7 @@ mod tests {
 
     fn summary_seeded() -> SqliteConnection {
         let mut database = database();
-        let event = |id: &str, agent: &str, session: &str, turn: i32, observed_at: &str| {
+        let event = |id: &str, agent: &str, session: &str, observed_at: &str| {
             let (provider, model) = if agent == "codex" {
                 ("openai", "gpt-5")
             } else {
@@ -2001,7 +1727,6 @@ mod tests {
                 "device": {"host_name": "alice-mbp", "platform": "macos", "os_version": "15.1"},
                 "agent": {"name": agent},
                 "session_id": session,
-                "turn_id": format!("{session}-{turn}"),
                 "llm": {"provider": provider, "model": model},
                 "event_type": if id.ends_with("req") { "request" } else { "response" },
                 "token_usage": if id.ends_with("req") {
@@ -2009,16 +1734,24 @@ mod tests {
                 } else {
                     json!({"input_tokens": 0_i64, "output_tokens": 5_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 5_i64})
                 },
-                "metadata": {"raw_body": "large"}
+                // A request asking in words opens a turn; a response opens none.
+                "metadata": if id.ends_with("req") {
+                    json!({"raw_body": "large", "conversation": {
+                        "entries": [{"role": "user", "text": "ask"}],
+                        "completeness": "complete"
+                    }})
+                } else {
+                    json!({"raw_body": "large"})
+                }
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({
             "events": [
-                event("a-req", "codex", "alpha", 1_i32, "2026-09-01T23:00:00Z"),
-                event("a-res", "codex", "alpha", 1_i32, "2026-09-01T23:30:00Z"),
-                event("b-req", "claude-desktop", "beta", 1_i32, "2026-09-02T01:00:00Z"),
-                event("c-res", "claude-code", "gamma", 1_i32, "2026-09-02T02:00:00Z"),
-                event("a2-req", "codex", "alpha", 2_i32, "2026-09-03T00:00:00Z"),
+                event("a-req", "codex", "alpha", "2026-09-01T23:00:00Z"),
+                event("a-res", "codex", "alpha", "2026-09-01T23:30:00Z"),
+                event("b-req", "claude-desktop", "beta", "2026-09-02T01:00:00Z"),
+                event("c-res", "claude-code", "gamma", "2026-09-02T02:00:00Z"),
+                event("a2-req", "codex", "alpha", "2026-09-03T00:00:00Z"),
             ]
         }))
         .expect("request should deserialize");
@@ -2062,7 +1795,7 @@ mod tests {
                 {
                     "agent_name": "claude-code", "llm_provider": "anthropic",
                     "llm_model": "claude-x",
-                    "sessions": 1_i64, "turns": 1_i64, "requests": 0_i64, "responses": 1_i64,
+                    "sessions": 1_i64, "turns": 0_i64, "requests": 0_i64, "responses": 1_i64,
                     "input_tokens": 0_i64, "output_tokens": 5_i64, "cache_read_tokens": 0_i64,
                     "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 5_i64
                 }
@@ -2171,177 +1904,6 @@ mod tests {
 
     /// One request observed `second` seconds into a fixed minute, working for
     /// `turn` when it names one.
-    fn turn_event(id: &str, agent: &str, second: u32, turn: Option<&str>) -> serde_json::Value {
-        json!({
-            "event_id": id,
-            "observed_at": format!("2026-10-08T00:00:{second:02}Z"),
-            "device": {"host_name": "local", "platform": "macos"},
-            "agent": {"name": agent},
-            "session_id": "thread-session",
-            "turn_id": turn,
-            "llm": {"provider": "Anthropic", "model": "claude-x"},
-            "event_type": "request",
-            "token_usage": {"input_tokens": 1_i64, "output_tokens": 0_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 1_i64},
-            "metadata": {}
-        })
-    }
-
-    fn ingest_turn_events(database: &mut SqliteConnection, events: Vec<serde_json::Value>) {
-        let request: IngestEventsRequest =
-            serde_json::from_value(json!({"events": serde_json::Value::Array(events)}))
-                .expect("request should deserialize");
-        ingest_events(database, &request, OWNER_ID, 100).expect("ingest should succeed");
-    }
-
-    fn turn_of(database: &mut SqliteConnection, event_id: &str) -> i32 {
-        llm_usage_events::table
-            .filter(llm_usage_events::event_id.eq(event_id))
-            .select(llm_usage_events::turn_index)
-            .first::<i32>(database)
-            .expect("event should be stored")
-    }
-
-    /// Stored turns in number order: key, number, start and end second.
-    fn turns(database: &mut SqliteConnection) -> Vec<(Option<String>, i32, i64, Option<i64>)> {
-        agent_turns::table
-            .order_by(agent_turns::turn_index.asc())
-            .select((
-                agent_turns::turn_key,
-                agent_turns::turn_index,
-                agent_turns::started_at,
-                agent_turns::ended_at,
-            ))
-            .load::<(Option<String>, i32, i64, Option<i64>)>(database)
-            .expect("turns should load")
-    }
-
-    fn second(value: i64) -> i64 {
-        super::timestamp_to_micros(
-            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-08T00:00:{value:02}Z"))
-                .expect("timestamp should parse")
-                .into(),
-        )
-    }
-
-    #[test]
-    fn events_naming_a_turn_share_it_and_others_join_the_turn_in_progress() {
-        let mut database = database();
-        ingest_turn_events(
-            &mut database,
-            vec![
-                turn_event("main-1", "codex", 10, Some("p1")),
-                turn_event("subagent-1", "codex", 12, Some("p1")),
-                turn_event("recap", "codex", 20, None),
-                turn_event("main-2", "codex", 30, Some("p2")),
-                turn_event("subagent-2", "codex", 40, Some("p2")),
-            ],
-        );
-        // Delivered late: a request naming no turn observed during turn 2, and
-        // a background agent of turn 1 still working during turn 2.
-        ingest_turn_events(
-            &mut database,
-            vec![
-                turn_event("late-title", "codex", 32, None),
-                turn_event("late-subagent", "codex", 45, Some("p1")),
-            ],
-        );
-
-        for (event, turn) in [
-            ("main-1", 1_i32),
-            ("subagent-1", 1_i32),
-            ("recap", 1_i32),
-            ("late-subagent", 1_i32),
-            ("main-2", 2_i32),
-            ("subagent-2", 2_i32),
-            ("late-title", 2_i32),
-        ] {
-            assert_eq!(turn_of(&mut database, event), turn, "{event}");
-        }
-        assert_eq!(
-            turns(&mut database),
-            vec![
-                (Some("p1".to_owned()), 1_i32, second(10), Some(second(45))),
-                (Some("p2".to_owned()), 2_i32, second(30), Some(second(40))),
-            ]
-        );
-    }
-
-    #[test]
-    fn the_first_named_turn_adopts_the_turn_opened_without_one() {
-        let mut database = database();
-        ingest_turn_events(
-            &mut database,
-            vec![turn_event("probe", "claude-code", 5, None)],
-        );
-        ingest_turn_events(
-            &mut database,
-            vec![
-                turn_event("main-1", "claude-code", 10, Some("p1")),
-                turn_event("main-2", "claude-code", 30, Some("p2")),
-                // Earlier than every turn: joins the first one.
-                turn_event("early", "claude-code", 1, None),
-            ],
-        );
-
-        assert_eq!(turn_of(&mut database, "probe"), 1_i32);
-        assert_eq!(turn_of(&mut database, "main-1"), 1_i32);
-        assert_eq!(turn_of(&mut database, "early"), 1_i32);
-        assert_eq!(turn_of(&mut database, "main-2"), 2_i32);
-        assert_eq!(
-            turns(&mut database),
-            vec![
-                (Some("p1".to_owned()), 1_i32, second(1), Some(second(10))),
-                (Some("p2".to_owned()), 2_i32, second(30), Some(second(30))),
-            ]
-        );
-    }
-
-    #[test]
-    fn turns_are_numbered_by_start_time_whatever_order_they_arrive_in() {
-        let mut database = database();
-        ingest_turn_events(
-            &mut database,
-            vec![
-                turn_event("b", "codex", 30, Some("b")),
-                turn_event("b-next", "codex", 31, Some("b")),
-                turn_event("c", "codex", 50, Some("c")),
-            ],
-        );
-        assert_eq!(turn_of(&mut database, "c"), 2_i32);
-
-        // A turn delivered late started first.
-        ingest_turn_events(&mut database, vec![turn_event("a", "codex", 10, Some("a"))]);
-        for (event, turn) in [("a", 1_i32), ("b", 2_i32), ("b-next", 2_i32), ("c", 3_i32)] {
-            assert_eq!(turn_of(&mut database, event), turn, "{event}");
-        }
-
-        // A late event of a known turn moves its start before every other turn.
-        ingest_turn_events(
-            &mut database,
-            vec![turn_event("c-early", "codex", 5, Some("c"))],
-        );
-        for (event, turn) in [
-            ("c-early", 1_i32),
-            ("c", 1_i32),
-            ("a", 2_i32),
-            ("b", 3_i32),
-            ("b-next", 3_i32),
-        ] {
-            assert_eq!(turn_of(&mut database, event), turn, "{event}");
-        }
-        assert_eq!(
-            turns(&mut database)
-                .into_iter()
-                .map(|(key, index, ..)| (key, index))
-                .collect::<Vec<_>>(),
-            vec![
-                (Some("c".to_owned()), 1_i32),
-                (Some("a".to_owned()), 2_i32),
-                (Some("b".to_owned()), 3_i32),
-            ]
-        );
-    }
-
     fn request_with_text(text: &str) -> IngestEventsRequest {
         serde_json::from_value(json!({
             "events": [{

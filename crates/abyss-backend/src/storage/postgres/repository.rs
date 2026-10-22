@@ -2,21 +2,23 @@
 //!
 //! This module is the transactional boundary for the event hierarchy. Ingest
 //! validates the complete request before opening a transaction, upserts device,
-//! session, and turn aggregates, inserts immutable events idempotently, and
+//! session aggregates, inserts immutable events idempotently, and
 //! enqueues search projection in the same commit. Query functions always apply
 //! the authenticated owner before returning conversation or attachment data.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 use diesel::{
     Connection, ExpressionMethods, IntoSql, NullableExpressionMethods, PgConnection, QueryDsl,
-    QueryableByName, RunQueryDsl, SelectableHelper, define_sql_function,
-    dsl::{count_star, max},
+    QueryableByName, RunQueryDsl, define_sql_function,
     result::OptionalExtension,
     sql_query,
     sql_types::{
-        Array, BigInt, Bool, Bytea, Integer, Jsonb, Nullable, SingleValue, Text, Timestamptz,
+        Array, BigInt, Bool, Bytea, Jsonb, Nullable, SingleValue, Text, Timestamptz,
         Uuid as SqlUuid,
     },
     upsert::excluded,
@@ -28,29 +30,27 @@ use uuid::Uuid;
 use crate::{
     db::{
         models::{
-            AgentSession, AgentTurn, Device, NewAgentDiagnosticCapture,
-            NewAgentDiagnosticCaptureEvent, NewAgentSession, NewAgentTurn, NewDevice,
-            NewSearchOutboxTask, NewStreamFacts, NewUsageEvent, NewUsageEventAttachment,
+            Device, NewAgentDiagnosticCapture, NewAgentDiagnosticCaptureEvent, NewAgentSession,
+            NewDevice, NewSearchOutboxTask, NewStreamFacts, NewUsageEvent, NewUsageEventAttachment,
             StreamEventRow, UsageEvent, UsageEventAttachment,
         },
         schema::{
-            agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions,
-            agent_turns, devices, llm_usage_event_attachments, llm_usage_event_stream_facts,
-            llm_usage_events, search_outbox,
+            agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, devices,
+            llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
+            search_outbox,
         },
     },
     error::AppError,
+    storage::stream_cache::StreamCache,
     usage::{
         IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
-        RawEventsResponse, SessionInfo, SessionOutlineResponse, SessionTimelineResponse,
-        SummaryQuery, SummaryResponse, SummaryRow, TurnTimeline, UsageEventOutline,
-        UsageEventResponse, UsageEventType,
+        RawEventsResponse, SummaryQuery, SummaryResponse, SummaryRow, UsageEventResponse,
+        UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
         },
         diagnostics::IngestDiagnosticCapture,
-        event_order::UsageEventTimelineOrder,
         persistence::{
             escape_like_pattern, exact_values_filter, non_empty, non_negative_count,
             normalize_limit, normalize_text, parse_group_by, unix_epoch, validate_batch,
@@ -62,8 +62,8 @@ use crate::{
         },
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
-            EventFacts, Label, RequestFacts, ResponseFacts, SessionStreamsResponse, StreamEvent,
-            segment_run, session_streams as streams_of, stream_summary,
+            EventFacts, EventLocationResponse, Label, RequestFacts, ResponseFacts,
+            SessionStreamsResponse, SessionStructure, StreamEvent,
         },
     },
 };
@@ -88,7 +88,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         CASE WHEN $6 THEN e.llm_model END AS llm_model, \
         CASE WHEN $7 THEN e.event_type END AS event_type, \
         COUNT(DISTINCT e.session_pk)::bigint AS sessions, \
-        COUNT(DISTINCT e.turn_pk)::bigint AS turns, \
+        COUNT(*) FILTER (WHERE f.starts_turn)::bigint AS turns, \
         COUNT(*) FILTER (WHERE e.event_type = 'request')::bigint AS requests, \
         COUNT(*) FILTER (WHERE e.event_type = 'response')::bigint AS responses, \
         COALESCE(SUM(e.input_tokens), 0)::bigint AS input_tokens, \
@@ -98,6 +98,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         COALESCE(SUM(e.reasoning_tokens), 0)::bigint AS reasoning_tokens, \
         COALESCE(SUM(e.total_tokens), 0)::bigint AS total_tokens \
     FROM llm_usage_events e \
+    LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
     LEFT JOIN app_users u ON u.id = e.user_id \
     LEFT JOIN devices d ON d.id = e.device_context_id \
     WHERE e.user_id = $8 \
@@ -114,13 +115,12 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         AND ($17 = false OR e.agent_name = ANY($18)) \
         AND ($19 = false OR e.session_id = ANY($20)) \
         AND ($21 = false OR e.session_pk = $22) \
-        AND ($23 = false OR e.turn_index = $24) \
-        AND ($25 = false OR e.llm_provider = ANY($26)) \
-        AND ($27 = false OR e.llm_model = ANY($28)) \
-        AND ($29 = false OR e.event_type = $30) \
+        AND ($23 = false OR e.llm_provider = ANY($24)) \
+        AND ($25 = false OR e.llm_model = ANY($26)) \
+        AND ($27 = false OR e.event_type = $28) \
     GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 \
     ORDER BY total_tokens DESC, agent_name ASC NULLS LAST, user_email ASC NULLS LAST, day ASC NULLS LAST \
-    LIMIT $31";
+    LIMIT $29";
 
 /// Validates and atomically ingests one batch for the authenticated owner.
 ///
@@ -134,7 +134,7 @@ pub fn ingest_events(
 ) -> Result<IngestEventsResponse, AppError> {
     let validated_attachments = validate_batch(request, max_batch_size)?;
 
-    // Process the batch atomically so the device/session/turn hierarchy cannot
+    // Process the batch atomically so the device/session hierarchy cannot
     // be partially created without its corresponding usage events.
     let (accepted, duplicates, accepted_diagnostic_captures, duplicate_diagnostic_captures) =
         connection.transaction(|transaction| {
@@ -263,7 +263,6 @@ pub fn usage_summary(
             agent_names: &query.agent_name,
             session_ids: &query.session_id,
             session_pk: None,
-            turn_index: None,
             llm_providers: &query.llm_provider,
             llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
@@ -304,8 +303,6 @@ fn load_filtered_summary_rows(
     let has_session_id_filter = !session_ids.is_empty();
     let session_pk = sql_filters.session_pk.unwrap_or_else(Uuid::nil);
     let has_session_pk_filter = session_pk != Uuid::nil();
-    let turn_index = sql_filters.turn_index.unwrap_or_default();
-    let has_turn_index_filter = turn_index > 0_i32;
     let providers = sql_filters.providers;
     let has_provider_filter = !providers.is_empty();
     let models = sql_filters.models;
@@ -339,8 +336,6 @@ fn load_filtered_summary_rows(
         .bind::<Array<Text>, _>(session_ids)
         .bind::<Bool, _>(has_session_pk_filter)
         .bind::<SqlUuid, _>(session_pk)
-        .bind::<Bool, _>(has_turn_index_filter)
-        .bind::<Integer, _>(turn_index)
         .bind::<Bool, _>(has_provider_filter)
         .bind::<Array<Text>, _>(providers)
         .bind::<Bool, _>(has_model_filter)
@@ -351,186 +346,6 @@ fn load_filtered_summary_rows(
         .load::<SummaryAggregateRow>(connection)
         .map(|rows| rows.into_iter().map(SummaryRow::from).collect())
         .map_err(AppError::from)
-}
-
-/// Loads one owner-scoped session with normalized turns and ordered events.
-pub fn session_timeline(
-    connection: &mut PgConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-) -> Result<SessionTimelineResponse, AppError> {
-    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
-
-    let mut events = llm_usage_events::table
-        .filter(llm_usage_events::session_pk.eq(session.id))
-        .order((
-            llm_usage_events::turn_index.asc(),
-            llm_usage_events::observed_at.asc(),
-        ))
-        .load::<UsageEvent>(connection)?;
-    UsageEventTimelineOrder::sort(&mut events);
-
-    let device_contexts = load_device_contexts_for_events(connection, &events)?;
-    let mut attachments_by_event = load_attachments_for_events(connection, &events)?;
-    let mut events_by_turn: HashMap<Uuid, Vec<UsageEventResponse>> = HashMap::new();
-    for event in events {
-        let event_pk = event.id;
-        let device_context_id = event.device_context_id;
-        events_by_turn
-            .entry(event.turn_pk)
-            .or_default()
-            .push(event_response(
-                event,
-                device_contexts.get(&device_context_id),
-                attachments_by_event.remove(&event_pk).unwrap_or_default(),
-            ));
-    }
-    let mut timeline = assemble_timeline(session, turns, events_by_turn);
-    session_titles::fill(connection, &mut timeline.session)?;
-    Ok(timeline)
-}
-
-type OutlineRow = (
-    Uuid,
-    String,
-    Uuid,
-    i32,
-    String,
-    String,
-    String,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    DateTime<Utc>,
-);
-
-/// Loads one owner-scoped session timeline without event content bodies.
-pub fn session_outline(
-    connection: &mut PgConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-) -> Result<SessionOutlineResponse, AppError> {
-    let (session, turns) = load_session_turns(connection, user_id, session_pk)?;
-    // Only fixed-size columns and SQL-computed summaries are selected, so the
-    // outline stays small no matter how large event text or metadata grows.
-    let rows = llm_usage_events::table
-        .filter(llm_usage_events::session_pk.eq(session.id))
-        .select((
-            llm_usage_events::id,
-            llm_usage_events::event_id,
-            llm_usage_events::turn_pk,
-            llm_usage_events::turn_index,
-            llm_usage_events::llm_provider,
-            llm_usage_events::llm_model,
-            llm_usage_events::event_type,
-            llm_usage_events::input_tokens,
-            llm_usage_events::output_tokens,
-            llm_usage_events::cache_read_tokens,
-            llm_usage_events::cache_write_tokens,
-            llm_usage_events::reasoning_tokens,
-            llm_usage_events::total_tokens,
-            llm_usage_events::observed_at,
-        ))
-        .load::<OutlineRow>(connection)?;
-    let event_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
-    let attachment_counts = llm_usage_event_attachments::table
-        .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
-        .group_by(llm_usage_event_attachments::event_pk)
-        .select((llm_usage_event_attachments::event_pk, count_star()))
-        .load::<(Uuid, i64)>(connection)?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-    let mut events = rows
-        .into_iter()
-        .map(|row| UsageEventOutline {
-            id: row.0,
-            event_id: row.1,
-            turn_pk: row.2,
-            turn_index: row.3,
-            llm_provider: row.4,
-            llm_model: row.5,
-            event_type: row.6,
-            input_tokens: row.7,
-            output_tokens: row.8,
-            cache_read_tokens: row.9,
-            cache_write_tokens: row.10,
-            reasoning_tokens: row.11,
-            total_tokens: row.12,
-            observed_at: row.13,
-            attachment_count: attachment_counts.get(&row.0).copied().unwrap_or(0),
-        })
-        .collect::<Vec<_>>();
-    UsageEventTimelineOrder::sort(&mut events);
-    let mut events_by_turn: HashMap<Uuid, Vec<UsageEventOutline>> = HashMap::new();
-    for event in events {
-        events_by_turn.entry(event.turn_pk).or_default().push(event);
-    }
-    let mut timeline = assemble_timeline(session, turns, events_by_turn);
-    session_titles::fill(connection, &mut timeline.session)?;
-    Ok(timeline)
-}
-
-fn load_session_turns(
-    connection: &mut PgConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-) -> Result<(AgentSession, Vec<AgentTurn>), AppError> {
-    // Timeline views include prompt/response text, so they are always limited
-    // to the owner.
-    let session = agent_sessions::table
-        .filter(agent_sessions::id.eq(session_pk))
-        .filter(agent_sessions::user_id.eq(user_id))
-        .first::<AgentSession>(connection)
-        .optional()?
-        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
-    touch_session_metadata(&session);
-
-    let turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session.id))
-        .order(agent_turns::turn_index.asc())
-        .load::<AgentTurn>(connection)?;
-    Ok((session, turns))
-}
-
-fn assemble_timeline<E>(
-    session: AgentSession,
-    turns: Vec<AgentTurn>,
-    mut events_by_turn: HashMap<Uuid, Vec<E>>,
-) -> SessionTimelineResponse<E> {
-    let turn_timelines = turns
-        .into_iter()
-        .map(|turn| {
-            touch_turn_metadata(&turn);
-            TurnTimeline {
-                turn_pk: turn.id,
-                turn_index: turn.turn_index,
-                started_at: turn.started_at,
-                ended_at: turn.ended_at,
-                events: events_by_turn.remove(&turn.id).unwrap_or_default(),
-            }
-        })
-        .collect();
-
-    SessionTimelineResponse {
-        session: SessionInfo {
-            session_pk: session.id,
-            user_id: session.user_id,
-            device_context_id: session.device_context_id,
-            agent_name: session.agent_name,
-            agent_version: session.agent_version,
-            session_id: session.session_id,
-            started_at: session.started_at,
-            ended_at: session.ended_at,
-            metadata: session.metadata,
-            title: None,
-            purpose: None,
-            parent_session_pk: None,
-        },
-        turns: turn_timelines,
-    }
 }
 
 /// Returns one newest-first page of raw owner-scoped events.
@@ -556,7 +371,6 @@ pub fn raw_events(
             agent_names: &query.agent_name,
             session_ids: &query.session_id,
             session_pk: query.session_pk,
-            turn_index: query.turn_index,
             llm_providers: &query.llm_provider,
             llm_models: &query.llm_model,
             event_type: query.event_type.as_deref(),
@@ -668,14 +482,55 @@ pub fn session_streams(
     connection: &mut PgConnection,
     user_id: Uuid,
     session_pk: Uuid,
+    cache: &StreamCache,
 ) -> Result<SessionStreamsResponse, AppError> {
-    let events = stream_events(connection, user_id, session_pk)?;
-    if events.is_empty() {
-        return Err(AppError::not_found(format!(
-            "session not found: {session_pk}"
-        )));
-    }
-    Ok(streams_of(session_pk, events))
+    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    Ok(structure.session_streams(session_pk))
+}
+
+/// Uses the caller's read transaction so the revision and facts are one snapshot.
+/// A cache hit reads only the session revision; it does not load the event facts.
+pub fn session_structure(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+    cache: &StreamCache,
+) -> Result<Arc<SessionStructure>, AppError> {
+    let revision = agent_sessions::table
+        .filter(agent_sessions::user_id.eq(user_id))
+        .filter(agent_sessions::id.eq(session_pk))
+        .select(agent_sessions::structure_revision)
+        .first::<i64>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
+    cache.get_or_load(user_id, session_pk, revision, || {
+        let events = stream_events(connection, user_id, session_pk)?;
+        if events.is_empty() {
+            return Err(AppError::not_found(format!(
+                "session not found: {session_pk}"
+            )));
+        }
+        Ok(events)
+    })
+}
+
+/// Resolves an authorized event without reading its body or attachments.
+pub fn event_location(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    event_pk: Uuid,
+    cache: &StreamCache,
+) -> Result<EventLocationResponse, AppError> {
+    let session_pk = llm_usage_events::table
+        .filter(llm_usage_events::user_id.eq(user_id))
+        .filter(llm_usage_events::id.eq(event_pk))
+        .select(llm_usage_events::session_pk)
+        .first::<Uuid>(connection)
+        .optional()?
+        .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))?;
+    session_structure(connection, user_id, session_pk, cache)?
+        .event_location(session_pk, event_pk)
+        .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))
 }
 
 /// Columns of one session event the header reads.
@@ -699,6 +554,7 @@ pub fn session_header(
     connection: &mut PgConnection,
     user_id: Uuid,
     session_pk: Uuid,
+    cache: &StreamCache,
 ) -> Result<SessionHeaderResponse, AppError> {
     let events = llm_usage_events::table
         .filter(llm_usage_events::user_id.eq(user_id))
@@ -726,8 +582,9 @@ pub fn session_header(
             "session not found: {session_pk}"
         )));
     }
-    let summary = stream_summary(stream_events(connection, user_id, session_pk)?);
-    Ok(header_of(session_pk, events, summary))
+    let summary = session_structure(connection, user_id, session_pk, cache)?.summary();
+    let title = session_titles::title(connection, session_pk)?;
+    Ok(header_of(session_pk, events, &summary, title))
 }
 
 fn header_event(
@@ -772,9 +629,10 @@ pub fn session_segment(
     session_pk: Uuid,
     head: &str,
     query: &ValidatedSegmentQuery,
+    cache: &StreamCache,
 ) -> Result<SegmentResponse, AppError> {
-    let events = stream_events(connection, user_id, session_pk)?;
-    let run = segment_run(events, head).ok_or_else(|| {
+    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let run = structure.segment_run(head).ok_or_else(|| {
         AppError::not_found(format!(
             "exchange not found in session {session_pk}: {head}"
         ))
@@ -940,6 +798,16 @@ fn ingest_one_event(
     event: &IngestUsageEvent,
     attachments: Vec<ValidatedImageAttachment>,
 ) -> Result<bool, AppError> {
+    let exists = llm_usage_events::table
+        .filter(llm_usage_events::event_id.eq(&event.event_id))
+        .select(llm_usage_events::id)
+        .first::<Uuid>(connection)
+        .optional()?
+        .is_some();
+    if exists {
+        return Ok(false);
+    }
+
     let observed_at = event.observed_at;
     let now = Utc::now();
     let agent_name = event.agent.name.clone();
@@ -948,7 +816,7 @@ fn ingest_one_event(
     let model = event.llm.model.clone();
 
     let device = upsert_device(connection, user_id, event, observed_at, now)?;
-    let session = upsert_session(
+    let session_pk = upsert_session(
         connection,
         UpsertSessionInput {
             device: &device,
@@ -960,14 +828,6 @@ fn ingest_one_event(
             now,
         },
     )?;
-    let (turn_pk, turn_index) = place_in_turn(
-        connection,
-        user_id,
-        session.id,
-        event.turn_id.as_deref(),
-        observed_at,
-        now,
-    )?;
     let tokens = &event.token_usage;
 
     // `event_id` is the idempotency key supplied by the collector. Duplicate
@@ -978,13 +838,11 @@ fn ingest_one_event(
             id: usage_event_id,
             user_id,
             device_context_id: device.id,
-            session_pk: session.id,
-            turn_pk,
+            session_pk,
             event_id: event.event_id.clone(),
             agent_name: agent_name.clone(),
             agent_version,
             session_id: event.session_id.clone(),
-            turn_index,
             llm_provider: provider,
             llm_model: model,
             event_type: event.event_type.as_str().to_owned(),
@@ -1028,11 +886,9 @@ fn ingest_one_event(
             connection,
             &session_titles::CapturedEvent {
                 user_id,
-                session_pk: session.id,
+                session_pk,
                 event_pk: usage_event_id,
                 event_type: event.event_type.as_str(),
-                metadata: &event.metadata,
-                naming_thread: event.naming_thread,
                 observed_at,
             },
         )?;
@@ -1108,10 +964,14 @@ fn upsert_device(
         .map_err(AppError::from)
 }
 
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Diesel builds an atomic SQL increment, not a Rust integer addition."
+)]
 fn upsert_session(
     connection: &mut PgConnection,
     input: UpsertSessionInput<'_>,
-) -> Result<AgentSession, AppError> {
+) -> Result<Uuid, AppError> {
     let session_id = input.event.session_id.clone();
     diesel::insert_into(agent_sessions::table)
         .values(NewAgentSession {
@@ -1126,6 +986,7 @@ fn upsert_session(
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             created_at: input.now,
             updated_at: input.now,
+            structure_revision: 1,
         })
         .on_conflict((
             agent_sessions::user_id,
@@ -1148,166 +1009,11 @@ fn upsert_session(
                 excluded(agent_sessions::ended_at),
             )),
             agent_sessions::updated_at.eq(input.now),
+            agent_sessions::structure_revision.eq(agent_sessions::structure_revision + 1_i64),
         ))
-        .get_result::<AgentSession>(connection)
+        .returning(agent_sessions::id)
+        .get_result::<Uuid>(connection)
         .map_err(AppError::from)
-}
-
-/// Places an event in a turn of its session and returns the turn's id and
-/// position.
-///
-/// Events naming the same turn share it, and an event naming none joins the
-/// turn in progress when it was observed. Turns are numbered by when they
-/// started, so a turn that arrives late moves the turns after it.
-fn place_in_turn(
-    connection: &mut PgConnection,
-    user_id: Uuid,
-    session_pk: Uuid,
-    turn_id: Option<&str>,
-    observed_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Result<(Uuid, i32), AppError> {
-    let found = match turn_id {
-        Some(key) => named_turn(connection, session_pk, key)?,
-        None => turn_in_progress(connection, session_pk, observed_at)?,
-    };
-    let (turn_pk, turn_index, reordered) = if let Some(turn) = found {
-        diesel::update(agent_turns::table.find(turn.id))
-            .set((
-                agent_turns::started_at.eq(turn.started_at.min(observed_at)),
-                agent_turns::ended_at
-                    .eq(Some(turn.ended_at.unwrap_or(observed_at).max(observed_at))),
-                agent_turns::updated_at.eq(now),
-            ))
-            .execute(connection)?;
-        (turn.id, turn.turn_index, observed_at < turn.started_at)
-    } else {
-        let last = agent_turns::table
-            .filter(agent_turns::session_pk.eq(session_pk))
-            .select(max(agent_turns::turn_index))
-            .get_result::<Option<i32>>(connection)?;
-        let id = Uuid::now_v7();
-        let turn_index = last.unwrap_or(0_i32).saturating_add(1_i32);
-        diesel::insert_into(agent_turns::table)
-            .values(NewAgentTurn {
-                id,
-                user_id,
-                session_pk,
-                turn_index,
-                turn_key: turn_id.map(str::to_owned),
-                started_at: observed_at,
-                ended_at: Some(observed_at),
-                created_at: now,
-                updated_at: now,
-            })
-            .execute(connection)?;
-        (id, turn_index, last.is_some())
-    };
-    let turn_index = if reordered && number_turns(connection, session_pk)? {
-        agent_turns::table
-            .find(turn_pk)
-            .select(agent_turns::turn_index)
-            .get_result::<i32>(connection)?
-    } else {
-        turn_index
-    };
-    Ok((turn_pk, turn_index))
-}
-
-/// The turn named `key` in a session. The first named turn adopts the turn
-/// that events naming none opened at the start of the session.
-fn named_turn(
-    connection: &mut PgConnection,
-    session_pk: Uuid,
-    key: &str,
-) -> Result<Option<AgentTurn>, AppError> {
-    let named = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session_pk))
-        .filter(agent_turns::turn_key.eq(key))
-        .select(AgentTurn::as_select())
-        .first::<AgentTurn>(connection)
-        .optional()?;
-    if named.is_some() {
-        return Ok(named);
-    }
-    let mut turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session_pk))
-        .select(AgentTurn::as_select())
-        .limit(2_i64)
-        .load::<AgentTurn>(connection)?;
-    let opening = match turns.as_slice() {
-        [turn] if turn.turn_key.is_none() => turns.pop(),
-        _ => None,
-    };
-    if let Some(turn) = &opening {
-        diesel::update(agent_turns::table.find(turn.id))
-            .set(agent_turns::turn_key.eq(key))
-            .execute(connection)?;
-    }
-    Ok(opening)
-}
-
-/// The turn in progress when an event naming no turn was observed: the latest
-/// turn started by then, else the first turn of the session.
-fn turn_in_progress(
-    connection: &mut PgConnection,
-    session_pk: Uuid,
-    observed_at: DateTime<Utc>,
-) -> Result<Option<AgentTurn>, AppError> {
-    let started = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session_pk))
-        .filter(agent_turns::started_at.le(observed_at))
-        .order_by((agent_turns::started_at.desc(), agent_turns::id.desc()))
-        .select(AgentTurn::as_select())
-        .first::<AgentTurn>(connection)
-        .optional()?;
-    if started.is_some() {
-        return Ok(started);
-    }
-    agent_turns::table
-        .filter(agent_turns::session_pk.eq(session_pk))
-        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
-        .select(AgentTurn::as_select())
-        .first::<AgentTurn>(connection)
-        .optional()
-        .map_err(AppError::from)
-}
-
-/// Numbers the turns of a session, and their events, by when the turns
-/// started. Writes nothing and returns `false` while the numbers already
-/// follow that order.
-fn number_turns(connection: &mut PgConnection, session_pk: Uuid) -> Result<bool, AppError> {
-    let turns = agent_turns::table
-        .filter(agent_turns::session_pk.eq(session_pk))
-        .order_by((agent_turns::started_at.asc(), agent_turns::id.asc()))
-        .select((agent_turns::id, agent_turns::turn_index))
-        .load::<(Uuid, i32)>(connection)?;
-    let moved = turns
-        .iter()
-        .zip(1_i32..)
-        .filter(|((_, index), position)| index != position)
-        .map(|((id, _), position)| (*id, position))
-        .collect::<Vec<_>>();
-    if moved.is_empty() {
-        return Ok(false);
-    }
-    // Moved turns first step above every current number, so no single-row
-    // update collides with another turn's number or goes below one.
-    let above = turns.iter().map(|(_, index)| *index).max().unwrap_or(0_i32);
-    for (id, position) in &moved {
-        diesel::update(agent_turns::table.find(*id))
-            .set(agent_turns::turn_index.eq(above.saturating_add(*position)))
-            .execute(connection)?;
-    }
-    for (id, position) in moved {
-        diesel::update(agent_turns::table.find(id))
-            .set(agent_turns::turn_index.eq(position))
-            .execute(connection)?;
-        diesel::update(llm_usage_events::table.filter(llm_usage_events::turn_pk.eq(id)))
-            .set(llm_usage_events::turn_index.eq(position))
-            .execute(connection)?;
-    }
-    Ok(true)
 }
 
 /// Loads matching events newest first. Without content, text and metadata are
@@ -1344,9 +1050,6 @@ fn load_filtered_events(
     if let Some(session_pk) = filters.session_pk {
         query = query.filter(llm_usage_events::session_pk.eq(session_pk));
     }
-    if let Some(turn_index) = filters.turn_index {
-        query = query.filter(llm_usage_events::turn_index.eq(turn_index));
-    }
     let providers = exact_values_filter(filters.llm_providers);
     if !providers.is_empty() {
         query = query.filter(llm_usage_events::llm_provider.eq_any(providers));
@@ -1360,7 +1063,11 @@ fn load_filtered_events(
     }
 
     let query = query
-        .order(llm_usage_events::observed_at.desc())
+        .order((
+            llm_usage_events::observed_at.desc(),
+            llm_usage_events::event_type.asc(),
+            llm_usage_events::id.desc(),
+        ))
         .limit(filters.limit)
         .offset(filters.offset);
     if include_content {
@@ -1372,12 +1079,10 @@ fn load_filtered_events(
             llm_usage_events::user_id,
             llm_usage_events::device_context_id,
             llm_usage_events::session_pk,
-            llm_usage_events::turn_pk,
             llm_usage_events::event_id,
             llm_usage_events::agent_name,
             llm_usage_events::agent_version,
             llm_usage_events::session_id,
-            llm_usage_events::turn_index,
             llm_usage_events::llm_provider,
             llm_usage_events::llm_model,
             llm_usage_events::event_type,
@@ -1476,11 +1181,10 @@ fn event_response(
         host_name: device.map(|value| value.host_name.clone()),
         platform: device.map(|value| value.platform.clone()),
         session_pk: event.session_pk,
-        turn_pk: event.turn_pk,
+        location: None,
         agent_name: event.agent_name,
         agent_version: event.agent_version,
         session_id: event.session_id,
-        turn_index: event.turn_index,
         llm_provider: event.llm_provider,
         llm_model: event.llm_model,
         event_type: event.event_type,
@@ -1512,19 +1216,6 @@ const fn touch_device_metadata(device: &Device) {
     ));
 }
 
-const fn touch_session_metadata(session: &AgentSession) {
-    std::hint::black_box((session.created_at, session.updated_at, &session.metadata));
-}
-
-const fn touch_turn_metadata(turn: &AgentTurn) {
-    std::hint::black_box((
-        turn.user_id,
-        turn.session_pk,
-        turn.created_at,
-        turn.updated_at,
-    ));
-}
-
 #[cfg(test)]
 fn latest_optional(
     left: Option<DateTime<Utc>>,
@@ -1546,7 +1237,6 @@ struct EventFilters<'a> {
     agent_names: &'a [String],
     session_ids: &'a [String],
     session_pk: Option<Uuid>,
-    turn_index: Option<i32>,
     llm_providers: &'a [String],
     llm_models: &'a [String],
     event_type: Option<&'a str>,
@@ -1611,7 +1301,6 @@ struct SummarySqlFilters {
     agent_names: Vec<String>,
     session_ids: Vec<String>,
     session_pk: Option<Uuid>,
-    turn_index: Option<i32>,
     providers: Vec<String>,
     models: Vec<String>,
     event_type: Option<String>,
@@ -1638,7 +1327,6 @@ impl SummarySqlFilters {
             agent_names,
             session_ids,
             session_pk: filters.session_pk,
-            turn_index: filters.turn_index,
             providers,
             models,
             event_type,
@@ -1747,7 +1435,7 @@ mod tests {
         error::AppError,
         usage::{
             AgentPayload, DevicePayload, IngestEventsRequest, IngestUsageEvent, LlmPayload,
-            SummaryRow, TokenUsagePayload, UsageEventType,
+            SummaryRow, TokenUsagePayload, UsageEventType, streams::RequestFacts,
         },
     };
 
@@ -1807,7 +1495,10 @@ mod tests {
             let key = summary_key(event, device_contexts, user_contexts, group_by);
             let accumulator = accumulators.entry(key).or_default();
             accumulator.sessions.insert(event.session_pk);
-            accumulator.turns.insert(event.turn_pk);
+            // Ingest stores the same fact for every request it reads.
+            if event.event_type == "request" && RequestFacts::read(&event.metadata).starts_turn {
+                accumulator.turns.insert(event.id);
+            }
             if event.event_type == "request" {
                 accumulator.requests = accumulator.requests.saturating_add(1);
             }
@@ -1959,7 +1650,6 @@ mod tests {
             agent_names: &[" claude-desktop ".to_owned(), "codex".to_owned()],
             session_ids: &[" session-1 ".to_owned(), "session-2".to_owned()],
             session_pk: None,
-            turn_index: None,
             llm_providers: &["OpenAI".to_owned(), " ".to_owned()],
             llm_models: &[
                 " gpt-5.5 ".to_owned(),
@@ -1985,7 +1675,6 @@ mod tests {
         assert_eq!(sql_filters.agent_names, ["claude-desktop", "codex"]);
         assert_eq!(sql_filters.session_ids, ["session-1", "session-2"]);
         assert_eq!(sql_filters.session_pk, None);
-        assert_eq!(sql_filters.turn_index, None);
         assert_eq!(sql_filters.providers, ["OpenAI"]);
         assert_eq!(sql_filters.models, ["gpt-5.5", "o3"]);
         assert_eq!(sql_filters.event_type.as_deref(), Some("response"));
@@ -2052,7 +1741,7 @@ mod tests {
     #[test]
     fn aggregate_summary_counts_sessions_turns_events_and_tokens() {
         let device_context_id = fixed_uuid(1_u128);
-        let events = vec![
+        let mut events = vec![
             usage_event(
                 "evt-summary-request",
                 "request",
@@ -2070,6 +1759,11 @@ mod tests {
                 15_i64,
             ),
         ];
+        // The request asks in words, so it opens a turn.
+        events[0].metadata = json!({"conversation": {
+            "entries": [{"role": "user", "text": "ask"}],
+            "completeness": "complete"
+        }});
         let device_contexts =
             HashMap::from([(device_context_id, device_context(device_context_id))]);
         let group_by = vec![
@@ -2103,7 +1797,7 @@ mod tests {
         );
         assert_eq!(
             row.turns, 1_usize,
-            "summary row should count distinct turns"
+            "summary row should count turn-opening requests"
         );
         assert_eq!(
             row.requests, 1_i64,
@@ -2223,8 +1917,6 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
             },
             session_id: "session-001".to_owned(),
-            turn_id: None,
-            naming_thread: false,
             stream_id: None,
             response_id: None,
             previous_response_id: None,
@@ -2259,12 +1951,10 @@ mod tests {
             user_id: fixed_uuid(100_u128),
             device_context_id: fixed_uuid(1_u128),
             session_pk: fixed_uuid(2_u128),
-            turn_pk: fixed_uuid(3_u128),
             event_id: event_id.to_owned(),
             agent_name: "codex".to_owned(),
             agent_version: Some("1.0.0".to_owned()),
             session_id: "session-001".to_owned(),
-            turn_index: 1_i32,
             llm_provider: "openai".to_owned(),
             llm_model: "gpt-5.5".to_owned(),
             event_type: event_type.to_owned(),
