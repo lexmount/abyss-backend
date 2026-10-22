@@ -374,6 +374,30 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         [(row["llm_model"], row["total_tokens"]) for row in any_of_rows] == [("gpt-5.5", 36)],
         "summary must aggregate every repeated filter value",
     )
+
+    # Days follow the requested time zone; both events are at 08:00 UTC.
+    def day_totals(time_zone: str | None) -> list[tuple[str, int]]:
+        params = [("group_by", "day"), ("session_id", session_id)]
+        if time_zone is not None:
+            params.append(("tz", time_zone))
+        response = request(
+            base_url, "GET", "/v1/agent-usage/summary?" + urllib.parse.urlencode(params), token=token
+        )
+        require_status(response, 200, f"usage summary by day in {time_zone or 'UTC'}")
+        return [(row["day"], row["total_tokens"]) for row in response.json()["rows"]]
+
+    require(day_totals(None) == [("2026-08-24", 36)], "summary days must default to UTC")
+    require(
+        day_totals("Pacific/Honolulu") == [("2026-08-23", 36)],
+        "summary days must follow the requested time zone",
+    )
+    invalid_zone = request(
+        base_url,
+        "GET",
+        "/v1/agent-usage/summary?" + urllib.parse.urlencode({"group_by": "day", "tz": "UTC+8"}),
+        token=token,
+    )
+    require_status(invalid_zone, 400, "usage summary with an unknown time zone")
     any_of_sessions_path = "/v1/agent-usage/sessions?" + urllib.parse.urlencode(
         [("llm_model", "absent-model"), ("llm_model", "gpt-5.5"), ("page_size", 100)]
     )

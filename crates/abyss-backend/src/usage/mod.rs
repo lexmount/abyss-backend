@@ -21,6 +21,8 @@ pub mod session_header;
 pub mod session_list;
 /// Streams of a session: stream facts, bases, and segments.
 pub mod streams;
+/// Local calendar days for summaries grouped by day.
+pub mod time_zone;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -175,6 +177,9 @@ pub struct SummaryQuery {
     pub to: Option<DateTime<Utc>>,
     /// Comma-separated grouping dimensions.
     pub group_by: Option<String>,
+    /// IANA time zone whose calendar days the `day` dimension follows; UTC
+    /// when absent.
+    pub tz: Option<String>,
     /// Selects the full or token-only response shape.
     pub fields: Option<SummaryFields>,
     /// User UUID, name, or email filter retained for the summary contract.

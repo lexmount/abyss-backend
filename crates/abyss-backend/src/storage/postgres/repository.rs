@@ -12,6 +12,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use diesel::{
     Connection, ExpressionMethods, IntoSql, NullableExpressionMethods, PgConnection, QueryDsl,
     QueryableByName, RunQueryDsl, define_sql_function,
@@ -65,6 +66,7 @@ use crate::{
             EventFacts, EventLocationResponse, Label, RequestFacts, ResponseFacts,
             SessionStreamsResponse, SessionStructure, StreamEvent,
         },
+        time_zone::parse_time_zone,
     },
 };
 
@@ -76,7 +78,7 @@ define_sql_function!(fn greatest<ST: SingleValue>(left: ST, right: ST) -> ST);
 
 const SUMMARY_AGGREGATE_SQL: &str = "\
     SELECT \
-        CASE WHEN $1 THEN to_char(e.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') END AS day, \
+        CASE WHEN $1 THEN to_char(e.observed_at AT TIME ZONE $30, 'YYYY-MM-DD') END AS day, \
         CASE WHEN $2 THEN e.user_id END AS user_id, \
         CASE WHEN $2 THEN NULLIF(btrim(u.name), '') END AS user_name, \
         CASE WHEN $2 THEN u.email END AS user_email, \
@@ -252,6 +254,7 @@ pub fn usage_summary(
     default_limit: i64,
 ) -> Result<SummaryResponse, AppError> {
     let group_by = parse_group_by(query.group_by.as_deref());
+    let zone = parse_time_zone(query.tz.as_deref())?;
     let limit = normalize_limit(query.limit, default_limit, 100_000);
     let rows = load_filtered_summary_rows(
         connection,
@@ -270,6 +273,7 @@ pub fn usage_summary(
             offset: 0,
         },
         &group_by,
+        zone,
     )?;
 
     Ok(SummaryResponse {
@@ -285,6 +289,7 @@ fn load_filtered_summary_rows(
     connection: &mut PgConnection,
     filters: &EventFilters<'_>,
     group_by: &[String],
+    zone: Tz,
 ) -> Result<Vec<SummaryRow>, AppError> {
     let dimensions = SummaryDimensions::from_group_by(group_by);
     let sql_filters = SummarySqlFilters::from_event_filters(filters)?;
@@ -343,6 +348,7 @@ fn load_filtered_summary_rows(
         .bind::<Bool, _>(has_event_type_filter)
         .bind::<Text, _>(&event_type)
         .bind::<BigInt, _>(filters.limit)
+        .bind::<Text, _>(zone.name())
         .load::<SummaryAggregateRow>(connection)
         .map(|rows| rows.into_iter().map(SummaryRow::from).collect())
         .map_err(AppError::from)
