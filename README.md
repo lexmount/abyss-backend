@@ -98,11 +98,21 @@ curl \
 | `GET` | `/v1/agent-usage/events` | Query raw events. |
 | `GET` | `/v1/agent-usage/attachments/{id}` | Download stored image content. |
 | `GET` | `/v1/agent-usage/summary` | Aggregate event and token usage. |
+| `POST` | `/v1/agent-usage/comparison` | Compare token totals and daily activity across dimensions. |
 | `GET` | `/v1/agent-usage/sessions/{id}` | Read an ordered session timeline. |
 | `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite FTS5. |
 
 Every `/v1/agent-usage/*` endpoint requires the bearer token. Health and
 readiness endpoints are unauthenticated for orchestrator probes.
+
+Comparison requests contain `group_by` (`agent`, `model`, `provider`, `platform`,
+or `null` for combined activity), contiguous `buckets` of ISO `start`/`end`
+timestamps, and optional `filters` arrays for `agent`, `model`, `provider`,
+`platform`, and `session`. Values within a filter are ORed; dimensions are ANDed.
+A comparison dimension cannot also be filtered. Ranges are start-inclusive and
+end-exclusive, limited to 367 days and 400 buckets. Results contain bucket-start
+epoch milliseconds, dimension values, summed `total_tokens`, and request counts;
+filter options use the same authorized time range before optional filters.
 
 ## Configuration
 
