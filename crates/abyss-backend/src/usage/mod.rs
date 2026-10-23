@@ -63,6 +63,15 @@ pub struct IngestUsageEvent {
     /// The response this exchange's request continues after; the request then
     /// carries only the messages added since.
     pub previous_response_id: Option<String>,
+    /// Id of the sub-agent this exchange belongs to, as the client declares
+    /// it; absent on the main line and its side requests.
+    pub subagent_id: Option<String>,
+    /// Id of the sub-agent that started this one, as the client declares it;
+    /// absent when the main line started it.
+    pub parent_subagent_id: Option<String>,
+    /// The turn this exchange ultimately works for, as the client declares
+    /// it; a sub-agent carries the value of the turn that started it.
+    pub root_turn_id: Option<String>,
     /// LLM provider and model labels.
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.

@@ -497,11 +497,104 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         base_url, token, session_pk, [item["id"] for item in session_events], in_session
     )
 
+    run_sub_agent_contract(base_url, token, run_id)
+
     from session_titles_api import run_title_contract
 
     run_title_contract(base_url, token, run_id)
 
     print(f"blackbox API contract passed for {session_id}")
+
+
+def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
+    """Declared sub-agent ids are stored with each event, and a sub-agent's
+    root segment shows beside the main-line segment of the same root turn."""
+    session_id = f"session-subagent-{run_id}"
+
+    def declared_event(
+        name: str, event_type: str, second: int, declared: dict[str, str | None]
+    ) -> dict[str, Any]:
+        value = event(
+            f"event-{name}-{event_type}-{run_id}",
+            session_id,
+            event_type,
+            f"{name} {event_type}",
+            token_usage(input_tokens=1),
+            run_id,
+        )
+        value.pop("attachments", None)
+        value["observed_at"] = f"2026-08-24T09:00:{second:02d}Z"
+        value["response_id"] = f"{name}-{run_id}"
+        value.update(declared)
+        return value
+
+    main = {"root_turn_id": f"turn-{run_id}"}
+    sub = {
+        "subagent_id": f"agent-{run_id}",
+        "parent_subagent_id": None,
+        "root_turn_id": f"turn-{run_id}",
+    }
+    ingest = request(
+        base_url,
+        "POST",
+        "/v1/agent-usage/events",
+        token=token,
+        json_body={
+            "events": [
+                declared_event("main", "request", 1, main),
+                declared_event("main", "response", 9, main),
+                declared_event("sub", "request", 2, sub),
+                declared_event("sub", "response", 3, sub),
+            ]
+        },
+    )
+    require_status(ingest, 200, "sub-agent event ingest")
+    require(ingest.json()["accepted"] == 4, "sub-agent ingest must accept four events")
+    raw_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
+        {"session_id": session_id, "limit": 10}
+    )
+    raw = request(base_url, "GET", raw_path, token=token)
+    require_status(raw, 200, "sub-agent raw event query")
+    session_pk = raw.json()["events"][0]["session_pk"]
+
+    streams = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/streams", token=token
+    )
+    require_status(streams, 200, "sub-agent session streams")
+    segments = [
+        (
+            segment["head"],
+            segment.get("subagent_id"),
+            segment.get("attached_to"),
+            segment.get("attached_by"),
+        )
+        for segment in streams.json()["segments"]
+    ]
+    require(
+        segments
+        == [
+            (f"main-{run_id}", None, None, None),
+            (f"sub-{run_id}", f"agent-{run_id}", f"main-{run_id}", "declared"),
+        ],
+        f"the sub-agent segment attaches to the main segment of its root turn: {segments}",
+    )
+    segment = request(
+        base_url,
+        "GET",
+        f"/v1/agent-usage/sessions/{session_pk}/segments/sub-{run_id}",
+        token=token,
+    )
+    require_status(segment, 200, "sub-agent segment")
+    exchange = segment.json()["exchanges"][0]
+    declared = (
+        exchange.get("subagent_id"),
+        exchange.get("parent_subagent_id"),
+        exchange.get("root_turn_id"),
+    )
+    require(
+        declared == (f"agent-{run_id}", None, f"turn-{run_id}"),
+        f"the exchange carries its declared ids: {declared}",
+    )
 
 
 def in_session_search_path(session_pk: str, query: str) -> str:

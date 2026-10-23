@@ -8,6 +8,9 @@
 -- lists JSON arrays of strings, and output_skeleton a JSON array of
 -- [role, key] pairs, the key being the call id, else the item id. Events
 -- stored before this migration have no facts row.
+-- subagent_id, parent_subagent_id, and root_turn_id are the ids the client
+-- declared on the event, kept as sent and NULL when absent; they only
+-- decide where a sub-agent's segment shows.
 CREATE TABLE llm_usage_event_stream_facts (
     event_pk uuid PRIMARY KEY REFERENCES llm_usage_events(id) ON DELETE CASCADE,
     new_from integer,
@@ -19,7 +22,10 @@ CREATE TABLE llm_usage_event_stream_facts (
     output_skeleton jsonb,
     label_index integer,
     label_text text,
-    label_length integer
+    label_length integer,
+    subagent_id text,
+    parent_subagent_id text,
+    root_turn_id text
 );
 
 -- The backend also registers each session's earliest request in session_titles,

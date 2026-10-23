@@ -10,6 +10,9 @@
 -- output_skeleton a JSON array of [role, key] pairs, the key being the call
 -- id, else the item id. Events stored before this migration have no facts
 -- row.
+-- subagent_id, parent_subagent_id, and root_turn_id are the ids the client
+-- declared on the event, kept as sent and NULL when absent; they only
+-- decide where a sub-agent's segment shows.
 CREATE TABLE llm_usage_event_stream_facts (
     event_pk TEXT PRIMARY KEY REFERENCES llm_usage_events(id) ON DELETE CASCADE,
     new_from INTEGER,
@@ -21,7 +24,10 @@ CREATE TABLE llm_usage_event_stream_facts (
     output_skeleton TEXT CHECK (json_valid(output_skeleton)),
     label_index INTEGER,
     label_text TEXT,
-    label_length INTEGER
+    label_length INTEGER,
+    subagent_id TEXT,
+    parent_subagent_id TEXT,
+    root_turn_id TEXT
 ) STRICT;
 
 -- Search reads the text and the name of every conversation entry. Each

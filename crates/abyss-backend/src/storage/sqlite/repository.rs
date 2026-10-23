@@ -577,6 +577,9 @@ pub(super) fn stream_events(
             llm_usage_event_stream_facts::label_index.nullable(),
             llm_usage_event_stream_facts::label_text.nullable(),
             llm_usage_event_stream_facts::label_length.nullable(),
+            llm_usage_event_stream_facts::subagent_id.nullable(),
+            llm_usage_event_stream_facts::parent_subagent_id.nullable(),
+            llm_usage_event_stream_facts::root_turn_id.nullable(),
         ))
         .load::<StreamEventRow>(connection)?
         .into_iter()
@@ -598,6 +601,12 @@ fn insert_stream_facts(
         UsageEventType::Response => {
             NewStreamFacts::response(event_pk, &ResponseFacts::read(&event.metadata))?
         }
+    };
+    let facts = NewStreamFacts {
+        subagent_id: event.subagent_id.clone(),
+        parent_subagent_id: event.parent_subagent_id.clone(),
+        root_turn_id: event.root_turn_id.clone(),
+        ..facts
     };
     diesel::insert_into(llm_usage_event_stream_facts::table)
         .values(facts)
@@ -1320,6 +1329,7 @@ mod tests {
             IngestEventsRequest, RawEventsQuery, SummaryQuery,
             preview::{PreviewQuery, Window},
             segments::SegmentQuery,
+            streams::AttachedBy,
         },
     };
 
@@ -1631,6 +1641,84 @@ mod tests {
             )
             .is_err(),
             "a session without events is not found"
+        );
+    }
+
+    #[test]
+    fn declared_sub_agent_ids_are_stored_and_attach_the_sub_agent_segment() {
+        let mut database = database();
+        let event = |id: &str, second: u8, event_type: &str, declared: serde_json::Value| {
+            let mut event = json!({
+                "event_id": id,
+                "observed_at": format!("2026-10-20T00:00:0{second}Z"),
+                "device": {"host_name": "local", "platform": "macos"},
+                "agent": {"name": "claude-code"},
+                "session_id": "declared-session",
+                "llm": {"provider": "anthropic", "model": "claude"},
+                "event_type": event_type,
+                "response_id": &id[..1],
+                "metadata": {"conversation": {
+                    "entries": [{"role": "user", "text": id}],
+                    "completeness": "complete"
+                }}
+            });
+            for (key, value) in declared.as_object().into_iter().flatten() {
+                event[key] = value.clone();
+            }
+            event
+        };
+        let main = json!({"root_turn_id": "p1"});
+        let sub = json!({"subagent_id": "a1", "root_turn_id": "p1"});
+        let request: IngestEventsRequest = serde_json::from_value(json!({"events": [
+            event("m-req", 1, "request", main.clone()),
+            event("m-res", 5, "response", main),
+            event("s-req", 2, "request", sub.clone()),
+            event("s-res", 3, "response", sub),
+            // Without a request, the response's declared ids stand for the
+            // exchange; with no root turn it attaches by time.
+            event("o-res", 4, "response", json!({"subagent_id": "a2", "parent_subagent_id": null})),
+        ]}))
+        .expect("test ingest request should deserialize");
+        ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+
+        let stored = llm_usage_event_stream_facts::table
+            .inner_join(llm_usage_events::table)
+            .filter(llm_usage_events::event_id.eq("s-res"))
+            .select((
+                llm_usage_event_stream_facts::subagent_id,
+                llm_usage_event_stream_facts::parent_subagent_id,
+                llm_usage_event_stream_facts::root_turn_id,
+            ))
+            .first::<(Option<String>, Option<String>, Option<String>)>(&mut database)
+            .expect("the response's facts");
+        assert_eq!(stored, (Some("a1".to_owned()), None, Some("p1".to_owned())));
+
+        let session_pk = agent_sessions::table
+            .select(agent_sessions::id)
+            .first::<String>(&mut database)
+            .expect("the session is stored");
+        let session_pk = Uuid::parse_str(&session_pk).expect("a UUID");
+        let streams = session_streams(&mut database, OWNER_ID, session_pk, &StreamCache::default())
+            .expect("the session's streams derive");
+        let attachments = streams
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.head.as_str(),
+                    segment.subagent_id.as_deref(),
+                    segment.attached_to.as_deref(),
+                    segment.attached_by,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attachments,
+            [
+                ("m", None, None, None),
+                ("s", Some("a1"), Some("m"), Some(AttachedBy::Declared)),
+                ("o", Some("a2"), Some("m"), Some(AttachedBy::Time)),
+            ]
         );
     }
 

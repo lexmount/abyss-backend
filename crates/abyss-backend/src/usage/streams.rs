@@ -52,6 +52,12 @@ pub struct StreamEvent {
     pub response_id: Option<String>,
     /// Response the request names as the one it continues.
     pub previous_response_id: Option<String>,
+    /// Sub-agent the client declared the event belongs to.
+    pub subagent_id: Option<String>,
+    /// Sub-agent the client declared as the one that started it.
+    pub parent_subagent_id: Option<String>,
+    /// Turn the client declared the event ultimately works for.
+    pub root_turn_id: Option<String>,
     /// Facts read at ingest; an event stored before they were read has the
     /// default facts of its side.
     pub facts: EventFacts,
@@ -85,6 +91,27 @@ pub struct StreamSegment {
     pub exchange_count: usize,
     /// The new user words of the segment's first request.
     pub label: Option<EntryLabel>,
+    /// Sub-agent the first exchange declares.
+    pub subagent_id: Option<String>,
+    /// Head of the parent stream's segment this sub-agent segment shows
+    /// beside; only a root segment of a sub-agent is attached.
+    pub attached_to: Option<String>,
+    /// How the attachment was found.
+    pub attached_by: Option<AttachedBy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// How a sub-agent's root segment was attached to a segment of its parent
+/// stream. Attachment only decides where the segment shows; it changes no
+/// base and no segment.
+pub enum AttachedBy {
+    /// The first parent segment holding a request with the sub-agent's
+    /// declared root turn.
+    Declared,
+    /// The earliest parent segment whose time range holds the sub-agent's
+    /// start.
+    Time,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -184,6 +211,14 @@ impl SessionStructure {
             .iter()
             .map(|segment| structure.segment(segment))
             .collect();
+        for (index, attachment) in structure.attachments().into_iter().enumerate() {
+            if let Some((target, by)) = attachment {
+                let head = structure.segment_head(target).to_owned();
+                let segment = &mut structure.segments[index];
+                segment.attached_to = Some(head);
+                segment.attached_by = Some(by);
+            }
+        }
         structure
     }
 
@@ -304,7 +339,62 @@ impl SessionStructure {
                 .unwrap_or_default(),
             exchange_count: segment.exchanges.len(),
             label: self.label(first),
+            subagent_id: self.exchanges[first].subagent_id.clone(),
+            attached_to: None,
+            attached_by: None,
         }
+    }
+
+    /// Where each sub-agent root segment shows: in its parent stream, the
+    /// first segment holding a request with the same declared root turn;
+    /// without a declared root turn, or when no parent segment holds it, the
+    /// earliest segment whose time range holds the sub-agent's start.
+    ///
+    /// The parent stream is the segments of the declared parent sub-agent, or
+    /// those of no sub-agent when none is declared. Other segments are not
+    /// attached.
+    fn attachments(&self) -> Vec<Option<(usize, AttachedBy)>> {
+        let segments = &self.segmentation.segments;
+        let stream_of = |index: usize| self.segments[index].subagent_id.as_deref();
+        let mut by_stream: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+        let mut by_root_turn: HashMap<(Option<&str>, &str), usize> = HashMap::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let stream = stream_of(index);
+            by_stream.entry(stream).or_default().push(index);
+            for &exchange in &segment.exchanges {
+                if let Some(root_turn) = self.exchanges[exchange].root_turn_id.as_deref() {
+                    by_root_turn.entry((stream, root_turn)).or_insert(index);
+                }
+            }
+        }
+        self.segments
+            .iter()
+            .zip(segments)
+            .map(|(segment, members)| {
+                if segment.kind != SegmentKind::Root || segment.subagent_id.is_none() {
+                    return None;
+                }
+                let first = &self.exchanges[*members.exchanges.first()?];
+                let parent = first.parent_subagent_id.as_deref();
+                if let Some(&target) = first
+                    .root_turn_id
+                    .as_deref()
+                    .and_then(|root_turn| by_root_turn.get(&(parent, root_turn)))
+                {
+                    return Some((target, AttachedBy::Declared));
+                }
+                by_stream
+                    .get(&parent)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|&target| {
+                        let target = &self.segments[target];
+                        (target.start..=target.end).contains(&segment.start)
+                    })
+                    .map(|target| (target, AttachedBy::Time))
+            })
+            .collect()
     }
 }
 
@@ -369,6 +459,12 @@ pub struct SegmentExchange {
     pub new_from: Option<i32>,
     /// Whether the request opens a turn.
     pub starts_turn: bool,
+    /// Sub-agent the client declared: the request's, else the response's.
+    pub subagent_id: Option<String>,
+    /// Parent sub-agent the client declared.
+    pub parent_subagent_id: Option<String>,
+    /// Root turn the client declared.
+    pub root_turn_id: Option<String>,
 }
 
 /// Exchanges of one segment from a given exchange on.
@@ -421,6 +517,9 @@ impl SessionStructure {
             no_base_reason: self.bases[index].err(),
             new_from: request.map(|request| request.facts.new_from),
             starts_turn: exchange.starts_turn(),
+            subagent_id: exchange.subagent_id.clone(),
+            parent_subagent_id: exchange.parent_subagent_id.clone(),
+            root_turn_id: exchange.root_turn_id.clone(),
         }
     }
 }
@@ -431,8 +530,241 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{BaseRule, SegmentKind, event_segments, segment_run, session_streams};
+    use super::{
+        AttachedBy, BaseRule, SegmentKind, SessionStreamsResponse, event_segments, segment_run,
+        session_streams,
+    };
     use crate::usage::streams::fixtures::{Session, assistant, call, item, result, user};
+
+    fn sorted_streams(session: &Session) -> SessionStreamsResponse {
+        let mut events = session.events.clone();
+        events.sort_by_key(|event| event.observed_at);
+        session_streams(Uuid::nil(), events)
+    }
+
+    /// `(head, subagent_id, attached_to, attached_by)` of one segment.
+    type Attachment<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<AttachedBy>,
+    );
+
+    fn attachments(streams: &SessionStreamsResponse) -> Vec<Attachment<'_>> {
+        streams
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.head.as_str(),
+                    segment.subagent_id.as_deref(),
+                    segment.attached_to.as_deref(),
+                    segment.attached_by,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sub_agents_attach_by_declared_root_turn_by_time_or_not_at_all() {
+        let mut session = Session::new();
+        let main = (None, None, Some("p1"));
+        let a1 = (Some("a1"), None, Some("p1"));
+        // Claude Code: the main line names its prompt; a sub-agent carries its
+        // own id and the prompt that started it.
+        session.declared(
+            "ask",
+            0,
+            &json!([user("plan")]),
+            &json!([call("task")]),
+            main,
+        );
+        session.declared(
+            "agent",
+            5,
+            &json!([user("explore")]),
+            &json!([call("spawn")]),
+            a1,
+        );
+        session.declared(
+            "agent-back",
+            8,
+            &json!([user("explore"), call("spawn"), result("spawn")]),
+            &json!([assistant("explored")]),
+            a1,
+        );
+        session.declared(
+            "back",
+            30,
+            &json!([user("plan"), call("task"), result("task")]),
+            &json!([assistant("planned")]),
+            main,
+        );
+        // Codex: a sub-agent started by sub-agent `a1` names its parent; with
+        // no root turn declared it attaches to the parent segment active when
+        // it starts.
+        session.declared(
+            "nested",
+            6,
+            &json!([user("count lines")]),
+            &json!([assistant("2")]),
+            (Some("t2"), Some("a1"), None),
+        );
+        // Nothing to attach to: starts after the main line ended, one with a
+        // declared root turn no parent segment holds and one without any.
+        session.declared(
+            "stray",
+            40,
+            &json!([user("hi")]),
+            &json!([assistant("hello")]),
+            (Some("a3"), None, Some("p9")),
+        );
+        session.declared(
+            "late",
+            100,
+            &json!([user("hi")]),
+            &json!([assistant("hello")]),
+            (Some("a4"), None, None),
+        );
+        let streams = sorted_streams(&session);
+        assert_eq!(
+            attachments(&streams),
+            [
+                ("ask", None, None, None),
+                ("agent", Some("a1"), Some("ask"), Some(AttachedBy::Declared)),
+                ("nested", Some("t2"), Some("agent"), Some(AttachedBy::Time)),
+                ("stray", Some("a3"), None, None),
+                ("late", Some("a4"), None, None),
+            ]
+        );
+        assert_eq!(streams.segments[1].exchange_count, 2);
+
+        let mut events = session.events.clone();
+        events.sort_by_key(|event| event.observed_at);
+        let run = segment_run(events, "nested").expect("a run");
+        let nested = &run.exchanges[0];
+        assert_eq!(
+            (
+                nested.subagent_id.as_deref(),
+                nested.parent_subagent_id.as_deref(),
+                nested.root_turn_id.as_deref()
+            ),
+            (Some("t2"), Some("a1"), None)
+        );
+    }
+
+    #[test]
+    fn a_declared_root_turn_the_parent_lacks_falls_back_to_time() {
+        let mut session = Session::new();
+        // Codex: the main line declares no root turn, while its sub-agent
+        // carries the turn that started it.
+        session.exchange("main", 0, &json!([user("go")]), &json!([call("spawn")]));
+        session.exchange(
+            "main-back",
+            20,
+            &json!([user("go"), call("spawn"), result("spawn")]),
+            &json!([assistant("done")]),
+        );
+        session.declared(
+            "sub",
+            5,
+            &json!([user("look")]),
+            &json!([assistant("seen")]),
+            (Some("t1"), None, Some("turn-1")),
+        );
+        let streams = sorted_streams(&session);
+        assert_eq!(
+            attachments(&streams)[1],
+            ("sub", Some("t1"), Some("main"), Some(AttachedBy::Time))
+        );
+    }
+
+    #[test]
+    fn of_several_parent_segments_active_at_the_start_the_earliest_is_taken() {
+        let mut session = Session::new();
+        session.exchange("main", 0, &json!([user("go")]), &json!([call("m")]));
+        session.exchange(
+            "main-2",
+            10,
+            &json!([user("go"), call("m"), result("m")]),
+            &json!([assistant("ok")]),
+        );
+        session.exchange(
+            "side",
+            3,
+            &json!([user("title")]),
+            &json!([assistant("Go")]),
+        );
+        session.declared(
+            "sub",
+            3,
+            &json!([user("look")]),
+            &json!([assistant("seen")]),
+            (Some("a"), None, None),
+        );
+        let streams = sorted_streams(&session);
+        assert_eq!(streams.segments[1].head, "side");
+        assert_eq!(
+            attachments(&streams)[2],
+            ("sub", Some("a"), Some("main"), Some(AttachedBy::Time))
+        );
+    }
+
+    #[test]
+    fn only_root_segments_of_sub_agents_attach_and_attachment_changes_no_segment() {
+        let mut session = Session::new();
+        let a = (Some("a"), None, Some("p1"));
+        session.declared(
+            "ask",
+            0,
+            &json!([user("plan")]),
+            &json!([call("task")]),
+            (None, None, Some("p1")),
+        );
+        session.declared(
+            "sub",
+            1,
+            &json!([user("look")]),
+            &json!([item(assistant("seen"), "msg_1")]),
+            a,
+        );
+        // A new turn of the same sub-agent opens a turn segment, which keeps
+        // its place without attaching.
+        session.declared(
+            "sub-2",
+            2,
+            &json!([user("look"), item(assistant("seen"), "msg_1"), user("more")]),
+            &json!([assistant("more")]),
+            a,
+        );
+        let declared = sorted_streams(&session);
+        let mut plain = session.events.clone();
+        for event in &mut plain {
+            event.subagent_id = None;
+            event.parent_subagent_id = None;
+            event.root_turn_id = None;
+        }
+        plain.sort_by_key(|event| event.observed_at);
+        let plain = session_streams(Uuid::nil(), plain);
+        let shape = |streams: &SessionStreamsResponse| {
+            streams
+                .segments
+                .iter()
+                .map(|segment| (segment.head.clone(), segment.kind, segment.parent.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&declared), shape(&plain));
+        assert_eq!(
+            attachments(&declared),
+            [
+                ("ask", None, None, None),
+                ("sub", Some("a"), Some("ask"), Some(AttachedBy::Declared)),
+                ("sub-2", Some("a"), None, None),
+            ]
+        );
+        assert_eq!(declared.segments[2].kind, SegmentKind::Turn);
+        assert!(attachments(&plain).iter().all(|row| row.2.is_none()));
+    }
 
     #[test]
     fn segments_open_at_roots_turns_and_branches() {
