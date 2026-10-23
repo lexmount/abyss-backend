@@ -5,6 +5,8 @@
 //! connection pools, SQL dialects, search projection, and worker lifecycle out
 //! of the API layer.
 
+mod comparison_buckets;
+
 #[cfg(feature = "postgres-es")]
 mod postgres;
 #[cfg(feature = "sqlite-fts")]

@@ -2,6 +2,7 @@
 """Exercise comparison aggregation against a running service and real storage."""
 
 import copy
+from datetime import datetime, timedelta, timezone
 import json
 import urllib.error
 import urllib.request
@@ -121,8 +122,131 @@ def run(base, token, prefix="/v1/agent-usage", other_token=None, admin_token=Non
             )
             == 100
         )
+    check_bucket_boundaries(base, prefix, token, key)
     print(
         "comparison API: dimensions, filters, time boundaries, idempotency and authorization passed"
+    )
+
+
+def check_bucket_boundaries(base, prefix, token, key):
+    """Exercise bound timestamps, quoted filter values and maximum-size bucket sets."""
+    session = key + "-'quoted"
+    model = "model-'quoted"
+    provider = "provider-'quoted"
+
+    def ingest(samples, suffix):
+        events = [
+            {
+                "event_id": session + suffix + str(index),
+                "session_id": session + suffix,
+                "observed_at": observed_at,
+                "device": {"host_name": session, "platform": "linux"},
+                "agent": {"name": "codex"},
+                "llm": {"provider": provider, "model": model},
+                "event_type": "request",
+                "token_usage": {"input_tokens": tokens, "total_tokens": tokens},
+            }
+            for index, (observed_at, tokens) in enumerate(samples)
+        ]
+        status, data = request(base, prefix + "/events", token, {"events": events})
+        assert status == 200, (status, data)
+
+    def compare(query):
+        status, data = request(base, prefix + "/comparison", token, query)
+        assert status == 200, (status, data)
+        return data
+
+    def millis(value):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        delta = value - datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return (delta.days * 86400 + delta.seconds) * 1000 + delta.microseconds // 1000
+
+    ingest(
+        [
+            ("2030-03-01T00:00:00.000000Z", 999),
+            ("2030-03-01T00:00:00.000001Z", 5_000_000_000),
+            ("2030-03-01T01:00:00.000000Z", 7),
+            ("2030-03-01T01:00:00.000001Z", 11),
+            ("2030-03-01T02:00:00.000001Z", 999),
+        ],
+        "",
+    )
+    query = {
+        "group_by": None,
+        "buckets": [
+            {
+                "start": "2030-03-01T00:00:00.000001Z",
+                "end": "2030-03-01T01:00:00.000001Z",
+            },
+            {
+                "start": "2030-03-01T01:00:00.000001Z",
+                "end": "2030-03-01T02:00:00.000001Z",
+            },
+        ],
+        "filters": {
+            "session": [session],
+            "agent": ["codex"],
+            "model": [model],
+            "provider": [provider],
+            "platform": ["linux"],
+        },
+    }
+    data = compare(query)
+    assert data["rows"] == [
+        {
+            "bucket": millis(query["buckets"][0]["start"]),
+            "value": "all",
+            "total_tokens": 5_000_000_007,
+            "requests": 2,
+        },
+        {
+            "bucket": millis(query["buckets"][1]["start"]),
+            "value": "all",
+            "total_tokens": 11,
+            "requests": 1,
+        },
+    ], data
+    query["filters"]["model"] = ["does-not-exist-' OR 1=1 --"]
+    empty = compare(query)
+    assert empty["rows"] == [], "filter values must remain literal parameters"
+    assert empty["options"] == data["options"], "chart filters must not narrow facets"
+    query["filters"]["model"] = [model]
+    start = datetime(2030, 3, 1, microsecond=1, tzinfo=timezone.utc)
+    query["buckets"] = [
+        {
+            "start": (start + timedelta(minutes=index)).isoformat(),
+            "end": (start + timedelta(minutes=index + 1)).isoformat(),
+        }
+        for index in range(400)
+    ]
+    maximum = compare(query)
+    assert len(maximum["rows"]) == 4, maximum
+    assert sum(row["total_tokens"] for row in maximum["rows"]) == 5_000_001_017
+    assert sum(row["requests"] for row in maximum["rows"]) == 4
+
+    ingest(
+        [
+            ("2026-11-01T04:00:00Z", 7),
+            ("2026-11-02T04:59:59.999999Z", 11),
+            ("2026-11-02T05:00:00Z", 13),
+            ("2026-11-03T05:00:00Z", 999),
+        ],
+        "-dst",
+    )
+    query["filters"]["session"] = [session + "-dst"]
+    query["buckets"] = [
+        {"start": "2026-11-01T04:00:00Z", "end": "2026-11-02T05:00:00Z"},
+        {"start": "2026-11-02T05:00:00Z", "end": "2026-11-03T05:00:00Z"},
+    ]
+    dst = compare(query)
+    assert [
+        (row["bucket"], row["total_tokens"], row["requests"]) for row in dst["rows"]
+    ] == [
+        (millis(query["buckets"][0]["start"]), 18, 2),
+        (millis(query["buckets"][1]["start"]), 13, 1),
+    ], dst
+    print(
+        "comparison boundaries: microseconds, quoted filters, empty matches, 400 buckets and DST passed"
     )
 
 

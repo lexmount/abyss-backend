@@ -114,6 +114,11 @@ end-exclusive, limited to 367 days and 400 buckets. Results contain bucket-start
 epoch milliseconds, dimension values, summed `total_tokens`, and request counts;
 filter options use the same authorized time range before optional filters.
 
+Comparison joins, filters, aggregates, and facet queries use Diesel's typed query
+builder for both storage backends. A small `QueryFragment` extension supplies the
+bound `VALUES` CTE for time buckets, which Diesel does not provide as a built-in
+query source. Bucket values remain bound and result types remain checked.
+
 ## Configuration
 
 | Variable | Required | Default | Description |

@@ -4,7 +4,7 @@ use crate::error::AppError;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComparisonDimension {
     Agent,
@@ -13,18 +13,7 @@ pub enum ComparisonDimension {
     Platform,
 }
 
-impl ComparisonDimension {
-    pub const fn column(self) -> &'static str {
-        match self {
-            Self::Agent => "e.agent_name",
-            Self::Model => "e.llm_model",
-            Self::Provider => "e.llm_provider",
-            Self::Platform => "d.platform",
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ComparisonFilters {
     pub agent: Vec<String>,
@@ -101,45 +90,19 @@ impl ComparisonQuery {
         }
         Ok(())
     }
-
-    pub fn encoded_buckets(&self) -> String {
-        serde_json::Value::Array(
-            self.buckets
-                .iter()
-                .map(|bucket| {
-                    serde_json::json!({
-                        "start_us": bucket.start.timestamp_micros(),
-                        "end_us": bucket.end.timestamp_micros(),
-                    })
-                })
-                .collect(),
-        )
-        .to_string()
-    }
-
-    pub fn encoded_filters(&self) -> Result<String, AppError> {
-        serde_json::to_string(&self.filters)
-            .map_err(|error| AppError::internal(format!("serialize comparison filters: {error}")))
-    }
 }
 
-#[derive(diesel::QueryableByName, Serialize)]
+#[derive(diesel::Queryable, Serialize)]
 pub struct ComparisonRow {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub bucket: i64,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     pub value: String,
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub total_tokens: i64,
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub requests: i64,
 }
 
-#[derive(diesel::QueryableByName, Serialize)]
+#[derive(diesel::Queryable, Serialize)]
 pub struct ComparisonOption {
-    #[diesel(sql_type = diesel::sql_types::Text)]
     pub dimension: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     pub value: String,
 }
 
@@ -180,5 +143,64 @@ mod tests {
             query(&serde_json::json!([])).validate().is_err(),
             "empty ranges are invalid"
         );
+    }
+
+    #[test]
+    fn limits_bucket_count_and_total_duration_before_building_the_query() {
+        use chrono::{Duration, TimeZone, Utc};
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let buckets: Vec<_> = (0..400)
+            .map(|index| {
+                serde_json::json!({
+                    "start": start + Duration::minutes(index),
+                    "end": start + Duration::minutes(index + 1),
+                })
+            })
+            .collect();
+        let mut value = query(&serde_json::json!(buckets));
+        assert!(value.validate().is_ok(), "400 bound buckets are supported");
+        value.buckets.push(super::ComparisonBucket {
+            start: start + Duration::minutes(400),
+            end: start + Duration::minutes(401),
+        });
+        assert!(
+            value.validate().is_err(),
+            "reject oversized bucket sets before SQL generation"
+        );
+
+        let mut value = query(&serde_json::json!([{
+            "start": start,
+            "end": start + Duration::days(367),
+        }]));
+        assert!(
+            value.validate().is_ok(),
+            "the documented maximum span is inclusive"
+        );
+        value.buckets[0].end += Duration::microseconds(1);
+        assert!(
+            value.validate().is_err(),
+            "even a fractional excess is rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_reversed_and_gapped_buckets() {
+        for buckets in [
+            serde_json::json!([{ "start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:00:00Z" }]),
+            serde_json::json!([{ "start": "2026-01-02T00:00:00Z", "end": "2026-01-01T00:00:00Z" }]),
+            serde_json::json!([
+                { "start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z" },
+                { "start": "2026-01-03T00:00:00Z", "end": "2026-01-04T00:00:00Z" },
+            ]),
+        ] {
+            assert!(
+                query(&buckets).validate().is_err(),
+                "buckets must partition the entire requested interval"
+            );
+        }
     }
 }
