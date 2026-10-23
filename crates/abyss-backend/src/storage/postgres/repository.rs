@@ -716,6 +716,9 @@ fn stream_events(
             llm_usage_event_stream_facts::label_index.nullable(),
             llm_usage_event_stream_facts::label_text.nullable(),
             llm_usage_event_stream_facts::label_length.nullable(),
+            llm_usage_event_stream_facts::subagent_id.nullable(),
+            llm_usage_event_stream_facts::parent_subagent_id.nullable(),
+            llm_usage_event_stream_facts::root_turn_id.nullable(),
         ))
         .load::<StreamEventRow>(connection)?
         .into_iter()
@@ -745,6 +748,9 @@ fn stream_event(row: StreamEventRow) -> Result<StreamEvent, AppError> {
         observed_at: row.observed_at,
         response_id: row.response_id,
         previous_response_id: row.previous_response_id,
+        subagent_id: row.subagent_id,
+        parent_subagent_id: row.parent_subagent_id,
+        root_turn_id: row.root_turn_id,
         facts,
     })
 }
@@ -770,11 +776,17 @@ fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, AppError> {
 
 /// Stream fact columns of one ingested event; the other side's stay NULL.
 fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFacts, AppError> {
+    let declared = NewStreamFacts {
+        event_pk,
+        subagent_id: event.subagent_id.clone(),
+        parent_subagent_id: event.parent_subagent_id.clone(),
+        root_turn_id: event.root_turn_id.clone(),
+        ..NewStreamFacts::default()
+    };
     Ok(match event.event_type {
         UsageEventType::Request => {
             let facts = RequestFacts::read(&event.metadata);
             NewStreamFacts {
-                event_pk,
                 new_from: Some(facts.new_from),
                 starts_turn: Some(facts.starts_turn),
                 last_identity: facts.last_identity,
@@ -783,16 +795,15 @@ fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFac
                 label_index: facts.label.as_ref().map(|label| label.index),
                 label_length: facts.label.as_ref().map(|label| label.length),
                 label_text: facts.label.map(|label| label.text),
-                ..NewStreamFacts::default()
+                ..declared
             }
         }
         UsageEventType::Response => {
             let facts = ResponseFacts::read(&event.metadata);
             NewStreamFacts {
-                event_pk,
                 emitted_ids: Some(json_value(&facts.emitted_ids, "emitted ids")?),
                 output_skeleton: Some(json_value(&facts.output_skeleton, "output skeleton")?),
-                ..NewStreamFacts::default()
+                ..declared
             }
         }
     })
@@ -1926,6 +1937,9 @@ mod tests {
             stream_id: None,
             response_id: None,
             previous_response_id: None,
+            subagent_id: None,
+            parent_subagent_id: None,
+            root_turn_id: None,
             llm: LlmPayload {
                 provider: "OpenAI".to_owned(),
                 model: "gpt-5.5".to_owned(),

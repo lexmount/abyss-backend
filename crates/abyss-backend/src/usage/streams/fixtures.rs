@@ -49,6 +49,13 @@ pub(super) fn skeleton(entries: &[(&str, Option<&str>)]) -> Vec<(String, Option<
         .collect()
 }
 
+/// `(subagent_id, parent_subagent_id, root_turn_id)` an exchange declares.
+pub(super) type Declared = (
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
 pub(super) fn ids(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -88,6 +95,9 @@ impl Session {
             observed_at: at,
             response_id: Some(name.to_owned()),
             previous_response_id: previous.map(str::to_owned),
+            subagent_id: None,
+            parent_subagent_id: None,
+            root_turn_id: None,
             facts,
         });
     }
@@ -108,6 +118,25 @@ impl Session {
     pub(super) fn exchange(&mut self, name: &str, second: i64, request: &Value, response: &Value) {
         self.ask(name, second, None, request);
         self.answer(name, second, response);
+    }
+
+    /// Adds exchange `name` whose events both carry the declared `ids`:
+    /// `(subagent_id, parent_subagent_id, root_turn_id)`.
+    pub(super) fn declared(
+        &mut self,
+        name: &str,
+        second: i64,
+        request: &Value,
+        response: &Value,
+        ids: Declared,
+    ) {
+        self.exchange(name, second, request, response);
+        let (subagent, parent, root_turn) = ids;
+        for event in self.events.iter_mut().rev().take(2) {
+            event.subagent_id = subagent.map(str::to_owned);
+            event.parent_subagent_id = parent.map(str::to_owned);
+            event.root_turn_id = root_turn.map(str::to_owned);
+        }
     }
 
     /// The base and rule of exchange `name`, or why it has none.

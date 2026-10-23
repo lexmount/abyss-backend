@@ -320,6 +320,12 @@ pub struct StreamEventRow {
     pub label_text: Option<String>,
     /// Request: length of its label entry's text in UTF-16 code units.
     pub label_length: Option<i32>,
+    /// Sub-agent id the client declared for the event.
+    pub subagent_id: Option<String>,
+    /// Id of the sub-agent the client declared as this one's parent.
+    pub parent_subagent_id: Option<String>,
+    /// Root turn the client declared the event works for.
+    pub root_turn_id: Option<String>,
 }
 
 #[derive(Debug, Default, Insertable)]
@@ -348,6 +354,12 @@ pub struct NewStreamFacts {
     pub label_text: Option<String>,
     /// Request: length of its label entry's text in UTF-16 code units.
     pub label_length: Option<i32>,
+    /// Sub-agent id the client declared for the event.
+    pub subagent_id: Option<String>,
+    /// Id of the sub-agent the client declared as this one's parent.
+    pub parent_subagent_id: Option<String>,
+    /// Root turn the client declared the event works for.
+    pub root_turn_id: Option<String>,
 }
 
 #[derive(Insertable)]
