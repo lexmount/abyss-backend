@@ -33,7 +33,7 @@ use crate::{
         segments::{SegmentQuery, SegmentResponse},
         session_header::SessionHeaderResponse,
         session_list::{SessionListQuery, SessionListResponse},
-        streams::{EventLocationResponse, SessionStreamsResponse},
+        streams::{EventLocationResponse, SessionStreamsResponse, SessionTurnsResponse},
     },
 };
 
@@ -90,6 +90,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/agent-usage/sessions/{session_pk}/streams",
             get(session_streams),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/turns",
+            get(session_turns),
         )
         .route(
             "/v1/agent-usage/sessions/{session_pk}/segments/{head}",
@@ -193,6 +197,18 @@ async fn session_streams(
     let user_id = state.identity.authenticate(&headers)?;
     Ok(Json(
         state.storage.session_streams(user_id, session_pk).await?,
+    ))
+}
+
+/// Turns of one session, each with its executors' segments, without content.
+async fn session_turns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionTurnsResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state.storage.session_turns(user_id, session_pk).await?,
     ))
 }
 

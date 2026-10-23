@@ -30,7 +30,7 @@ use crate::{
         segments::{SegmentResponse, ValidatedSegmentQuery},
         session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
-        streams::{EventLocationResponse, SessionStreamsResponse},
+        streams::{EventLocationResponse, SessionStreamsResponse, SessionTurnsResponse},
     },
 };
 
@@ -95,6 +95,14 @@ pub trait StorageBackend: Send + Sync {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>>;
+
+    /// Derives the turn view of an owner-scoped session; not found when the
+    /// owner has no event in it.
+    fn session_turns(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionTurnsResponse, AppError>>;
 
     /// The exchanges of the segment holding exchange `head` in
     /// an owner-scoped session, from `head` to the segment end; not found when the session

@@ -13,6 +13,8 @@ mod facts;
 #[cfg(test)]
 mod fixtures;
 mod segmentation;
+mod timeline;
+mod turns;
 
 use std::collections::HashMap;
 
@@ -24,10 +26,12 @@ pub use self::{
     base::{BaseRule, NoBaseReason},
     facts::{Label, RequestFacts, ResponseFacts},
     segmentation::SegmentKind,
+    timeline::SessionTurnsResponse,
 };
 use self::{
     base::{Exchange, emitters, find_base, group_exchanges},
     segmentation::{Segment, Segmentation},
+    turns::Turns,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +61,7 @@ pub struct StreamEvent {
     /// Sub-agent the client declared as the one that started it.
     pub parent_subagent_id: Option<String>,
     /// Turn the client declared the event ultimately works for.
-    pub root_turn_id: Option<String>,
+    pub turn_id: Option<String>,
     /// Facts read at ingest; an event stored before they were read has the
     /// default facts of its side.
     pub facts: EventFacts,
@@ -91,6 +95,12 @@ pub struct StreamSegment {
     pub exchange_count: usize,
     /// The new user words of the segment's first request.
     pub label: Option<EntryLabel>,
+    /// Turn of the segment's first exchange: the declared value, or the id of
+    /// the exchange that opened it; `None` when it belongs to no turn.
+    pub turn_id: Option<String>,
+    /// One-based number of that turn in the session; the segments of one
+    /// turn share it.
+    pub turn: Option<i64>,
     /// Sub-agent the first exchange declares.
     pub subagent_id: Option<String>,
     /// Head of the parent stream's segment this sub-agent segment shows
@@ -107,7 +117,7 @@ pub struct StreamSegment {
 /// base and no segment.
 pub enum AttachedBy {
     /// The first parent segment holding a request with the sub-agent's
-    /// declared root turn.
+    /// declared turn.
     Declared,
     /// The earliest parent segment whose time range holds the sub-agent's
     /// start.
@@ -151,6 +161,7 @@ impl EntryLabel {
 pub struct SessionStructure {
     exchanges: Vec<Exchange>,
     bases: Vec<Result<(usize, BaseRule), NoBaseReason>>,
+    turns: Turns,
     segmentation: Segmentation,
     segments: Vec<StreamSegment>,
     summary: StreamSummary,
@@ -174,13 +185,11 @@ impl SessionStructure {
         let bases = (0..exchanges.len())
             .map(|index| find_base(index, &exchanges, &by_response_id, &by_id))
             .collect::<Vec<_>>();
-        let segmentation = Segmentation::cut(&exchanges, &bases);
+        let turns = Turns::assign(&exchanges, &bases);
+        let segmentation = Segmentation::cut(&exchanges, &bases, &turns);
         let summary = StreamSummary {
             exchanges: exchanges.len(),
-            turns: exchanges
-                .iter()
-                .filter(|exchange| exchange.starts_turn())
-                .count(),
+            turns: turns.ids.len(),
             segments: segmentation.segments.len(),
         };
         let mut exchange_by_id = HashMap::with_capacity(exchanges.len());
@@ -199,6 +208,7 @@ impl SessionStructure {
         let mut structure = Self {
             exchanges,
             bases,
+            turns,
             segmentation,
             segments: Vec::new(),
             summary,
@@ -256,7 +266,7 @@ impl SessionStructure {
         let segment = self.segmentation.segment_of[exchange];
         Some(EventLocation {
             segment: self.segment_head(segment).to_owned(),
-            segment_index: segment.saturating_add(1),
+            turn: self.turn(exchange).1,
             segment_kind: self.segments[segment].kind,
             exchange: self.exchanges[exchange].id.clone(),
         })
@@ -309,6 +319,16 @@ impl SessionStructure {
         })
     }
 
+    /// Identity and one-based number of an exchange's turn.
+    fn turn(&self, exchange: usize) -> (Option<String>, Option<i64>) {
+        self.turns.of[exchange].map_or((None, None), |turn| {
+            (
+                Some(self.turns.ids[turn].clone()),
+                Some(Turns::number(turn)),
+            )
+        })
+    }
+
     fn base(&self, exchange: usize) -> Option<usize> {
         self.bases[exchange].ok().map(|(base, _)| base)
     }
@@ -316,6 +336,7 @@ impl SessionStructure {
     fn segment(&self, segment: &Segment) -> StreamSegment {
         let id = |exchange: usize| self.exchanges[exchange].id.clone();
         let first = segment.exchanges.first().copied().unwrap_or_default();
+        let (turn_id, turn) = self.turn(first);
         let members = segment
             .exchanges
             .iter()
@@ -339,6 +360,8 @@ impl SessionStructure {
                 .unwrap_or_default(),
             exchange_count: segment.exchanges.len(),
             label: self.label(first),
+            turn_id,
+            turn,
             subagent_id: self.exchanges[first].subagent_id.clone(),
             attached_to: None,
             attached_by: None,
@@ -346,8 +369,8 @@ impl SessionStructure {
     }
 
     /// Where each sub-agent root segment shows: in its parent stream, the
-    /// first segment holding a request with the same declared root turn;
-    /// without a declared root turn, or when no parent segment holds it, the
+    /// first segment holding a request with the same declared turn;
+    /// without a declared turn, or when no parent segment holds it, the
     /// earliest segment whose time range holds the sub-agent's start.
     ///
     /// The parent stream is the segments of the declared parent sub-agent, or
@@ -357,13 +380,13 @@ impl SessionStructure {
         let segments = &self.segmentation.segments;
         let stream_of = |index: usize| self.segments[index].subagent_id.as_deref();
         let mut by_stream: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
-        let mut by_root_turn: HashMap<(Option<&str>, &str), usize> = HashMap::new();
+        let mut by_turn: HashMap<(Option<&str>, &str), usize> = HashMap::new();
         for (index, segment) in segments.iter().enumerate() {
             let stream = stream_of(index);
             by_stream.entry(stream).or_default().push(index);
             for &exchange in &segment.exchanges {
-                if let Some(root_turn) = self.exchanges[exchange].root_turn_id.as_deref() {
-                    by_root_turn.entry((stream, root_turn)).or_insert(index);
+                if let Some(turn) = self.exchanges[exchange].turn_id.as_deref() {
+                    by_turn.entry((stream, turn)).or_insert(index);
                 }
             }
         }
@@ -377,9 +400,9 @@ impl SessionStructure {
                 let first = &self.exchanges[*members.exchanges.first()?];
                 let parent = first.parent_subagent_id.as_deref();
                 if let Some(&target) = first
-                    .root_turn_id
+                    .turn_id
                     .as_deref()
-                    .and_then(|root_turn| by_root_turn.get(&(parent, root_turn)))
+                    .and_then(|turn| by_turn.get(&(parent, turn)))
                 {
                     return Some((target, AttachedBy::Declared));
                 }
@@ -411,7 +434,8 @@ pub fn session_streams(session_pk: Uuid, events: Vec<StreamEvent>) -> SessionStr
 #[derive(Clone, Copy, Debug)]
 pub struct StreamSummary {
     pub exchanges: usize,
-    /// Requests that open a turn.
+    /// Turns the exchanges belong to: the distinct declared turns when the
+    /// session declares any, else the requests that open a turn.
     pub turns: usize,
     pub segments: usize,
 }
@@ -421,8 +445,9 @@ pub struct StreamSummary {
 pub struct EventLocation {
     /// The current segment head; it can change when a later fork is observed.
     pub segment: String,
-    /// One-based position in the session's `streams.segments` array.
-    pub segment_index: usize,
+    /// One-based number of the turn of the event's exchange; `None` when the
+    /// exchange belongs to no turn.
+    pub turn: Option<i64>,
     /// Why this segment begins.
     pub segment_kind: SegmentKind,
     /// The exchange containing the event.
@@ -463,8 +488,11 @@ pub struct SegmentExchange {
     pub subagent_id: Option<String>,
     /// Parent sub-agent the client declared.
     pub parent_subagent_id: Option<String>,
-    /// Root turn the client declared.
-    pub root_turn_id: Option<String>,
+    /// Turn the exchange belongs to: the declared value, or the id of the
+    /// exchange that opened it; `None` when it belongs to no turn.
+    pub turn_id: Option<String>,
+    /// One-based number of that turn in the session.
+    pub turn: Option<i64>,
 }
 
 /// Exchanges of one segment from a given exchange on.
@@ -504,6 +532,7 @@ impl SessionStructure {
         let exchange = &self.exchanges[index];
         let base = self.base(index);
         let request = exchange.request.as_ref();
+        let (turn_id, turn) = self.turn(index);
         SegmentExchange {
             id: exchange.id.clone(),
             request_pk: request.map(|request| request.pk),
@@ -519,7 +548,8 @@ impl SessionStructure {
             starts_turn: exchange.starts_turn(),
             subagent_id: exchange.subagent_id.clone(),
             parent_subagent_id: exchange.parent_subagent_id.clone(),
-            root_turn_id: exchange.root_turn_id.clone(),
+            turn_id,
+            turn,
         }
     }
 }
@@ -530,9 +560,11 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    use std::collections::HashSet;
+
     use super::{
-        AttachedBy, BaseRule, SegmentKind, SessionStreamsResponse, event_segments, segment_run,
-        session_streams,
+        AttachedBy, BaseRule, EventFacts, SegmentKind, SessionStreamsResponse, SessionStructure,
+        StreamEvent, event_segments, segment_run, session_streams,
     };
     use crate::usage::streams::fixtures::{Session, assistant, call, item, result, user};
 
@@ -566,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_agents_attach_by_declared_root_turn_by_time_or_not_at_all() {
+    fn sub_agents_attach_by_declared_turn_by_time_or_not_at_all() {
         let mut session = Session::new();
         let main = (None, None, Some("p1"));
         let a1 = (Some("a1"), None, Some("p1"));
@@ -601,7 +633,7 @@ mod tests {
             main,
         );
         // Codex: a sub-agent started by sub-agent `a1` names its parent; with
-        // no root turn declared it attaches to the parent segment active when
+        // no turn declared it attaches to the parent segment active when
         // it starts.
         session.declared(
             "nested",
@@ -611,7 +643,7 @@ mod tests {
             (Some("t2"), Some("a1"), None),
         );
         // Nothing to attach to: starts after the main line ended, one with a
-        // declared root turn no parent segment holds and one without any.
+        // declared turn no parent segment holds and one without any.
         session.declared(
             "stray",
             40,
@@ -643,20 +675,23 @@ mod tests {
         events.sort_by_key(|event| event.observed_at);
         let run = segment_run(events, "nested").expect("a run");
         let nested = &run.exchanges[0];
+        // Declaring no turn in a session that declares turns, it joins the
+        // turn in progress.
         assert_eq!(
             (
                 nested.subagent_id.as_deref(),
                 nested.parent_subagent_id.as_deref(),
-                nested.root_turn_id.as_deref()
+                nested.turn_id.as_deref(),
+                nested.turn,
             ),
-            (Some("t2"), Some("a1"), None)
+            (Some("t2"), Some("a1"), Some("p1"), Some(1))
         );
     }
 
     #[test]
-    fn a_declared_root_turn_the_parent_lacks_falls_back_to_time() {
+    fn a_declared_turn_the_parent_lacks_falls_back_to_time() {
         let mut session = Session::new();
-        // Codex: the main line declares no root turn, while its sub-agent
+        // Codex: the main line declares no turn, while its sub-agent
         // carries the turn that started it.
         session.exchange("main", 0, &json!([user("go")]), &json!([call("spawn")]));
         session.exchange(
@@ -728,21 +763,21 @@ mod tests {
             &json!([item(assistant("seen"), "msg_1")]),
             a,
         );
-        // A new turn of the same sub-agent opens a turn segment, which keeps
-        // its place without attaching.
+        // The user speaking to the sub-agent starts a new turn, which opens a
+        // turn segment; it keeps its place without attaching.
         session.declared(
             "sub-2",
             2,
             &json!([user("look"), item(assistant("seen"), "msg_1"), user("more")]),
             &json!([assistant("more")]),
-            a,
+            (Some("a"), None, Some("p2")),
         );
         let declared = sorted_streams(&session);
         let mut plain = session.events.clone();
         for event in &mut plain {
             event.subagent_id = None;
             event.parent_subagent_id = None;
-            event.root_turn_id = None;
+            event.turn_id = None;
         }
         plain.sort_by_key(|event| event.observed_at);
         let plain = session_streams(Uuid::nil(), plain);
@@ -914,5 +949,265 @@ mod tests {
                 Some("e3")
             ]
         );
+    }
+
+    /// `(exchange, turn_id, turn)` of every exchange in session order.
+    fn exchange_turns(events: Vec<StreamEvent>) -> Vec<(String, Option<String>, Option<i64>)> {
+        let structure = SessionStructure::derive(events);
+        (0..structure.exchanges.len())
+            .map(|index| {
+                let exchange = structure.exchange(index);
+                (exchange.id, exchange.turn_id, exchange.turn)
+            })
+            .collect()
+    }
+
+    /// TURN-DESIGN 第三节: distinct declared turns when any event declares
+    /// one, else the requests that open a turn; read from events alone.
+    fn counted_turns(events: &[StreamEvent]) -> usize {
+        let declared = events
+            .iter()
+            .filter_map(|event| event.turn_id.as_deref())
+            .collect::<HashSet<_>>();
+        if declared.is_empty() {
+            events
+                .iter()
+                .filter(
+                    |event| matches!(&event.facts, EventFacts::Request(facts) if facts.starts_turn),
+                )
+                .count()
+        } else {
+            declared.len()
+        }
+    }
+
+    fn turn(id: &str, number: i64) -> (Option<String>, Option<i64>) {
+        (Some(id.to_owned()), Some(number))
+    }
+
+    /// A Claude Code session: the main line, its sub-agent, and its side
+    /// requests declare the prompt they work for.
+    fn declared_session() -> Session {
+        let mut session = Session::new();
+        let p1 = (None, None, Some("p1"));
+        // An auxiliary request before the first prompt.
+        session.exchange("pre", 0, &json!([user("quota")]), &json!([call("q")]));
+        session.declared(
+            "m1",
+            1,
+            &json!([user("quota"), call("q"), result("q"), user("fix it")]),
+            &json!([call("c1")]),
+            p1,
+        );
+        session.declared(
+            "sub",
+            2,
+            &json!([user("explore")]),
+            &json!([assistant("found")]),
+            (Some("a1"), None, Some("p1")),
+        );
+        // A title request declares nothing and has no base.
+        session.exchange(
+            "side",
+            3,
+            &json!([user("name this")]),
+            &json!([assistant("Fix")]),
+        );
+        session.declared(
+            "m2",
+            4,
+            &json!([user("fix it"), call("c1"), result("c1")]),
+            &json!([call("c2")]),
+            p1,
+        );
+        // The client resumes after hitting its output limit: user text
+        // without tool results, under the same prompt.
+        session.declared(
+            "resume",
+            5,
+            &json!([
+                user("fix it"),
+                call("c2"),
+                result("c2"),
+                user("Resume directly")
+            ]),
+            &json!([call("c3")]),
+            p1,
+        );
+        // The user interjects: a new prompt that still carries tool results.
+        session.declared(
+            "interject",
+            6,
+            &json!([call("c3"), result("c3"), user("also add a test")]),
+            &json!([call("c4")]),
+            (None, None, Some("p2")),
+        );
+        // A compaction continues the interjection without a declaration.
+        session.exchange(
+            "compact",
+            7,
+            &json!([call("c4"), result("c4"), user("summarize")]),
+            &json!([assistant("summary")]),
+        );
+        // A recap starts afresh without a declaration.
+        session.exchange(
+            "recap",
+            8,
+            &json!([user("recap")]),
+            &json!([assistant("so far")]),
+        );
+        session
+    }
+
+    #[test]
+    fn declared_turns_hold_their_sub_agents_and_side_requests() {
+        let session = declared_session();
+        let turns = exchange_turns(session.events.clone());
+        let expected = [
+            ("pre", (None, None)),
+            ("m1", turn("p1", 1)),
+            ("sub", turn("p1", 1)),
+            ("side", turn("p1", 1)),
+            ("m2", turn("p1", 1)),
+            ("resume", turn("p1", 1)),
+            ("interject", turn("p2", 2)),
+            ("compact", turn("p2", 2)),
+            ("recap", turn("p2", 2)),
+        ];
+        assert_eq!(
+            turns,
+            expected
+                .iter()
+                .map(|(id, (turn_id, number))| ((*id).to_owned(), turn_id.clone(), *number))
+                .collect::<Vec<_>>()
+        );
+        let structure = SessionStructure::derive(session.events.clone());
+        assert_eq!(structure.summary().turns, 2);
+        assert_eq!(counted_turns(&session.events), 2);
+    }
+
+    #[test]
+    fn a_segment_opens_where_the_turn_differs_from_the_base_turn() {
+        let session = declared_session();
+        let streams = session_streams(Uuid::nil(), session.events);
+        let segments = streams
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.head.as_str(),
+                    segment.kind,
+                    segment.exchange_count,
+                    segment.turn_id.as_deref(),
+                    segment.turn,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            segments,
+            [
+                ("pre", SegmentKind::Root, 1, None, None),
+                // Joining p1 from an exchange of no turn opens a segment.
+                ("m1", SegmentKind::Turn, 3, Some("p1"), Some(1)),
+                ("sub", SegmentKind::Root, 1, Some("p1"), Some(1)),
+                ("side", SegmentKind::Root, 1, Some("p1"), Some(1)),
+                // The resumption opens a turn by its request but stays in p1;
+                // the interjection carries tool results but declares p2.
+                ("interject", SegmentKind::Turn, 2, Some("p2"), Some(2)),
+                ("recap", SegmentKind::Root, 1, Some("p2"), Some(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_declarations_requests_that_open_a_turn_number_the_turns() {
+        let mut session = Session::new();
+        // A response without its request, before any turn.
+        session.answer("lonely", 0, &json!([assistant("hi")]));
+        session.exchange("e1", 1, &json!([user("fix it")]), &json!([call("a")]));
+        session.exchange(
+            "e2",
+            2,
+            &json!([user("fix it"), call("a"), result("a")]),
+            &json!([call("b")]),
+        );
+        // A side request with user words opens its own turn.
+        session.exchange(
+            "title",
+            3,
+            &json!([user("name this")]),
+            &json!([assistant("Fix")]),
+        );
+        // Tool results without a known call and without user words: no base,
+        // so it joins the turn in progress.
+        session.exchange("stray", 4, &json!([result("zz")]), &json!([assistant("?")]));
+        // Continuing the main line by its base keeps the main line's turn.
+        session.exchange(
+            "e3",
+            5,
+            &json!([
+                user("fix it"),
+                call("a"),
+                result("a"),
+                call("b"),
+                result("b")
+            ]),
+            &json!([item(assistant("done"), "msg_1")]),
+        );
+        session.exchange(
+            "e4",
+            6,
+            &json!([item(assistant("done"), "msg_1"), user("next")]),
+            &json!([assistant("ok")]),
+        );
+        let turns = exchange_turns(session.events.clone());
+        assert_eq!(
+            turns
+                .iter()
+                .map(|(id, turn_id, number)| (id.as_str(), turn_id.as_deref(), *number))
+                .collect::<Vec<_>>(),
+            [
+                ("lonely", None, None),
+                ("e1", Some("e1"), Some(1)),
+                ("e2", Some("e1"), Some(1)),
+                ("title", Some("title"), Some(2)),
+                ("stray", Some("title"), Some(2)),
+                ("e3", Some("e1"), Some(1)),
+                ("e4", Some("e4"), Some(3)),
+            ]
+        );
+        let structure = SessionStructure::derive(session.events.clone());
+        assert_eq!(structure.summary().turns, 3);
+        assert_eq!(counted_turns(&session.events), 3);
+        let location = structure
+            .event_position(session.events[1].pk)
+            .expect("e1 is located");
+        assert_eq!((location.segment.as_str(), location.turn), ("e1", Some(1)));
+    }
+
+    #[test]
+    fn the_turn_count_matches_the_formula_on_every_fixture() {
+        let mut plain = Session::new();
+        plain.exchange("e1", 1, &json!([user("go")]), &json!([call("a")]));
+        plain.exchange(
+            "e2",
+            2,
+            &json!([user("go"), call("a"), result("a"), user("more")]),
+            &json!([assistant("ok")]),
+        );
+        let mut events = declared_session().events;
+        events.sort_by_key(|event| event.observed_at);
+        for events in [events, plain.events] {
+            let structure = SessionStructure::derive(events.clone());
+            let derived = structure
+                .segments
+                .iter()
+                .filter_map(|segment| segment.turn)
+                .max()
+                .and_then(|turn| usize::try_from(turn).ok())
+                .unwrap_or_default();
+            assert_eq!(structure.summary().turns, counted_turns(&events));
+            assert_eq!(structure.summary().turns, derived);
+        }
     }
 }

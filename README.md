@@ -137,14 +137,19 @@ curl \
 | `GET` | `/v1/agent-usage/summary` | Aggregate event and token usage. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/header` | Session title, counts, and token totals. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/streams` | Read the session’s derived segments. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/turns` | One node per turn: its executors' main-line and side segments. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/segments/{head}` | Read one segment’s exchanges. |
 | `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session (SQLite). |
 
 The retired session timeline, outline, and trajectory endpoints have been removed.
 Events and search matches no longer carry `turn_pk` or `turn_index`, and raw
-queries no longer filter on a stored turn number. Turn counts use the request’s
-persisted `starts_turn` fact. The initial schema now omits the old turn hierarchy
+queries no longer filter on a stored turn number. A turn is one user input and
+all the work it causes; the backend reads only the `turn_id` an event declares.
+Turn counts (session list, summary `turns`, header `turn_count`) are, per
+session, the number of distinct `turn_id` values when the session declares any,
+else the number of requests whose persisted `starts_turn` fact is true; a
+summary row applies the same rule to the events of its group. The initial schema now omits the old turn hierarchy
 and its event columns and includes the session revision that advances when
 ingestion adds an event. Event IDs, content, attachments, stream facts, and
 search references retain their roles. Existing databases need the explicit
@@ -156,7 +161,7 @@ readiness endpoints are unauthenticated for orchestrator probes.
 
 ### Session structure and event links
 
-The header, streams, segment details, in-session search, and event location
+The header, streams, turns, segment details, in-session search, and event location
 share one immutable derived structure for an owner/session/revision. The
 process retains up to 128 idle revisions with LRU eviction. Concurrent reads
 of the same revision share the load and derivation; a cache hit reads the
@@ -171,16 +176,17 @@ the first read derives the full structure again. This is a shared query cache,
 not an incremental derivation at ingest time.
 
 Stable links retain `event_pk`. The location endpoint returns
-`{"session_pk", "event_pk", "segment", "segment_index", "segment_kind", "exchange"}` using the current structure,
+`{"session_pk", "event_pk", "segment", "turn", "segment_kind", "exchange"}` using the current structure,
 and returns 404 for an event outside the authenticated owner's data. A later
 fork can change an event's segment, so links resolve the event when opened.
 Segment IDs remain their first exchange IDs; a segment is not a turn number.
 
 `GET /events?locate=true` includes a `location` object on each returned event;
 the list projection also preserves it. Session-search matches and the single
-event endpoint include the same object: `{segment, segment_index, segment_kind,
-exchange}`. `segment_index` is the current one-based position in the session's
-segment list, for display only. A response page looks up each session structure
+event endpoint include the same object: `{segment, turn, segment_kind,
+exchange}`. `turn` is the one-based number of the turn of the event's exchange,
+in the order the session's turns first appear, or null when the exchange belongs
+to no turn; it is for display only. A response page looks up each session structure
 once, sharing the cache with the detail view. The dashboard uses these values
 in its segment column, search-hit labels, and inspector properties without
 sending a separate location request for every row.

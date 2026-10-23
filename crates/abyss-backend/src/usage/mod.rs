@@ -69,9 +69,10 @@ pub struct IngestUsageEvent {
     /// Id of the sub-agent that started this one, as the client declares it;
     /// absent when the main line started it.
     pub parent_subagent_id: Option<String>,
-    /// The turn this exchange ultimately works for, as the client declares
-    /// it; a sub-agent carries the value of the turn that started it.
-    pub root_turn_id: Option<String>,
+    /// The turn this exchange works for: the user input that started it, as
+    /// the client declares it. A sub-agent and a side request carry the value
+    /// of the turn they work for.
+    pub turn_id: Option<String>,
     /// LLM provider and model labels.
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.

@@ -40,7 +40,7 @@ use crate::{
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
             EventLocationResponse, RequestFacts, ResponseFacts, SessionStreamsResponse,
-            SessionStructure, StreamEvent,
+            SessionStructure, SessionTurnsResponse, StreamEvent,
         },
         time_zone::parse_time_zone,
     },
@@ -350,6 +350,18 @@ pub(super) fn session_streams(
     Ok(structure.session_streams(session_pk))
 }
 
+/// Derives the turn view of one session from its stream facts, without
+/// reading any request body.
+pub(super) fn session_turns(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+    cache: &StreamCache,
+) -> Result<SessionTurnsResponse, AppError> {
+    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    Ok(structure.session_turns(session_pk))
+}
+
 /// Uses the caller's read transaction so the revision and facts are one snapshot.
 /// A cache hit reads only the session revision; it does not load the event facts.
 pub(super) fn session_structure(
@@ -579,7 +591,7 @@ pub(super) fn stream_events(
             llm_usage_event_stream_facts::label_length.nullable(),
             llm_usage_event_stream_facts::subagent_id.nullable(),
             llm_usage_event_stream_facts::parent_subagent_id.nullable(),
-            llm_usage_event_stream_facts::root_turn_id.nullable(),
+            llm_usage_event_stream_facts::turn_id.nullable(),
         ))
         .load::<StreamEventRow>(connection)?
         .into_iter()
@@ -605,7 +617,7 @@ fn insert_stream_facts(
     let facts = NewStreamFacts {
         subagent_id: event.subagent_id.clone(),
         parent_subagent_id: event.parent_subagent_id.clone(),
-        root_turn_id: event.root_turn_id.clone(),
+        turn_id: event.turn_id.clone(),
         ..facts
     };
     diesel::insert_into(llm_usage_event_stream_facts::table)
@@ -996,6 +1008,10 @@ fn day_offsets(
 /// them in memory read gigabytes for a week of usage. The owner is the single
 /// standalone user, so the user dimension is filled in afterwards.
 ///
+/// Turns are counted per session within each group, then summed: the
+/// distinct declared `turn_id` values when the session declares any turn,
+/// else the requests that open a turn.
+///
 /// Bind order: `?1`..`?6` day, device, Agent, provider, model, and event-type
 /// dimensions; `?7` owner; `?8`/`?9` observation bounds in microseconds, kept
 /// unconditional so the owner-time index bounds the scan; `?10`..`?17` flags
@@ -1006,44 +1022,66 @@ fn day_offsets(
 const SUMMARY_AGGREGATE_SQL: &str = "\
     WITH day_offsets(start_us, offset_us) AS MATERIALIZED ( \
         SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?21) \
+    ), \
+    by_session AS ( \
+        SELECT \
+            CASE WHEN ?1 THEN strftime( \
+                '%Y-%m-%d', \
+                (e.observed_at + ( \
+                    SELECT o.offset_us FROM day_offsets o WHERE o.start_us <= e.observed_at \
+                    ORDER BY o.start_us DESC LIMIT 1 \
+                )) / 1000000, \
+                'unixepoch' \
+            ) END AS day, \
+            CASE WHEN ?2 THEN d.host_name END AS host_name, \
+            CASE WHEN ?2 THEN d.platform END AS platform, \
+            CASE WHEN ?2 THEN d.os_version END AS os_version, \
+            CASE WHEN ?3 THEN e.agent_name END AS agent_name, \
+            CASE WHEN ?4 THEN e.llm_provider END AS llm_provider, \
+            CASE WHEN ?5 THEN e.llm_model END AS llm_model, \
+            CASE WHEN ?6 THEN e.event_type END AS event_type, \
+            e.session_pk AS session_pk, \
+            EXISTS ( \
+                SELECT 1 FROM llm_usage_events de \
+                JOIN llm_usage_event_stream_facts df ON df.event_pk = de.id \
+                WHERE de.session_pk = e.session_pk AND df.turn_id IS NOT NULL \
+            ) AS declares_turns, \
+            COUNT(DISTINCT f.turn_id) AS declared_turns, \
+            COUNT(*) FILTER (WHERE f.starts_turn = 1) AS opened_turns, \
+            COUNT(*) FILTER (WHERE e.event_type = 'request') AS requests, \
+            COUNT(*) FILTER (WHERE e.event_type = 'response') AS responses, \
+            COALESCE(SUM(e.input_tokens), 0) AS input_tokens, \
+            COALESCE(SUM(e.output_tokens), 0) AS output_tokens, \
+            COALESCE(SUM(e.cache_read_tokens), 0) AS cache_read_tokens, \
+            COALESCE(SUM(e.cache_write_tokens), 0) AS cache_write_tokens, \
+            COALESCE(SUM(e.reasoning_tokens), 0) AS reasoning_tokens, \
+            COALESCE(SUM(e.total_tokens), 0) AS total_tokens \
+        FROM llm_usage_events e \
+        LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
+        LEFT JOIN devices d ON ?2 AND d.id = e.device_context_id \
+        WHERE e.user_id = ?7 \
+            AND e.observed_at >= ?8 \
+            AND e.observed_at < ?9 \
+            AND (?10 = 0 OR e.agent_name IN (SELECT value FROM json_each(?11))) \
+            AND (?12 = 0 OR e.session_id IN (SELECT value FROM json_each(?13))) \
+            AND (?14 = 0 OR e.llm_provider IN (SELECT value FROM json_each(?15))) \
+            AND (?16 = 0 OR e.llm_model IN (SELECT value FROM json_each(?17))) \
+            AND (?18 = 0 OR e.event_type = ?19) \
+        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9 \
     ) \
     SELECT \
-        CASE WHEN ?1 THEN strftime( \
-            '%Y-%m-%d', \
-            (e.observed_at + ( \
-                SELECT o.offset_us FROM day_offsets o WHERE o.start_us <= e.observed_at \
-                ORDER BY o.start_us DESC LIMIT 1 \
-            )) / 1000000, \
-            'unixepoch' \
-        ) END AS day, \
-        CASE WHEN ?2 THEN d.host_name END AS host_name, \
-        CASE WHEN ?2 THEN d.platform END AS platform, \
-        CASE WHEN ?2 THEN d.os_version END AS os_version, \
-        CASE WHEN ?3 THEN e.agent_name END AS agent_name, \
-        CASE WHEN ?4 THEN e.llm_provider END AS llm_provider, \
-        CASE WHEN ?5 THEN e.llm_model END AS llm_model, \
-        CASE WHEN ?6 THEN e.event_type END AS event_type, \
-        COUNT(DISTINCT e.session_pk) AS sessions, \
-        COUNT(*) FILTER (WHERE f.starts_turn = 1) AS turns, \
-        COUNT(*) FILTER (WHERE e.event_type = 'request') AS requests, \
-        COUNT(*) FILTER (WHERE e.event_type = 'response') AS responses, \
-        COALESCE(SUM(e.input_tokens), 0) AS input_tokens, \
-        COALESCE(SUM(e.output_tokens), 0) AS output_tokens, \
-        COALESCE(SUM(e.cache_read_tokens), 0) AS cache_read_tokens, \
-        COALESCE(SUM(e.cache_write_tokens), 0) AS cache_write_tokens, \
-        COALESCE(SUM(e.reasoning_tokens), 0) AS reasoning_tokens, \
-        COALESCE(SUM(e.total_tokens), 0) AS total_tokens \
-    FROM llm_usage_events e \
-    LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
-    LEFT JOIN devices d ON ?2 AND d.id = e.device_context_id \
-    WHERE e.user_id = ?7 \
-        AND e.observed_at >= ?8 \
-        AND e.observed_at < ?9 \
-        AND (?10 = 0 OR e.agent_name IN (SELECT value FROM json_each(?11))) \
-        AND (?12 = 0 OR e.session_id IN (SELECT value FROM json_each(?13))) \
-        AND (?14 = 0 OR e.llm_provider IN (SELECT value FROM json_each(?15))) \
-        AND (?16 = 0 OR e.llm_model IN (SELECT value FROM json_each(?17))) \
-        AND (?18 = 0 OR e.event_type = ?19) \
+        day, host_name, platform, os_version, agent_name, llm_provider, llm_model, event_type, \
+        COUNT(*) AS sessions, \
+        COALESCE(SUM(CASE WHEN declares_turns THEN declared_turns ELSE opened_turns END), 0) AS turns, \
+        COALESCE(SUM(requests), 0) AS requests, \
+        COALESCE(SUM(responses), 0) AS responses, \
+        COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+        COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, \
+        COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, \
+        COALESCE(SUM(total_tokens), 0) AS total_tokens \
+    FROM by_session g \
     GROUP BY 1, 2, 3, 4, 5, 6, 7, 8 \
     ORDER BY total_tokens DESC, agent_name ASC, day ASC \
     LIMIT ?20";
@@ -1339,8 +1377,8 @@ mod tests {
             schema::{agent_sessions, llm_usage_event_stream_facts, llm_usage_events},
             search,
         },
-        event_conversation, ingest_events, raw_events, session_header, session_segment,
-        session_streams, usage_summary,
+        event_conversation, event_location, ingest_events, raw_events, session_header,
+        session_segment, session_streams, usage_summary,
     };
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -1667,15 +1705,15 @@ mod tests {
             }
             event
         };
-        let main = json!({"root_turn_id": "p1"});
-        let sub = json!({"subagent_id": "a1", "root_turn_id": "p1"});
+        let main = json!({"turn_id": "p1"});
+        let sub = json!({"subagent_id": "a1", "turn_id": "p1"});
         let request: IngestEventsRequest = serde_json::from_value(json!({"events": [
             event("m-req", 1, "request", main.clone()),
             event("m-res", 5, "response", main),
             event("s-req", 2, "request", sub.clone()),
             event("s-res", 3, "response", sub),
             // Without a request, the response's declared ids stand for the
-            // exchange; with no root turn it attaches by time.
+            // exchange; with no turn it attaches by time.
             event("o-res", 4, "response", json!({"subagent_id": "a2", "parent_subagent_id": null})),
         ]}))
         .expect("test ingest request should deserialize");
@@ -1687,7 +1725,7 @@ mod tests {
             .select((
                 llm_usage_event_stream_facts::subagent_id,
                 llm_usage_event_stream_facts::parent_subagent_id,
-                llm_usage_event_stream_facts::root_turn_id,
+                llm_usage_event_stream_facts::turn_id,
             ))
             .first::<(Option<String>, Option<String>, Option<String>)>(&mut database)
             .expect("the response's facts");
@@ -1719,6 +1757,244 @@ mod tests {
                 ("s", Some("a1"), Some("m"), Some(AttachedBy::Declared)),
                 ("o", Some("a2"), Some("m"), Some(AttachedBy::Time)),
             ]
+        );
+    }
+
+    /// One exchange's events: `(name, session, agent, second, declared ids,
+    /// request entries, response entries)`.
+    type TurnExchange = (
+        &'static str,
+        &'static str,
+        &'static str,
+        u8,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+    );
+
+    fn turn_events(exchanges: &[TurnExchange]) -> IngestEventsRequest {
+        let mut events = Vec::new();
+        for (name, session, agent, second, declared, request, response) in exchanges {
+            for (side, entries, at) in [("request", request, "0"), ("response", response, "5")] {
+                let mut event = json!({
+                    "event_id": format!("{name}-{side}"),
+                    "observed_at": format!("2026-10-22T00:00:{second:02}.{at}Z"),
+                    "device": {"host_name": "local", "platform": "macos"},
+                    "agent": {"name": agent},
+                    "session_id": session,
+                    "llm": {"provider": "anthropic", "model": "claude"},
+                    "event_type": side,
+                    "response_id": name,
+                    "metadata": {"conversation": {"entries": entries, "completeness": "complete"}}
+                });
+                for (key, value) in declared.as_object().into_iter().flatten() {
+                    event[key] = value.clone();
+                }
+                events.push(event);
+            }
+        }
+        serde_json::from_value(json!({ "events": events })).expect("a valid ingest request")
+    }
+
+    /// A Claude Code session `declared` with two declared turns, and a Codex
+    /// session `plain` without declarations whose three requests open turns.
+    fn turn_database() -> SqliteConnection {
+        let mut database = database();
+        let user = |text: &str| json!({"role": "user", "text": text});
+        let call = |id: &str| json!({"role": "tool_call", "text": "{}", "call_id": id});
+        let result = |id: &str| json!({"role": "tool_result", "text": "ok", "call_id": id});
+        let said = |text: &str| json!([{"role": "assistant", "text": text}]);
+        let (cc, codex) = ("claude-code", "codex");
+        let none = json!({});
+        let request = turn_events(&[
+            // An auxiliary request before the first prompt belongs to no turn.
+            (
+                "x",
+                "declared",
+                cc,
+                1,
+                none.clone(),
+                json!([user("quota")]),
+                said("ok"),
+            ),
+            (
+                "m",
+                "declared",
+                cc,
+                2,
+                json!({"turn_id": "p1"}),
+                json!([user("fix")]),
+                json!([call("c1")]),
+            ),
+            (
+                "s",
+                "declared",
+                cc,
+                3,
+                json!({"subagent_id": "a1", "turn_id": "p1"}),
+                json!([user("explore")]),
+                said("found"),
+            ),
+            // A title request declares nothing and joins p1.
+            (
+                "t",
+                "declared",
+                cc,
+                4,
+                none.clone(),
+                json!([user("name it")]),
+                said("Fix"),
+            ),
+            (
+                "m2",
+                "declared",
+                cc,
+                5,
+                json!({"turn_id": "p1"}),
+                json!([user("fix"), call("c1"), result("c1")]),
+                said("fixed"),
+            ),
+            (
+                "i",
+                "declared",
+                cc,
+                6,
+                json!({"turn_id": "p2"}),
+                json!([user("next")]),
+                said("ok"),
+            ),
+            (
+                "u1",
+                "plain",
+                codex,
+                7,
+                none.clone(),
+                json!([user("one")]),
+                said("1"),
+            ),
+            (
+                "u2",
+                "plain",
+                codex,
+                8,
+                none.clone(),
+                json!([user("two")]),
+                said("2"),
+            ),
+            (
+                "u3",
+                "plain",
+                codex,
+                9,
+                none,
+                json!([user("three")]),
+                said("3"),
+            ),
+        ]);
+        ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+        database
+    }
+
+    #[test]
+    fn turns_follow_declarations_or_turn_opening_requests_everywhere() {
+        let mut database = turn_database();
+        let stored = llm_usage_event_stream_facts::table
+            .inner_join(llm_usage_events::table)
+            .filter(llm_usage_events::event_id.eq("i-response"))
+            .select(llm_usage_event_stream_facts::turn_id)
+            .first::<Option<String>>(&mut database)
+            .expect("the response's facts");
+        assert_eq!(stored.as_deref(), Some("p2"));
+
+        let query = crate::usage::session_list::SessionListQuery::default()
+            .validate()
+            .expect("valid");
+        let listed = super::super::session_list::list_sessions(&mut database, OWNER_ID, &query)
+            .expect("sessions list")
+            .items
+            .into_iter()
+            .map(|item| (item.session_id, (item.session_pk, item.turns)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let cache = StreamCache::default();
+        for (session, turns) in [("declared", 2_i64), ("plain", 3_i64)] {
+            let (session_pk, listed_turns) = listed[session];
+            assert_eq!(listed_turns, turns, "{session}: listed turns");
+            let header =
+                session_header(&mut database, OWNER_ID, session_pk, &cache).expect("the header");
+            assert_eq!(
+                i64::try_from(header.turn_count).expect("a small count"),
+                turns,
+                "{session}: the header counts as the list does"
+            );
+        }
+
+        let (declared_pk, _) = listed["declared"];
+        let streams =
+            session_streams(&mut database, OWNER_ID, declared_pk, &cache).expect("streams");
+        let segments = streams
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.head.as_str(),
+                    segment.turn_id.as_deref(),
+                    segment.turn,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            segments,
+            [
+                ("x", None, None),
+                ("m", Some("p1"), Some(1)),
+                ("s", Some("p1"), Some(1)),
+                ("t", Some("p1"), Some(1)),
+                ("i", Some("p2"), Some(2)),
+            ]
+        );
+        let event_pk = |database: &mut SqliteConnection, event_id: &str| {
+            let pk = llm_usage_events::table
+                .filter(llm_usage_events::event_id.eq(event_id))
+                .select(llm_usage_events::id)
+                .first::<String>(database)
+                .expect("the event is stored");
+            Uuid::parse_str(&pk).expect("a UUID")
+        };
+        for (event_id, turn) in [
+            ("x-request", None),
+            ("t-response", Some(1)),
+            ("i-request", Some(2)),
+        ] {
+            let pk = event_pk(&mut database, event_id);
+            let location = event_location(&mut database, OWNER_ID, pk, &cache).expect("located");
+            assert_eq!(location.location.turn, turn, "{event_id}");
+        }
+
+        let rows = summary(&mut database, json!({"group_by": "agent"}));
+        let turns = rows
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                (
+                    row["agent_name"].clone(),
+                    row["turns"].clone(),
+                    row["sessions"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            turns.contains(&(json!("claude-code"), json!(2_i64), json!(1_i64))),
+            "{turns:?}"
+        );
+        assert!(
+            turns.contains(&(json!("codex"), json!(3_i64), json!(1_i64))),
+            "{turns:?}"
+        );
+        let all = summary(&mut database, json!({"group_by": "day"}));
+        assert_eq!(
+            (all[0]["turns"].clone(), all[0]["sessions"].clone()),
+            (json!(5_i64), json!(2_i64))
         );
     }
 

@@ -324,8 +324,8 @@ pub struct StreamEventRow {
     pub subagent_id: Option<String>,
     /// Id of the sub-agent the client declared as this one's parent.
     pub parent_subagent_id: Option<String>,
-    /// Root turn the client declared the event works for.
-    pub root_turn_id: Option<String>,
+    /// Turn the client declared the event works for.
+    pub turn_id: Option<String>,
 }
 
 #[derive(Debug, Default, Insertable)]
@@ -358,8 +358,8 @@ pub struct NewStreamFacts {
     pub subagent_id: Option<String>,
     /// Id of the sub-agent the client declared as this one's parent.
     pub parent_subagent_id: Option<String>,
-    /// Root turn the client declared the event works for.
-    pub root_turn_id: Option<String>,
+    /// Turn the client declared the event works for.
+    pub turn_id: Option<String>,
 }
 
 #[derive(Insertable)]
