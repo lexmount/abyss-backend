@@ -1,6 +1,7 @@
 //! Self-contained SQLite source-of-truth with its search index written in
 //! the same transactions.
 
+mod comparison;
 mod connection;
 mod day_offsets;
 mod migrations;
@@ -31,6 +32,7 @@ use crate::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse, SummaryQuery,
         SummaryResponse, UsageEventResponse,
         attachments::StoredImageAttachment,
+        comparison::{ComparisonQuery, ComparisonResponse},
         preview::{ConversationPreview, Window},
         segments::{SegmentResponse, ValidatedSegmentQuery},
         session_header::SessionHeaderResponse,
@@ -178,6 +180,17 @@ impl StorageBackend for SqliteFtsBackend {
                 repository::usage_summary(connection, &query, user_id, summary_limit)
             })
             .await
+        })
+    }
+
+    fn usage_comparison(
+        &self,
+        user_id: Uuid,
+        query: ComparisonQuery,
+    ) -> BoxedFuture<'_, Result<ComparisonResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| comparison::compare(connection, &query, user_id))
+                .await
         })
     }
 
