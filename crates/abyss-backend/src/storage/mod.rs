@@ -5,6 +5,8 @@
 //! connection pools, SQL dialects, search projection, and worker lifecycle out
 //! of the API layer.
 
+mod comparison_buckets;
+
 #[cfg(feature = "postgres-es")]
 mod postgres;
 #[cfg(feature = "sqlite-fts")]
@@ -23,6 +25,7 @@ use crate::{
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
         UsageEventResponse,
         attachments::StoredImageAttachment,
+        comparison::{ComparisonQuery, ComparisonResponse},
         session_list::{SessionListResponse, ValidatedSessionListQuery},
     },
 };
@@ -65,6 +68,13 @@ pub trait StorageBackend: Send + Sync {
         query: SummaryQuery,
         summary_limit: i64,
     ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>>;
+
+    /// Aggregates comparison buckets without loading event content.
+    fn usage_comparison(
+        &self,
+        user_id: Uuid,
+        query: ComparisonQuery,
+    ) -> BoxedFuture<'_, Result<ComparisonResponse, AppError>>;
 
     /// Loads one owner-scoped session timeline.
     fn session_timeline(

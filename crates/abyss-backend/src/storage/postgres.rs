@@ -1,5 +1,6 @@
 //! PostgreSQL source-of-truth and Elasticsearch projection implementation.
 
+mod comparison;
 mod repository;
 mod search;
 mod session_list;
@@ -22,6 +23,7 @@ use crate::{
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
         UsageEventResponse,
         attachments::StoredImageAttachment,
+        comparison::{ComparisonQuery, ComparisonResponse},
         session_list::{SessionListResponse, ValidatedSessionListQuery},
     },
 };
@@ -140,6 +142,17 @@ impl StorageBackend for PostgresEsBackend {
                 repository::usage_summary(connection, &query, user_id, summary_limit)
             })
             .await
+        })
+    }
+
+    fn usage_comparison(
+        &self,
+        user_id: Uuid,
+        query: ComparisonQuery,
+    ) -> BoxedFuture<'_, Result<ComparisonResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| comparison::compare(connection, &query, user_id))
+                .await
         })
     }
 

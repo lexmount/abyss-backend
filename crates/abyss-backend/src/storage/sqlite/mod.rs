@@ -1,5 +1,6 @@
 //! Self-contained SQLite source-of-truth with transactional FTS5 projection.
 
+mod comparison;
 mod connection;
 mod migrations;
 mod models;
@@ -22,6 +23,7 @@ use crate::{
         SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
         UsageEventResponse,
         attachments::StoredImageAttachment,
+        comparison::{ComparisonQuery, ComparisonResponse},
         session_list::{SessionListResponse, ValidatedSessionListQuery},
     },
 };
@@ -124,6 +126,17 @@ impl StorageBackend for SqliteFtsBackend {
                 repository::usage_summary(connection, &query, user_id, summary_limit)
             })
             .await
+        })
+    }
+
+    fn usage_comparison(
+        &self,
+        user_id: Uuid,
+        query: ComparisonQuery,
+    ) -> BoxedFuture<'_, Result<ComparisonResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| comparison::compare(connection, &query, user_id))
+                .await
         })
     }
 
