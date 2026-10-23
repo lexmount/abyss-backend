@@ -738,6 +738,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     run(args.base_url.rstrip("/"), args.token, args.run_id, args.in_session_search)
+    from comparison_api import run as run_comparison
+    run_comparison(args.base_url.rstrip("/"), args.token)
 
 
 if __name__ == "__main__":

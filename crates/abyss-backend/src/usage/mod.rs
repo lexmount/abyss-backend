@@ -7,6 +7,8 @@
 
 /// Image attachment contracts and validation.
 pub mod attachments;
+/// Comparison chart contracts.
+pub mod comparison;
 mod conversation;
 /// Opaque diagnostic-capture ingest contracts.
 pub mod diagnostics;

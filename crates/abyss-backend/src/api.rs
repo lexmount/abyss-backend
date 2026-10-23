@@ -29,6 +29,7 @@ use crate::{
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventListResponse, RawEventsQuery,
         SummaryFields, SummaryQuery, TokenUsageSummaryResponse, UsageEventResponse,
+        comparison::{ComparisonQuery, ComparisonResponse},
         preview::{ConversationPreview, PreviewQuery, Window},
         segments::{SegmentQuery, SegmentResponse},
         session_header::SessionHeaderResponse,
@@ -81,6 +82,7 @@ pub fn router(state: AppState) -> Router {
             get(image_attachment),
         )
         .route("/v1/agent-usage/summary", get(usage_summary))
+        .route("/v1/agent-usage/comparison", post(usage_comparison))
         .route("/v1/agent-usage/search", get(session_search))
         .route("/v1/agent-usage/sessions", get(list_sessions))
         .route(
@@ -149,6 +151,15 @@ async fn ingest_events(
         .ingest_events(user_id, request, max_batch_size)
         .await?;
     Ok(Json(response))
+}
+
+async fn usage_comparison(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(query): Json<ComparisonQuery>,
+) -> Result<Json<ComparisonResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(state.storage.usage_comparison(user_id, query).await?))
 }
 
 async fn usage_summary(

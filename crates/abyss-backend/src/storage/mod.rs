@@ -5,6 +5,7 @@
 //! connection pools, SQL dialects, search projection, and worker lifecycle out
 //! of the API layer.
 
+mod comparison_buckets;
 mod event_locations;
 #[cfg(feature = "postgres-es")]
 mod postgres;
@@ -26,6 +27,7 @@ use crate::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse, SummaryQuery,
         SummaryResponse, UsageEventResponse,
         attachments::StoredImageAttachment,
+        comparison::{ComparisonQuery, ComparisonResponse},
         preview::{ConversationPreview, Window},
         segments::{SegmentResponse, ValidatedSegmentQuery},
         session_header::SessionHeaderResponse,
@@ -79,6 +81,13 @@ pub trait StorageBackend: Send + Sync {
         query: SummaryQuery,
         summary_limit: i64,
     ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>>;
+
+    /// Aggregates comparison buckets without loading event content.
+    fn usage_comparison(
+        &self,
+        user_id: Uuid,
+        query: ComparisonQuery,
+    ) -> BoxedFuture<'_, Result<ComparisonResponse, AppError>>;
 
     /// The header of an owner-scoped session; not found when the owner has
     /// no event in it.

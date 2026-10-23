@@ -139,6 +139,7 @@ curl \
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/streams` | Read the session’s derived segments. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/turns` | One node per turn: its executors' main-line and side segments. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/segments/{head}` | Read one segment’s exchanges. |
+| `POST` | `/v1/agent-usage/comparison` | Compare token totals and daily activity across dimensions. |
 | `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session (SQLite). |
 
@@ -158,6 +159,20 @@ turn-removal migration.
 
 Every `/v1/agent-usage/*` endpoint requires the bearer token. Health and
 readiness endpoints are unauthenticated for orchestrator probes.
+
+Comparison requests contain `group_by` (`agent`, `model`, `provider`, `platform`,
+or `null` for combined activity), contiguous `buckets` of ISO `start`/`end`
+timestamps, and optional `filters` arrays for `agent`, `model`, `provider`,
+`platform`, and `session`. Values within a filter are ORed; dimensions are ANDed.
+A comparison dimension cannot also be filtered. Ranges are start-inclusive and
+end-exclusive, limited to 367 days and 400 buckets. Results contain bucket-start
+epoch milliseconds, dimension values, summed `total_tokens`, and request counts;
+filter options use the same authorized time range before optional filters.
+
+Comparison joins, filters, aggregates, and facet queries use Diesel's typed query
+builder for both storage backends. A small `QueryFragment` extension supplies the
+bound `VALUES` CTE for time buckets, which Diesel does not provide as a built-in
+query source. Bucket values remain bound and result types remain checked.
 
 ### Session structure and event links
 
