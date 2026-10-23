@@ -49,7 +49,7 @@ pub(super) fn skeleton(entries: &[(&str, Option<&str>)]) -> Vec<(String, Option<
         .collect()
 }
 
-/// `(subagent_id, parent_subagent_id, root_turn_id)` an exchange declares.
+/// `(subagent_id, parent_subagent_id, turn_id)` an exchange declares.
 pub(super) type Declared = (
     Option<&'static str>,
     Option<&'static str>,
@@ -97,7 +97,7 @@ impl Session {
             previous_response_id: previous.map(str::to_owned),
             subagent_id: None,
             parent_subagent_id: None,
-            root_turn_id: None,
+            turn_id: None,
             facts,
         });
     }
@@ -121,7 +121,7 @@ impl Session {
     }
 
     /// Adds exchange `name` whose events both carry the declared `ids`:
-    /// `(subagent_id, parent_subagent_id, root_turn_id)`.
+    /// `(subagent_id, parent_subagent_id, turn_id)`.
     pub(super) fn declared(
         &mut self,
         name: &str,
@@ -131,11 +131,11 @@ impl Session {
         ids: Declared,
     ) {
         self.exchange(name, second, request, response);
-        let (subagent, parent, root_turn) = ids;
+        let (subagent, parent, turn) = ids;
         for event in self.events.iter_mut().rev().take(2) {
             event.subagent_id = subagent.map(str::to_owned);
             event.parent_subagent_id = parent.map(str::to_owned);
-            event.root_turn_id = root_turn.map(str::to_owned);
+            event.turn_id = turn.map(str::to_owned);
         }
     }
 

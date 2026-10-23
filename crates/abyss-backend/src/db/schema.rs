@@ -95,7 +95,7 @@ diesel::table! {
         label_length -> Nullable<Integer>,
         subagent_id -> Nullable<Text>,
         parent_subagent_id -> Nullable<Text>,
-        root_turn_id -> Nullable<Text>,
+        turn_id -> Nullable<Text>,
     }
 }
 

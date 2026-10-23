@@ -32,7 +32,7 @@ use crate::{
         segments::{SegmentResponse, ValidatedSegmentQuery},
         session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
-        streams::{EventLocationResponse, SessionStreamsResponse},
+        streams::{EventLocationResponse, SessionStreamsResponse, SessionTurnsResponse},
     },
 };
 
@@ -246,6 +246,26 @@ impl StorageBackend for PostgresEsBackend {
                     .repeatable_read()
                     .run(|connection| {
                         repository::session_streams(connection, user_id, session_pk, &structures)
+                    })
+            })
+            .await
+        })
+    }
+
+    fn session_turns(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionTurnsResponse, AppError>> {
+        let structures = Arc::clone(&self.structures);
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        repository::session_turns(connection, user_id, session_pk, &structures)
                     })
             })
             .await

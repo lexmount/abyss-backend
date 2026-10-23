@@ -64,7 +64,7 @@ use crate::{
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
             EventFacts, EventLocationResponse, Label, RequestFacts, ResponseFacts,
-            SessionStreamsResponse, SessionStructure, StreamEvent,
+            SessionStreamsResponse, SessionStructure, SessionTurnsResponse, StreamEvent,
         },
         time_zone::parse_time_zone,
     },
@@ -76,50 +76,76 @@ define_sql_function!(fn coalesce<ST: SingleValue>(value: Nullable<ST>, fallback:
 define_sql_function!(fn least<ST: SingleValue>(left: ST, right: ST) -> ST);
 define_sql_function!(fn greatest<ST: SingleValue>(left: ST, right: ST) -> ST);
 
+/// Usage totals grouped in SQL. Turns are counted per session within each
+/// group, then summed: the distinct declared `turn_id` values when the
+/// session declares any turn, else the requests that open a turn.
 const SUMMARY_AGGREGATE_SQL: &str = "\
+    WITH by_session AS ( \
+        SELECT \
+            CASE WHEN $1 THEN to_char(e.observed_at AT TIME ZONE $30, 'YYYY-MM-DD') END AS day, \
+            CASE WHEN $2 THEN e.user_id END AS user_id, \
+            CASE WHEN $2 THEN NULLIF(btrim(u.name), '') END AS user_name, \
+            CASE WHEN $2 THEN u.email END AS user_email, \
+            CASE WHEN $3 THEN d.host_name END AS host_name, \
+            CASE WHEN $3 THEN d.platform END AS platform, \
+            CASE WHEN $3 THEN d.os_version END AS os_version, \
+            CASE WHEN $4 THEN e.agent_name END AS agent_name, \
+            CASE WHEN $5 THEN e.llm_provider END AS llm_provider, \
+            CASE WHEN $6 THEN e.llm_model END AS llm_model, \
+            CASE WHEN $7 THEN e.event_type END AS event_type, \
+            e.session_pk AS session_pk, \
+            EXISTS ( \
+                SELECT 1 FROM llm_usage_events de \
+                JOIN llm_usage_event_stream_facts df ON df.event_pk = de.id \
+                WHERE de.session_pk = e.session_pk AND df.turn_id IS NOT NULL \
+            ) AS declares_turns, \
+            COUNT(DISTINCT f.turn_id)::bigint AS declared_turns, \
+            COUNT(*) FILTER (WHERE f.starts_turn)::bigint AS opened_turns, \
+            COUNT(*) FILTER (WHERE e.event_type = 'request')::bigint AS requests, \
+            COUNT(*) FILTER (WHERE e.event_type = 'response')::bigint AS responses, \
+            COALESCE(SUM(e.input_tokens), 0)::bigint AS input_tokens, \
+            COALESCE(SUM(e.output_tokens), 0)::bigint AS output_tokens, \
+            COALESCE(SUM(e.cache_read_tokens), 0)::bigint AS cache_read_tokens, \
+            COALESCE(SUM(e.cache_write_tokens), 0)::bigint AS cache_write_tokens, \
+            COALESCE(SUM(e.reasoning_tokens), 0)::bigint AS reasoning_tokens, \
+            COALESCE(SUM(e.total_tokens), 0)::bigint AS total_tokens \
+        FROM llm_usage_events e \
+        LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
+        LEFT JOIN app_users u ON u.id = e.user_id \
+        LEFT JOIN devices d ON d.id = e.device_context_id \
+        WHERE e.user_id = $8 \
+            AND ($9 = false OR e.observed_at >= $10) \
+            AND ($11 = false OR e.observed_at < $12) \
+            AND ( \
+                $13 = false \
+                OR ($15 = true AND e.user_id = $14) \
+                OR ($15 = false AND ( \
+                    u.email ILIKE $16 ESCAPE '\\' \
+                    OR COALESCE(u.name, '') ILIKE $16 ESCAPE '\\' \
+                )) \
+            ) \
+            AND ($17 = false OR e.agent_name = ANY($18)) \
+            AND ($19 = false OR e.session_id = ANY($20)) \
+            AND ($21 = false OR e.session_pk = $22) \
+            AND ($23 = false OR e.llm_provider = ANY($24)) \
+            AND ($25 = false OR e.llm_model = ANY($26)) \
+            AND ($27 = false OR e.event_type = $28) \
+        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 \
+    ) \
     SELECT \
-        CASE WHEN $1 THEN to_char(e.observed_at AT TIME ZONE $30, 'YYYY-MM-DD') END AS day, \
-        CASE WHEN $2 THEN e.user_id END AS user_id, \
-        CASE WHEN $2 THEN NULLIF(btrim(u.name), '') END AS user_name, \
-        CASE WHEN $2 THEN u.email END AS user_email, \
-        CASE WHEN $3 THEN d.host_name END AS host_name, \
-        CASE WHEN $3 THEN d.platform END AS platform, \
-        CASE WHEN $3 THEN d.os_version END AS os_version, \
-        CASE WHEN $4 THEN e.agent_name END AS agent_name, \
-        CASE WHEN $5 THEN e.llm_provider END AS llm_provider, \
-        CASE WHEN $6 THEN e.llm_model END AS llm_model, \
-        CASE WHEN $7 THEN e.event_type END AS event_type, \
-        COUNT(DISTINCT e.session_pk)::bigint AS sessions, \
-        COUNT(*) FILTER (WHERE f.starts_turn)::bigint AS turns, \
-        COUNT(*) FILTER (WHERE e.event_type = 'request')::bigint AS requests, \
-        COUNT(*) FILTER (WHERE e.event_type = 'response')::bigint AS responses, \
-        COALESCE(SUM(e.input_tokens), 0)::bigint AS input_tokens, \
-        COALESCE(SUM(e.output_tokens), 0)::bigint AS output_tokens, \
-        COALESCE(SUM(e.cache_read_tokens), 0)::bigint AS cache_read_tokens, \
-        COALESCE(SUM(e.cache_write_tokens), 0)::bigint AS cache_write_tokens, \
-        COALESCE(SUM(e.reasoning_tokens), 0)::bigint AS reasoning_tokens, \
-        COALESCE(SUM(e.total_tokens), 0)::bigint AS total_tokens \
-    FROM llm_usage_events e \
-    LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
-    LEFT JOIN app_users u ON u.id = e.user_id \
-    LEFT JOIN devices d ON d.id = e.device_context_id \
-    WHERE e.user_id = $8 \
-        AND ($9 = false OR e.observed_at >= $10) \
-        AND ($11 = false OR e.observed_at < $12) \
-        AND ( \
-            $13 = false \
-            OR ($15 = true AND e.user_id = $14) \
-            OR ($15 = false AND ( \
-                u.email ILIKE $16 ESCAPE '\\' \
-                OR COALESCE(u.name, '') ILIKE $16 ESCAPE '\\' \
-            )) \
-        ) \
-        AND ($17 = false OR e.agent_name = ANY($18)) \
-        AND ($19 = false OR e.session_id = ANY($20)) \
-        AND ($21 = false OR e.session_pk = $22) \
-        AND ($23 = false OR e.llm_provider = ANY($24)) \
-        AND ($25 = false OR e.llm_model = ANY($26)) \
-        AND ($27 = false OR e.event_type = $28) \
+        day, user_id, user_name, user_email, host_name, platform, os_version, \
+        agent_name, llm_provider, llm_model, event_type, \
+        COUNT(*)::bigint AS sessions, \
+        COALESCE(SUM(CASE WHEN declares_turns THEN declared_turns ELSE opened_turns END), 0)::bigint AS turns, \
+        COALESCE(SUM(requests), 0)::bigint AS requests, \
+        COALESCE(SUM(responses), 0)::bigint AS responses, \
+        COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens, \
+        COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens, \
+        COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens, \
+        COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens, \
+        COALESCE(SUM(reasoning_tokens), 0)::bigint AS reasoning_tokens, \
+        COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens \
+    FROM by_session g \
     GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 \
     ORDER BY total_tokens DESC, agent_name ASC NULLS LAST, user_email ASC NULLS LAST, day ASC NULLS LAST \
     LIMIT $29";
@@ -494,6 +520,18 @@ pub fn session_streams(
     Ok(structure.session_streams(session_pk))
 }
 
+/// Derives the turn view of one session from its stream facts, without
+/// reading any request body.
+pub fn session_turns(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    session_pk: Uuid,
+    cache: &StreamCache,
+) -> Result<SessionTurnsResponse, AppError> {
+    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    Ok(structure.session_turns(session_pk))
+}
+
 /// Uses the caller's read transaction so the revision and facts are one snapshot.
 /// A cache hit reads only the session revision; it does not load the event facts.
 pub fn session_structure(
@@ -718,7 +756,7 @@ fn stream_events(
             llm_usage_event_stream_facts::label_length.nullable(),
             llm_usage_event_stream_facts::subagent_id.nullable(),
             llm_usage_event_stream_facts::parent_subagent_id.nullable(),
-            llm_usage_event_stream_facts::root_turn_id.nullable(),
+            llm_usage_event_stream_facts::turn_id.nullable(),
         ))
         .load::<StreamEventRow>(connection)?
         .into_iter()
@@ -750,7 +788,7 @@ fn stream_event(row: StreamEventRow) -> Result<StreamEvent, AppError> {
         previous_response_id: row.previous_response_id,
         subagent_id: row.subagent_id,
         parent_subagent_id: row.parent_subagent_id,
-        root_turn_id: row.root_turn_id,
+        turn_id: row.turn_id,
         facts,
     })
 }
@@ -780,7 +818,7 @@ fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFac
         event_pk,
         subagent_id: event.subagent_id.clone(),
         parent_subagent_id: event.parent_subagent_id.clone(),
-        root_turn_id: event.root_turn_id.clone(),
+        turn_id: event.turn_id.clone(),
         ..NewStreamFacts::default()
     };
     Ok(match event.event_type {
@@ -1939,7 +1977,7 @@ mod tests {
             previous_response_id: None,
             subagent_id: None,
             parent_subagent_id: None,
-            root_turn_id: None,
+            turn_id: None,
             llm: LlmPayload {
                 provider: "OpenAI".to_owned(),
                 model: "gpt-5.5".to_owned(),

@@ -508,7 +508,9 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
 
 def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
     """Declared sub-agent ids are stored with each event, and a sub-agent's
-    root segment shows beside the main-line segment of the same root turn."""
+    root segment shows beside the main-line segment of the same turn. The
+    main line, its sub-agent, and an undeclared side request form one turn,
+    counted once by the session list and the header."""
     session_id = f"session-subagent-{run_id}"
 
     def declared_event(
@@ -528,11 +530,11 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
         value.update(declared)
         return value
 
-    main = {"root_turn_id": f"turn-{run_id}"}
+    main = {"turn_id": f"turn-{run_id}"}
     sub = {
         "subagent_id": f"agent-{run_id}",
         "parent_subagent_id": None,
-        "root_turn_id": f"turn-{run_id}",
+        "turn_id": f"turn-{run_id}",
     }
     ingest = request(
         base_url,
@@ -545,11 +547,13 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
                 declared_event("main", "response", 9, main),
                 declared_event("sub", "request", 2, sub),
                 declared_event("sub", "response", 3, sub),
+                declared_event("side", "request", 4, {}),
+                declared_event("side", "response", 5, {}),
             ]
         },
     )
     require_status(ingest, 200, "sub-agent event ingest")
-    require(ingest.json()["accepted"] == 4, "sub-agent ingest must accept four events")
+    require(ingest.json()["accepted"] == 6, "sub-agent ingest must accept six events")
     raw_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
         {"session_id": session_id, "limit": 10}
     )
@@ -575,8 +579,72 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
         == [
             (f"main-{run_id}", None, None, None),
             (f"sub-{run_id}", f"agent-{run_id}", f"main-{run_id}", "declared"),
+            (f"side-{run_id}", None, None, None),
         ],
-        f"the sub-agent segment attaches to the main segment of its root turn: {segments}",
+        f"the sub-agent segment attaches to the main segment of its turn: {segments}",
+    )
+    turns = [(segment.get("turn_id"), segment.get("turn")) for segment in streams.json()["segments"]]
+    require(
+        turns == [(f"turn-{run_id}", 1)] * 3,
+        f"the main line, the sub-agent, and the side request share turn 1: {turns}",
+    )
+    turn_view = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/turns", token=token
+    )
+    require_status(turn_view, 200, "sub-agent session turns")
+    turn_nodes = [
+        (
+            node["turn"],
+            node["turn_id"],
+            node["new_context"],
+            [
+                (executor["subagent_id"], executor["main"], executor["side"])
+                for executor in node["executors"]
+            ],
+        )
+        for node in turn_view.json()["turns"]
+    ]
+    require(
+        turn_nodes
+        == [
+            (
+                1,
+                f"turn-{run_id}",
+                True,
+                [
+                    (None, [f"main-{run_id}"], [f"side-{run_id}"]),
+                    (f"agent-{run_id}", [f"sub-{run_id}"], []),
+                ],
+            )
+        ],
+        f"one turn node holds the main line, its side request, and the sub-agent: {turn_nodes}",
+    )
+    header = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/header", token=token
+    )
+    require_status(header, 200, "sub-agent session header")
+    require(header.json()["turn_count"] == 1, f"the header counts one turn: {header.json()}")
+    listed = request(
+        base_url,
+        "GET",
+        "/v1/agent-usage/sessions?" + urllib.parse.urlencode({"page_size": 100}),
+        token=token,
+    )
+    require_status(listed, 200, "sub-agent session list")
+    listed_turns = [
+        item["turns"] for item in listed.json()["items"] if item["session_id"] == session_id
+    ]
+    require(listed_turns == [1], f"the session list counts one turn: {listed_turns}")
+    side_request = next(
+        item for item in raw.json()["events"] if item["event_id"] == f"event-side-request-{run_id}"
+    )
+    location = request(
+        base_url, "GET", f"/v1/agent-usage/events/{side_request['id']}/location", token=token
+    )
+    require_status(location, 200, "side request location")
+    require(
+        location.json().get("turn") == 1 and "segment_index" not in location.json(),
+        f"the side request is located in turn 1: {location.json()}",
     )
     segment = request(
         base_url,
@@ -589,10 +657,11 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
     declared = (
         exchange.get("subagent_id"),
         exchange.get("parent_subagent_id"),
-        exchange.get("root_turn_id"),
+        exchange.get("turn_id"),
+        exchange.get("turn"),
     )
     require(
-        declared == (f"agent-{run_id}", None, f"turn-{run_id}"),
+        declared == (f"agent-{run_id}", None, f"turn-{run_id}", 1),
         f"the exchange carries its declared ids: {declared}",
     )
 

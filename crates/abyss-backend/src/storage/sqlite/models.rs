@@ -148,7 +148,7 @@ pub(super) struct NewStreamFacts {
     pub(super) label_length: Option<i32>,
     pub(super) subagent_id: Option<String>,
     pub(super) parent_subagent_id: Option<String>,
-    pub(super) root_turn_id: Option<String>,
+    pub(super) turn_id: Option<String>,
 }
 
 impl NewStreamFacts {
@@ -201,7 +201,7 @@ pub(super) struct StreamEventRow {
     pub(super) label_length: Option<i32>,
     pub(super) subagent_id: Option<String>,
     pub(super) parent_subagent_id: Option<String>,
-    pub(super) root_turn_id: Option<String>,
+    pub(super) turn_id: Option<String>,
 }
 
 impl StreamEventRow {
@@ -229,7 +229,7 @@ impl StreamEventRow {
             previous_response_id: self.previous_response_id,
             subagent_id: self.subagent_id,
             parent_subagent_id: self.parent_subagent_id,
-            root_turn_id: self.root_turn_id,
+            turn_id: self.turn_id,
             facts,
         })
     }

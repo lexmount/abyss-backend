@@ -51,7 +51,7 @@ pub(super) struct Side<F> {
     pub(super) facts: F,
 }
 
-/// `subagent_id`, `parent_subagent_id`, and `root_turn_id` of one event.
+/// `subagent_id`, `parent_subagent_id`, and `turn_id` of one event.
 type DeclaredIds = (Option<String>, Option<String>, Option<String>);
 
 pub(super) struct Exchange {
@@ -69,7 +69,7 @@ pub(super) struct Exchange {
     /// Ids the client declared: the request's, else the response's.
     pub(super) subagent_id: Option<String>,
     pub(super) parent_subagent_id: Option<String>,
-    pub(super) root_turn_id: Option<String>,
+    pub(super) turn_id: Option<String>,
 }
 
 impl Exchange {
@@ -78,11 +78,7 @@ impl Exchange {
         let (pk, previous_response_id) = (event.pk, event.previous_response_id);
         self.event_pks.push(pk);
         self.end = self.end.max(event.observed_at);
-        let declared = (
-            event.subagent_id,
-            event.parent_subagent_id,
-            event.root_turn_id,
-        );
+        let declared = (event.subagent_id, event.parent_subagent_id, event.turn_id);
         match event.facts {
             EventFacts::Request(facts) if self.request.is_none() => {
                 self.at = event.observed_at;
@@ -107,10 +103,10 @@ impl Exchange {
         }
     }
 
-    fn declare(&mut self, (subagent, parent, root_turn): DeclaredIds) {
+    fn declare(&mut self, (subagent, parent, turn): DeclaredIds) {
         self.subagent_id = subagent;
         self.parent_subagent_id = parent;
-        self.root_turn_id = root_turn;
+        self.turn_id = turn;
     }
 
     pub(super) fn starts_turn(&self) -> bool {
@@ -148,7 +144,7 @@ pub(super) fn group_exchanges(events: Vec<StreamEvent>) -> Vec<Exchange> {
                 response: None,
                 subagent_id: None,
                 parent_subagent_id: None,
-                root_turn_id: None,
+                turn_id: None,
             });
             exchanges.len().saturating_sub(1)
         });
