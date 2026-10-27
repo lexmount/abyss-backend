@@ -175,7 +175,10 @@ mod tests {
         assert_eq!(Pattern::new("aa").occurrences("aaaaa"), [0..2, 2..4]);
         let once = Pattern::new("aba").occurrences("ababa");
         assert_eq!((once.len(), once.first()), (1, Some(&(0..3))));
-        assert!(Pattern::new("x").occurrences("abc").is_empty());
+        assert_eq!(
+            Pattern::new("x").occurrences("abc"),
+            Vec::<std::ops::Range<usize>>::new()
+        );
         // The Kelvin sign folds to an ASCII k, so byte positions shift while
         // character positions do not.
         assert_eq!(Pattern::new("k").occurrences("\u{212a}ok"), [0..1, 2..3]);

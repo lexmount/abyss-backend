@@ -109,8 +109,8 @@ mod tests {
                 },
             ]
         );
-        assert!(pieces(&json!({})).is_empty());
-        assert!(pieces(&json!({"conversation": {"entries": "none"}})).is_empty());
+        assert_eq!(pieces(&json!({})), []);
+        assert_eq!(pieces(&json!({"conversation": {"entries": "none"}})), []);
     }
 
     #[test]
