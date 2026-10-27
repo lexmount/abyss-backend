@@ -17,7 +17,7 @@ CREATE TABLE llm_usage_event_stream_facts (
     new_from integer,
     starts_turn boolean,
     last_identity text,
-    trailing jsonb,
+    "trailing" jsonb,
     result_ids jsonb,
     emitted_ids jsonb,
     output_skeleton jsonb,
