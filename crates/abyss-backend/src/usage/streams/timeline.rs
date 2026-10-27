@@ -37,8 +37,10 @@ pub struct TurnNode {
     /// Whether the first executor's main line begins a new context: its first
     /// exchange has no base.
     pub new_context: bool,
-    /// Executors of the turn: the main line first, then sub-agents by their
-    /// first segment's start.
+    /// Executors of the turn as the tree of who started whom, depth first:
+    /// the main line first, each executor followed by the sub-agents it
+    /// started; siblings by their first segment's start. A sub-agent whose
+    /// declared parent is not an executor of the turn sits at the top level.
     pub executors: Vec<TurnExecutor>,
 }
 
@@ -47,6 +49,10 @@ pub struct TurnNode {
 pub struct TurnExecutor {
     /// Sub-agent the segments declare; `None` for the main line.
     pub subagent_id: Option<String>,
+    /// Sub-agent that started this one, as the first exchange of the
+    /// executor's earliest segment declares it; `None` when the main agent
+    /// started it, and for the main line.
+    pub parent_subagent_id: Option<String>,
     /// Heads of the main line: the root-to-leaf path of the executor's
     /// segment forest with the most exchanges, in path order.
     pub main: Vec<String>,
@@ -61,6 +67,7 @@ pub struct TurnExecutor {
 /// One executor's segments, as indices into the session's segments.
 struct Executor {
     subagent_id: Option<String>,
+    parent_subagent_id: Option<String>,
     main: Vec<usize>,
     side: Vec<usize>,
 }
@@ -135,6 +142,7 @@ impl SessionStructure {
                         main: self.heads(&executor.main),
                         side: self.heads(&executor.side),
                         subagent_id: executor.subagent_id,
+                        parent_subagent_id: executor.parent_subagent_id,
                     }
                 })
                 .collect(),
@@ -142,7 +150,7 @@ impl SessionStructure {
     }
 
     /// The executors of one turn's segments, each split into its main line
-    /// and side segments.
+    /// and side segments, in the depth-first order of who started whom.
     fn executors(&self, members: &[usize]) -> Vec<Executor> {
         let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
         for &segment in members {
@@ -164,7 +172,7 @@ impl SessionStructure {
                 group.first().map(|&segment| self.segments[segment].start),
             )
         });
-        groups
+        let executors = groups
             .into_iter()
             .map(|(subagent, group)| {
                 let main = self.main_line(&group);
@@ -173,12 +181,65 @@ impl SessionStructure {
                     .copied()
                     .filter(|segment| !main.contains(segment))
                     .collect();
+                let parent_subagent_id = subagent.and_then(|_| {
+                    let first = *self.segmentation.segments[*group.first()?]
+                        .exchanges
+                        .first()?;
+                    self.exchanges[first].parent_subagent_id.clone()
+                });
                 Executor {
                     subagent_id: subagent.map(str::to_owned),
+                    parent_subagent_id,
                     main,
                     side,
                 }
             })
+            .collect();
+        Self::started_first(executors)
+    }
+
+    /// Orders executors, already by start with the main line first, depth
+    /// first by who started whom. An executor whose declared parent is not
+    /// among them, or that a cycle of declarations reaches only through
+    /// itself, sits at the top level in its place.
+    fn started_first(executors: Vec<Executor>) -> Vec<Executor> {
+        let parent_of = |index: usize| {
+            let parent = executors[index].parent_subagent_id.as_deref()?;
+            executors
+                .iter()
+                .position(|executor| executor.subagent_id.as_deref() == Some(parent))
+                .filter(|&parent| parent != index)
+        };
+        let parents: Vec<Option<usize>> = (0..executors.len()).map(parent_of).collect();
+        let mut order = Vec::with_capacity(executors.len());
+        let mut placed = vec![false; executors.len()];
+        // Top-level executors first; a cycle, never reached from the top,
+        // is entered at its earliest member in the second pass.
+        for top_only in [true, false] {
+            for index in 0..executors.len() {
+                if placed[index] || (top_only && parents[index].is_some()) {
+                    continue;
+                }
+                let mut stack = vec![index];
+                while let Some(next) = stack.pop() {
+                    if placed[next] {
+                        continue;
+                    }
+                    placed[next] = true;
+                    order.push(next);
+                    // Pushed in reverse so the earliest child comes out first.
+                    stack.extend(
+                        (0..executors.len())
+                            .rev()
+                            .filter(|&child| parents[child] == Some(next) && !placed[child]),
+                    );
+                }
+            }
+        }
+        let mut slots: Vec<Option<Executor>> = executors.into_iter().map(Some).collect();
+        order
+            .into_iter()
+            .filter_map(|index| slots[index].take())
             .collect()
     }
 
@@ -415,5 +476,79 @@ mod tests {
         assert_eq!(first.exchange_count, 7);
         let numbered = view.turns.iter().filter(|turn| turn.turn.is_some()).count();
         assert_eq!(numbered, structure.summary().turns);
+    }
+
+    #[test]
+    fn executors_follow_who_started_whom() {
+        let mut session = Session::new();
+        let declare = |subagent: Option<&'static str>, parent: Option<&'static str>| {
+            (subagent, parent, Some("p1"))
+        };
+        session.declared(
+            "m1",
+            1,
+            &json!([user("fix")]),
+            &json!([assistant("ok")]),
+            declare(None, None),
+        );
+        session.declared(
+            "a1",
+            2,
+            &json!([user("explore")]),
+            &json!([assistant("a")]),
+            declare(Some("a1"), None),
+        );
+        // Its declared parent takes no part in the turn: top level.
+        session.declared(
+            "c1",
+            3,
+            &json!([user("orphan")]),
+            &json!([assistant("c")]),
+            declare(Some("c1"), Some("gone")),
+        );
+        session.declared(
+            "b1",
+            4,
+            &json!([user("search")]),
+            &json!([assistant("b")]),
+            declare(Some("b1"), None),
+        );
+        // Started by a1, after b1 began.
+        session.declared(
+            "a2",
+            5,
+            &json!([user("dig")]),
+            &json!([assistant("d")]),
+            declare(Some("a2"), Some("a1")),
+        );
+        session.declared(
+            "a3",
+            6,
+            &json!([user("deeper")]),
+            &json!([assistant("e")]),
+            declare(Some("a3"), Some("a2")),
+        );
+        let view = SessionStructure::derive(session.events).session_turns(Uuid::nil());
+        let executors = view.turns[0]
+            .executors
+            .iter()
+            .map(|executor| {
+                (
+                    executor.subagent_id.as_deref(),
+                    executor.parent_subagent_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            executors,
+            [
+                (None, None),
+                (Some("a1"), None),
+                (Some("a2"), Some("a1")),
+                (Some("a3"), Some("a2")),
+                (Some("c1"), Some("gone")),
+                (Some("b1"), None),
+            ]
+        );
     }
 }
