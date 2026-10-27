@@ -100,7 +100,7 @@ mod tests {
             document.content.as_deref(),
             Some("run the tests\n{\"command\":\"cargo test\"}\nall tests passed")
         );
-        assert!(document.tool_content.is_empty());
+        assert_eq!(document.tool_content, Vec::<String>::new());
         let serialized = serde_json::to_string(&document).expect("document should serialize");
         assert!(!serialized.contains("Bearer secret"));
     }

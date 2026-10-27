@@ -460,7 +460,7 @@ mod tests {
         let second = rank_sessions(hits.clone(), 1, 2);
         assert_eq!(second.total_sessions, 4);
         assert_eq!(names(&second, &all), ["tie-a", "tie-b"]);
-        assert!(rank_sessions(hits, 4, 2).sessions.is_empty());
+        assert_eq!(rank_sessions(hits, 4, 2).sessions, []);
     }
 
     #[test]

@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(facts.last_identity.as_deref(), Some("a"));
         assert_eq!(facts.trailing, ["assistant"]);
         assert!(facts.starts_turn);
-        assert!(facts.result_ids.is_empty());
+        assert_eq!(facts.result_ids, Vec::<String>::new());
         // Without model output, every entry is new and tool results answer
         // calls that live elsewhere.
         assert_eq!(
@@ -374,7 +374,7 @@ mod tests {
         ]);
         let facts = RequestFacts::read(&conversation(&json!(request)));
         assert_eq!(facts.last_identity.as_deref(), Some("item:msg_2"));
-        assert!(facts.trailing.is_empty());
+        assert_eq!(facts.trailing, Vec::<String>::new());
         let mut request = vec![user("go")];
         request.extend(output);
         request.extend([result("a"), reasoning(), assistant("done")]);
