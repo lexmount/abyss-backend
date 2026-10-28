@@ -1004,8 +1004,9 @@ fn day_offsets(
 
 /// Usage totals grouped in SQL, reading only the columns a summary reports.
 ///
-/// Event text and metadata hold whole request bodies, so loading rows to sum
-/// them in memory read gigabytes for a week of usage. The owner is the single
+/// Event metadata holds each event's conversation, so reading event rows
+/// reads a page per event; the summary cover index carries every event column
+/// used here, `id` included for the stream facts join. The owner is the single
 /// standalone user, so the user dimension is filled in afterwards.
 ///
 /// Turns are counted per session within each group, then summed: the
@@ -2176,6 +2177,42 @@ mod tests {
         let response =
             usage_summary(database, &query, OWNER_ID, 500).expect("summary should succeed");
         serde_json::to_value(response.rows).expect("rows should serialize")
+    }
+
+    #[test]
+    fn summary_reads_events_only_from_covering_indexes() {
+        #[derive(diesel::QueryableByName)]
+        struct PlanStep {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            detail: String,
+        }
+        let mut database = summary_seeded();
+
+        let plan = diesel::sql_query(format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::SUMMARY_AGGREGATE_SQL
+        ))
+        .load::<PlanStep>(&mut database)
+        .expect("summary should plan");
+
+        // Each event row holds its conversation, so reading rows costs a page
+        // per event; `e` and the turn check's `de` are both events.
+        let event_reads = plan
+            .iter()
+            .map(|step| step.detail.as_str())
+            .filter(|detail| {
+                let mut words = detail.split_whitespace();
+                matches!(words.next(), Some("SEARCH" | "SCAN"))
+                    && matches!(words.next(), Some("e" | "de"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !event_reads.is_empty()
+                && event_reads
+                    .iter()
+                    .all(|detail| detail.contains("USING COVERING INDEX")),
+            "summary should not read event rows: {event_reads:?}"
+        );
     }
 
     #[test]

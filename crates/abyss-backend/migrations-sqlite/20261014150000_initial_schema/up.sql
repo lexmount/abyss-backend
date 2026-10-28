@@ -163,16 +163,17 @@ CREATE TABLE session_titles (
     updated_at INTEGER NOT NULL
 ) STRICT;
 
--- Event rows hold whole request bodies in text and metadata, so reading a
--- token column from the row walks through megabytes of overflow pages. These
--- indexes carry every column the usage summary and the session list read,
--- letting both answer from the index alone.
+-- Event rows hold each event's conversation in metadata, tens of kilobytes,
+-- so a leaf page holds about one row and reading any column from the row
+-- reads a page per event. These indexes carry every column the usage summary
+-- and the session list read, letting both answer from the index alone; the
+-- summary joins stream facts by id.
 CREATE INDEX llm_usage_events_summary_cover_idx
     ON llm_usage_events (
         user_id, observed_at, agent_name, llm_provider, llm_model, event_type,
         device_context_id, session_pk, session_id,
         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-        reasoning_tokens, total_tokens
+        reasoning_tokens, total_tokens, id
     );
 CREATE INDEX llm_usage_events_session_activity_idx
     ON llm_usage_events (session_pk, observed_at, total_tokens);
