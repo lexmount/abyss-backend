@@ -38,7 +38,7 @@ use crate::{
 use super::{
     models::{parse_uuid, timestamp_from_micros},
     repository::{session_structure, timestamp_to_micros},
-    schema::{agent_sessions, devices, llm_usage_events, search_texts},
+    schema::{agent_sessions, devices, search_texts},
     session_titles,
 };
 
@@ -392,28 +392,41 @@ fn matched_events(
     owner: &str,
     event_pks: &[Uuid],
 ) -> Result<HashMap<Uuid, MatchedEvent>, AppError> {
-    llm_usage_events::table
-        .filter(llm_usage_events::user_id.eq(owner))
-        .filter(llm_usage_events::id.eq_any(event_pks.iter().map(Uuid::to_string)))
-        .select((
-            llm_usage_events::id,
-            llm_usage_events::event_type,
-            llm_usage_events::llm_provider,
-            llm_usage_events::llm_model,
+    let event_pks = serde_json::to_string(event_pks)
+        .map_err(|error| AppError::internal(format!("serialize search event ids: {error}")))?;
+    // The ids find the events, and the unary `+` keeps the owner a filter on
+    // them: the owner holds every event, so looking it up reads them all.
+    sql_query(
+        "SELECT id, event_type, llm_provider, llm_model FROM llm_usage_events \
+         WHERE id IN (SELECT value FROM json_each(?1)) AND +user_id = ?2",
+    )
+    .bind::<Text, _>(event_pks)
+    .bind::<Text, _>(owner)
+    .load::<MatchedEventRow>(connection)?
+    .into_iter()
+    .map(|row| {
+        Ok((
+            parse_uuid(&row.id, "search event id")?,
+            MatchedEvent {
+                event_type: row.event_type,
+                llm_provider: row.llm_provider,
+                llm_model: row.llm_model,
+            },
         ))
-        .load::<(String, String, String, String)>(connection)?
-        .into_iter()
-        .map(|(id, event_type, llm_provider, llm_model)| {
-            Ok((
-                parse_uuid(&id, "search event id")?,
-                MatchedEvent {
-                    event_type,
-                    llm_provider,
-                    llm_model,
-                },
-            ))
-        })
-        .collect()
+    })
+    .collect()
+}
+
+#[derive(QueryableByName)]
+struct MatchedEventRow {
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    event_type: String,
+    #[diesel(sql_type = Text)]
+    llm_provider: String,
+    #[diesel(sql_type = Text)]
+    llm_model: String,
 }
 
 /// Session and device columns of the page's sessions.
