@@ -1,15 +1,23 @@
 //! The stream facts ingest reads from one event's conversation entries alone:
-//! roles, call ids, item ids, and whether a user entry has text.
+//! roles, call ids, item ids, digests of model text without ids, and whether a
+//! user entry has text.
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::usage::conversation::{Conversation, Entry};
 
 /// Roles of the entries the model produced.
 pub(super) const MODEL_ROLES: [&str; 3] = ["assistant", "reasoning", "tool_call"];
 
+/// Roles of the model-side entries whose text can be their identity.
+const TEXT_ROLES: [&str; 2] = ["assistant", "reasoning"];
+
 /// Prefix that keeps item ids apart from call ids among entry identities.
 const ITEM_PREFIX: &str = "item:";
+
+/// Prefix that keeps text identities apart from call ids and item ids.
+const TEXT_PREFIX: &str = "text:";
 
 impl Entry {
     fn is_model_side(&self) -> bool {
@@ -24,16 +32,35 @@ impl Entry {
             .map(|item_id| format!("{ITEM_PREFIX}{item_id}"))
     }
 
-    /// The provider-made ids of the entry: its item, then the call id of a
-    /// `tool_call` entry.
-    fn identities(&self) -> impl Iterator<Item = String> {
-        let call = self.call_id.clone().filter(|_| self.role == "tool_call");
-        self.item().into_iter().chain(call)
+    /// The identity of an `assistant` or `reasoning` entry that has neither
+    /// a call id nor an item id, read from its text when that text is not
+    /// blank: `text:<role>:` and the lowercase hex SHA-256 of the exact text.
+    fn text_identity(&self) -> Option<String> {
+        let speaks = TEXT_ROLES.contains(&self.role.as_str());
+        (speaks && self.call_id.is_none() && self.item_id.is_none() && !self.text.trim().is_empty())
+            .then(|| {
+                let digest = hex::encode(Sha256::digest(self.text.as_bytes()));
+                format!("{TEXT_PREFIX}{}:{digest}", self.role)
+            })
     }
 
-    /// The entry's key in a skeleton: its call id, else its item.
+    /// The ids of the entry: its item, then the call id of a `tool_call`
+    /// entry; else, for model text without either, its text identity.
+    fn identities(&self) -> impl Iterator<Item = String> {
+        let call = self.call_id.clone().filter(|_| self.role == "tool_call");
+        self.item()
+            .into_iter()
+            .chain(call)
+            .chain(self.text_identity())
+    }
+
+    /// The entry's key in a skeleton: its call id, else its item, else its
+    /// text identity.
     fn key(&self) -> Option<String> {
-        self.call_id.clone().or_else(|| self.item())
+        self.call_id
+            .clone()
+            .or_else(|| self.item())
+            .or_else(|| self.text_identity())
     }
 }
 
@@ -46,7 +73,7 @@ fn conversation_entries(metadata: &Value) -> Vec<Entry> {
 }
 
 /// One skeleton entry: an entry's role and key, its call id, else its
-/// `item:`-prefixed item id.
+/// `item:`-prefixed item id, else its `text:`-prefixed text identity.
 pub type SkeletonEntry = (String, Option<String>);
 
 /// The `(role, key)` of each entry in order.
@@ -80,7 +107,8 @@ pub struct RequestFacts {
     /// The last identity in the last run, the run reaching from the last
     /// model-side entry back through model-side and `tool_result` entries to
     /// any other role or the start: the call id of a `tool_call` entry, else
-    /// the `item:`-prefixed item id of a model-side entry.
+    /// the `item:`-prefixed item id of a model-side entry, else the
+    /// `text:`-prefixed text identity of an `assistant` or `reasoning` entry.
     pub last_identity: Option<String>,
     /// Roles of the model-side entries after the one holding
     /// `last_identity`, in order; none of them has an identity. Empty without
@@ -204,7 +232,8 @@ fn starts_turn(new_part: &[Entry]) -> bool {
 pub struct ResponseFacts {
     /// Identities of every entry, in order: for each entry, the
     /// `item:`-prefixed item id of a model-side entry, then the call id of a
-    /// `tool_call` entry.
+    /// `tool_call` entry; else the `text:`-prefixed text identity of an
+    /// `assistant` or `reasoning` entry.
     pub emitted_ids: Vec<String>,
     /// Skeleton of every entry.
     pub output_skeleton: Vec<SkeletonEntry>,
@@ -227,7 +256,8 @@ mod tests {
 
     use super::{Label, RequestFacts, ResponseFacts};
     use crate::usage::streams::fixtures::{
-        assistant, call, conversation, ids, item, reasoning, result, skeleton, system, user,
+        assistant, call, conversation, ids, item, reasoning, result, said, skeleton, system,
+        thought, user,
     };
 
     #[test]
@@ -255,8 +285,8 @@ mod tests {
                 label: None,
             }
         );
-        // New user text after the last answer opens a turn; the answer has no
-        // identity, so it trails the last call.
+        // New user text after the last answer opens a turn; the answer's
+        // text is its identity.
         let facts = RequestFacts::read(&conversation(&json!([
             user("fix it"),
             call("a"),
@@ -266,10 +296,20 @@ mod tests {
             user("next")
         ])));
         assert_eq!(facts.new_from, 4_i32);
-        assert_eq!(facts.last_identity.as_deref(), Some("a"));
-        assert_eq!(facts.trailing, ["assistant"]);
+        assert_eq!(facts.last_identity, Some(said("assistant", "fixed")));
+        assert!(facts.trailing.is_empty());
         assert!(facts.starts_turn);
         assert!(facts.result_ids.is_empty());
+        // Blank model text has no identity, so it trails the last call.
+        let facts = RequestFacts::read(&conversation(&json!([
+            user("fix it"),
+            call("a"),
+            result("a"),
+            reasoning(),
+            assistant(" \n")
+        ])));
+        assert_eq!(facts.last_identity.as_deref(), Some("a"));
+        assert_eq!(facts.trailing, ["reasoning", "assistant"]);
         // Without model output, every entry is new and tool results answer
         // calls that live elsewhere.
         assert_eq!(
@@ -297,7 +337,7 @@ mod tests {
             call("a"),
             result("a"),
             user("thanks"),
-            assistant("sure")
+            assistant(" ")
         ])));
         assert_eq!((facts.last_identity, facts.trailing), (None, Vec::new()));
         // Empty user text opens no turn; a request without a complete
@@ -315,6 +355,7 @@ mod tests {
 
     #[test]
     fn response_facts_list_emitted_calls_and_the_output_skeleton() {
+        let look = said("assistant", "let me look");
         assert_eq!(
             ResponseFacts::read(&conversation(&json!([
                 reasoning(),
@@ -324,10 +365,10 @@ mod tests {
                 {"role": "tool_result", "text": "found", "call_id": "s"}
             ]))),
             ResponseFacts {
-                emitted_ids: ids(&["a", "b"]),
+                emitted_ids: vec![look.clone(), "a".to_owned(), "b".to_owned()],
                 output_skeleton: skeleton(&[
                     ("reasoning", None),
-                    ("assistant", None),
+                    ("assistant", Some(look.as_str())),
                     ("tool_call", Some("a")),
                     ("tool_call", Some("b")),
                     ("tool_result", Some("s"))
@@ -377,7 +418,7 @@ mod tests {
         assert!(facts.trailing.is_empty());
         let mut request = vec![user("go")];
         request.extend(output);
-        request.extend([result("a"), reasoning(), assistant("done")]);
+        request.extend([result("a"), reasoning(), assistant("")]);
         let facts = RequestFacts::read(&conversation(&json!(request)));
         assert_eq!(facts.last_identity.as_deref(), Some("a"));
         assert_eq!(
@@ -385,6 +426,64 @@ mod tests {
             ["reasoning", "assistant"],
             "trailing roles keep reasoning and leave out tool results"
         );
+    }
+
+    #[test]
+    fn model_text_without_ids_is_identified_by_its_digest_unless_blank() {
+        // Chat Completions: `reasoning_content`, `content`, and the calls; only
+        // the calls carry ids.
+        let facts = ResponseFacts::read(&conversation(&json!([
+            thought("plan"),
+            assistant("abc"),
+            call("a"),
+            thought(" \n\t"),
+            assistant("")
+        ])));
+        let (plan, abc) = (said("reasoning", "plan"), said("assistant", "abc"));
+        assert_eq!(
+            facts.emitted_ids,
+            [plan.clone(), abc.clone(), "a".to_owned()]
+        );
+        assert_eq!(
+            facts.output_skeleton,
+            skeleton(&[
+                ("reasoning", Some(plan.as_str())),
+                ("assistant", Some(abc.as_str())),
+                ("tool_call", Some("a")),
+                ("reasoning", None),
+                ("assistant", None)
+            ]),
+            "blank text has no identity"
+        );
+        assert_eq!(
+            abc, "text:assistant:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the lowercase hex SHA-256 of the text's bytes, after the role"
+        );
+        assert_ne!(said("assistant", "abc "), abc, "the exact text, untrimmed");
+        assert_ne!(said("reasoning", "abc"), abc, "the role is part of it");
+        // Entries with ids keep exactly those ids; other roles have none.
+        let facts = ResponseFacts::read(&conversation(&json!([
+            item(assistant("abc"), "msg_1"),
+            item(thought("plan"), "rs_1"),
+            call("a"),
+            user("abc"),
+            system("abc"),
+            {"role": "tool_result", "text": "abc"}
+        ])));
+        assert_eq!(facts.emitted_ids, ids(&["item:msg_1", "item:rs_1", "a"]));
+        // A request carries the answer back: blank thinking before it, as
+        // OpenCode adds to an answer without thinking, does not trail it.
+        let facts = RequestFacts::read(&conversation(&json!([
+            user("go"),
+            thought("plan"),
+            call("a"),
+            result("a"),
+            thought(" "),
+            assistant("abc"),
+            user("next")
+        ])));
+        assert_eq!(facts.last_identity, Some(abc));
+        assert!(facts.trailing.is_empty());
     }
 
     #[test]

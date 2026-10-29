@@ -3,8 +3,9 @@
 //!
 //! A stream is one line of the model's context. Every request has at most one
 //! base, the exchange whose output its context continues. Ingest reads the
-//! roles, call ids, and item ids of one event's conversation entries, plus
-//! whether a user entry has text, and never looks at another event. A query
+//! roles, call ids, and item ids of one event's conversation entries, the
+//! digest of model text that has neither id, plus whether a user entry has
+//! text, and never looks at another event. A query
 //! groups one session's events into exchanges and finds each base by key
 //! lookups within the session, without comparing content.
 

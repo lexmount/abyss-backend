@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::{
@@ -26,6 +27,19 @@ pub(super) fn assistant(text: &str) -> Value {
 
 pub(super) fn reasoning() -> Value {
     json!({"role": "reasoning", "text": ""})
+}
+
+/// Reasoning with visible text, like Chat Completions' `reasoning_content`.
+pub(super) fn thought(text: &str) -> Value {
+    json!({"role": "reasoning", "text": text})
+}
+
+/// The identity of model text `text` in an entry of `role` without ids.
+pub(super) fn said(role: &str, text: &str) -> String {
+    format!(
+        "text:{role}:{}",
+        hex::encode(Sha256::digest(text.as_bytes()))
+    )
 }
 
 pub(super) fn call(id: &str) -> Value {

@@ -261,15 +261,27 @@ pub(super) fn find_base(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{BaseRule, NoBaseReason};
     use crate::usage::streams::fixtures::{
-        Session, assistant, call, item, reasoning, result, user,
+        Session, assistant, call, item, reasoning, result, system, thought, user,
     };
 
     fn linked(base: &str) -> (String, BaseRule) {
         (base.to_owned(), BaseRule::LastOutput)
+    }
+
+    /// The base of a request after replies p1, p2, … with `outputs`.
+    fn base_after(outputs: &[Value], request: &Value) -> Result<(String, BaseRule), NoBaseReason> {
+        let mut session = Session::new();
+        let mut second = 0_i64;
+        for output in outputs {
+            second = second.saturating_add(1);
+            session.exchange(&format!("p{second}"), second, &json!([user("go")]), output);
+        }
+        session.ask("next", second.saturating_add(1), None, request);
+        session.base("next")
     }
 
     #[test]
@@ -313,10 +325,10 @@ mod tests {
                 Ok(linked("p1")),
             ),
             (
-                "5: text p1 did not say",
+                "5: text no observed reply said",
                 vec![json!([call("c1")])],
                 json!([user("go"), call("c1"), result("c1"), assistant("fixed")]),
-                Err(NoBaseReason::TextOnly),
+                Err(NoBaseReason::UnknownIds),
             ),
             (
                 "6: earlier calls of the run come from earlier replies",
@@ -343,7 +355,34 @@ mod tests {
                 Ok(linked("p1")),
             ),
             (
-                "thinking p1 did not say",
+                "blank thinking p1 did not say",
+                vec![json!([call("c1")])],
+                json!([user("go"), call("c1"), result("c1"), reasoning()]),
+                Err(NoBaseReason::TextOnly),
+            ),
+            (
+                "more blank text than p1 said",
+                vec![json!([call("c1"), assistant(" ")])],
+                json!([user("go"), call("c1"), assistant(" "), assistant("\n")]),
+                Err(NoBaseReason::TextOnly),
+            ),
+        ];
+        for (case, outputs, request, expected) in cases {
+            assert_eq!(base_after(&outputs, &request), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn model_text_without_ids_aligns_on_the_one_reply_that_said_it_exactly() {
+        let cases = [
+            (
+                "text a later reply said",
+                vec![json!([call("c1")]), json!([assistant("fixed")])],
+                json!([user("go"), call("c1"), result("c1"), assistant("fixed")]),
+                Ok(linked("p2")),
+            ),
+            (
+                "blank thinking before the replayed answer",
                 vec![json!([call("c1"), assistant("done")])],
                 json!([
                     user("go"),
@@ -352,29 +391,23 @@ mod tests {
                     reasoning(),
                     assistant("done")
                 ]),
-                Err(NoBaseReason::TextOnly),
+                Ok(linked("p1")),
             ),
             (
-                "more text than p1 said",
-                vec![json!([call("c1"), assistant("done")])],
-                json!([
-                    user("go"),
-                    call("c1"),
-                    assistant("done"),
-                    assistant("again")
-                ]),
-                Err(NoBaseReason::TextOnly),
+                "a rewritten answer",
+                vec![json!([assistant("done")])],
+                json!([user("go"), assistant("done."), user("more")]),
+                Err(NoBaseReason::UnknownIds),
+            ),
+            (
+                "an answer two replies said",
+                vec![json!([assistant("ok")]), json!([assistant("ok")])],
+                json!([user("go"), assistant("ok"), user("more")]),
+                Err(NoBaseReason::MultipleResponses),
             ),
         ];
         for (case, outputs, request, expected) in cases {
-            let mut session = Session::new();
-            let mut second = 0_i64;
-            for output in &outputs {
-                second = second.saturating_add(1);
-                session.exchange(&format!("p{second}"), second, &json!([user("go")]), output);
-            }
-            session.ask("next", second.saturating_add(1), None, &request);
-            assert_eq!(session.base("next"), expected, "{case}");
+            assert_eq!(base_after(&outputs, &request), expected, "{case}");
         }
     }
 
@@ -387,10 +420,10 @@ mod tests {
         session.ask("pointer", 4, Some("p"), &json!([user("next")]));
         session.ask("results", 5, None, &json!([result("a"), result("b")]));
         session.ask(
-            "plain_text",
+            "blank_text",
             6,
             None,
-            &json!([user("hi"), assistant("hey"), user("so")]),
+            &json!([user("hi"), assistant(" "), user("so")]),
         );
         session.ask("nothing", 7, None, &json!([user("hi")]));
         session.ask(
@@ -404,13 +437,58 @@ mod tests {
         for (name, expected) in [
             ("pointer", Ok(("p".to_owned(), BaseRule::Pointer))),
             ("results", Ok(("p".to_owned(), BaseRule::ResultsOnly))),
-            ("plain_text", Err(NoBaseReason::TextOnly)),
+            ("blank_text", Err(NoBaseReason::TextOnly)),
             ("nothing", Err(NoBaseReason::NoOutput)),
             ("unknown", Err(NoBaseReason::UnknownIds)),
             ("ambiguous", Err(NoBaseReason::MultipleResponses)),
             ("lonely", Err(NoBaseReason::MissingRequest)),
         ] {
             assert_eq!(session.base(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_chat_completions_turn_continues_the_exchange_that_gave_its_answer() {
+        // OpenCode on DeepSeek: thinking and answers come back without ids,
+        // as `reasoning_content` and `content`.
+        let mut session = Session::new();
+        let ask = [system("rules"), user("fix it")];
+        session.exchange(
+            "look",
+            1,
+            &json!(ask),
+            &json!([thought("read the log"), call("c1")]),
+        );
+        let mut resent = ask.to_vec();
+        resent.extend([thought("read the log"), call("c1"), result("c1")]);
+        session.exchange(
+            "answer",
+            2,
+            &json!(resent),
+            &json!([thought("it is fixed"), assistant("Fixed the build.")]),
+        );
+        // The next turn resends the answer; OpenCode drops the thinking.
+        let mut next = resent.clone();
+        next.extend([assistant("Fixed the build."), user("now test it")]);
+        session.exchange("next", 3, &json!(next), &json!([call("c2")]));
+        // OpenCode puts blank thinking before an answer that had none.
+        let mut replay = next.clone();
+        replay.extend([call("c2"), result("c2")]);
+        session.exchange(
+            "tested",
+            4,
+            &json!(replay),
+            &json!([assistant("Tests pass.")]),
+        );
+        replay.extend([thought(" "), assistant("Tests pass."), user("thanks")]);
+        session.ask("thanks", 5, None, &json!(replay));
+        for (name, base) in [
+            ("answer", "look"),
+            ("next", "answer"),
+            ("tested", "next"),
+            ("thanks", "tested"),
+        ] {
+            assert_eq!(session.base(name), Ok(linked(base)), "{name}");
         }
     }
 }
