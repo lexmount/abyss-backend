@@ -23,7 +23,6 @@ use crate::{
     usage::{
         IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
         RawEventsResponse, SummaryQuery, SummaryResponse, SummaryRow, UsageEventResponse,
-        UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -39,8 +38,8 @@ use crate::{
         },
         session_header::{HeaderEvent, SessionHeaderResponse, session_header as header_of},
         streams::{
-            EventLocationResponse, RequestFacts, ResponseFacts, SessionStreamsResponse,
-            SessionStructure, SessionTurnsResponse, StreamEvent,
+            EventLocationResponse, SessionStreamsResponse, SessionStructure, SessionTurnsResponse,
+            StreamEvent,
         },
         time_zone::parse_time_zone,
     },
@@ -605,15 +604,11 @@ fn insert_stream_facts(
     event_pk: Uuid,
     event: &IngestUsageEvent,
 ) -> Result<(), AppError> {
-    let event_pk = event_pk.to_string();
-    let facts = match event.event_type {
-        UsageEventType::Request => {
-            NewStreamFacts::request(event_pk, &RequestFacts::read(&event.metadata))?
-        }
-        UsageEventType::Response => {
-            NewStreamFacts::response(event_pk, &ResponseFacts::read(&event.metadata))?
-        }
-    };
+    let facts = NewStreamFacts::read(
+        event_pk.to_string(),
+        event.event_type.as_str(),
+        &event.metadata,
+    )?;
     let facts = NewStreamFacts {
         subagent_id: event.subagent_id.clone(),
         parent_subagent_id: event.parent_subagent_id.clone(),

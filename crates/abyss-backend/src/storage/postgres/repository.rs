@@ -24,7 +24,7 @@ use diesel::{
     },
     upsert::excluded,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -807,43 +807,13 @@ fn json_list<T: DeserializeOwned + Default>(
     )
 }
 
-fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, AppError> {
-    serde_json::to_value(value)
-        .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
-}
-
-/// Stream fact columns of one ingested event; the other side's stay NULL.
+/// Stream fact columns of one ingested event, with the ids it declares.
 fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFacts, AppError> {
-    let declared = NewStreamFacts {
-        event_pk,
+    Ok(NewStreamFacts {
         subagent_id: event.subagent_id.clone(),
         parent_subagent_id: event.parent_subagent_id.clone(),
         turn_id: event.turn_id.clone(),
-        ..NewStreamFacts::default()
-    };
-    Ok(match event.event_type {
-        UsageEventType::Request => {
-            let facts = RequestFacts::read(&event.metadata);
-            NewStreamFacts {
-                new_from: Some(facts.new_from),
-                starts_turn: Some(facts.starts_turn),
-                last_identity: facts.last_identity,
-                trailing: Some(json_value(&facts.trailing, "trailing roles")?),
-                result_ids: Some(json_value(&facts.result_ids, "result ids")?),
-                label_index: facts.label.as_ref().map(|label| label.index),
-                label_length: facts.label.as_ref().map(|label| label.length),
-                label_text: facts.label.map(|label| label.text),
-                ..declared
-            }
-        }
-        UsageEventType::Response => {
-            let facts = ResponseFacts::read(&event.metadata);
-            NewStreamFacts {
-                emitted_ids: Some(json_value(&facts.emitted_ids, "emitted ids")?),
-                output_skeleton: Some(json_value(&facts.output_skeleton, "output skeleton")?),
-                ..declared
-            }
-        }
+        ..super::stream_facts::read(event_pk, event.event_type.as_str(), &event.metadata)?
     })
 }
 

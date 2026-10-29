@@ -534,10 +534,12 @@ mod tests {
 
         // Return to the initial schema, including the previous search tables.
         // Reapplying facts must run its SQL and title rebuild in one transaction.
-        let reverted = database
-            .revert_last_migration(MIGRATIONS)
-            .expect("revert the facts migration");
-        assert_eq!(reverted.to_string(), "20261019120000");
+        for version in ["20261029120000", "20261019120000"] {
+            let reverted = database
+                .revert_last_migration(MIGRATIONS)
+                .expect("revert the facts migrations");
+            assert_eq!(reverted.to_string(), version);
+        }
         // Simulate the previous version's cache and migration history.
         for statement in [
             "UPDATE session_titles SET title = 'Old agent title', purpose = 'title_generation'",
@@ -577,7 +579,7 @@ mod tests {
             .expect("header");
         assert!(
             header.title.is_none(),
-            "migration does not manufacture missing labels from event bodies"
+            "the earliest request has no user words to label the session"
         );
 
         // A second startup must not change the registration.

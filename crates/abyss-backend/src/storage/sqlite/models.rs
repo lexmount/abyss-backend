@@ -8,7 +8,10 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    usage::streams::{EventFacts, Label, RequestFacts, ResponseFacts, StreamEvent},
+    usage::{
+        UsageEventType,
+        streams::{EventFacts, Label, RequestFacts, ResponseFacts, StreamEvent},
+    },
 };
 
 use super::schema::{
@@ -152,6 +155,20 @@ pub(super) struct NewStreamFacts {
 }
 
 impl NewStreamFacts {
+    /// Columns of the facts read from an event's metadata, by its type;
+    /// without the ids the client declared.
+    pub(super) fn read(
+        event_pk: String,
+        event_type: &str,
+        metadata: &Value,
+    ) -> Result<Self, AppError> {
+        if event_type == UsageEventType::Request.as_str() {
+            Self::request(event_pk, &RequestFacts::read(metadata))
+        } else {
+            Self::response(event_pk, &ResponseFacts::read(metadata))
+        }
+    }
+
     /// Columns of a request's facts.
     pub(super) fn request(event_pk: String, facts: &RequestFacts) -> Result<Self, AppError> {
         Ok(Self {

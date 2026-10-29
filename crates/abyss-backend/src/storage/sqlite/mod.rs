@@ -11,6 +11,7 @@ mod schema;
 mod search;
 mod session_list;
 mod session_titles;
+mod stream_facts;
 
 use std::sync::Arc;
 
