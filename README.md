@@ -45,6 +45,13 @@ readable user input in each session. Existing titles and naming classifications
 are replaced; sessions without complete `conversation.entries` remain untitled.
 Subsequent startup and page reads do not rescan event bodies for titles.
 
+`20261029120000_stream_facts_text_identity` changes no schema. When the backend
+applies it, the same transaction reads the stream facts of every stored event
+again from its metadata with the ingest functions, page by page, so stored
+events gain text identities; client-declared ids are kept, and each session
+whose facts changed gets a new structure revision. It runs once, on the first
+startup after the upgrade, and its time is mostly spent reading metadata.
+
 Existing databases require separate handling: an already recorded migration is
 not reapplied when its source SQL changes. A database with the old turn schema
 must have its physical schema updated, including the event columns, dependent
@@ -189,6 +196,16 @@ facts from the same database snapshot (a read transaction in SQLite, read-only
 repeatable read in PostgreSQL). On a new revision or after eviction/restart,
 the first read derives the full structure again. This is a shared query cache,
 not an incremental derivation at ingest time.
+
+A request's base is the exchange that emitted the last identity in its
+history, when exactly one other exchange did and the model output after that
+identity was all said by it. Identities come from the conversation entries:
+an entry's `item_id` (`item:<id>`), a `tool_call` entry's `call_id`, and for an
+`assistant` or `reasoning` entry with neither and non-blank text, a digest of
+that exact text (`text:<role>:<sha256 hex>`). Text identities let a reply that
+the protocol gives no id, such as a Chat Completions answer or an Anthropic text
+block without thinking, link the next turn; rewritten text links nothing, and
+text emitted by more than one exchange is ambiguous.
 
 Stable links retain `event_pk`. The location endpoint returns
 `{"session_pk", "event_pk", "segment", "turn", "segment_kind", "exchange"}` using the current structure,
