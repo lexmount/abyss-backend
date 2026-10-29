@@ -608,6 +608,7 @@ fn insert_stream_facts(
         event_pk.to_string(),
         event.event_type.as_str(),
         &event.metadata,
+        event.previous_response_id.is_some(),
     )?;
     let facts = NewStreamFacts {
         subagent_id: event.subagent_id.clone(),
@@ -1019,6 +1020,16 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
     WITH day_offsets(start_us, offset_us) AS MATERIALIZED ( \
         SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?21) \
     ), \
+    first_openers AS ( \
+        SELECT id FROM ( \
+            SELECT fe.id, ROW_NUMBER() OVER ( \
+                PARTITION BY fe.session_pk ORDER BY fe.observed_at, fe.id \
+            ) AS n \
+            FROM llm_usage_events fe \
+            JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
+            WHERE ff.starts_turn = 1 \
+        ) firsts WHERE n = 1 \
+    ), \
     by_session AS ( \
         SELECT \
             CASE WHEN ?1 THEN strftime( \
@@ -1043,7 +1054,8 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
                 WHERE de.session_pk = e.session_pk AND df.turn_id IS NOT NULL \
             ) AS declares_turns, \
             COUNT(DISTINCT f.turn_id) AS declared_turns, \
-            COUNT(*) FILTER (WHERE f.starts_turn = 1) AS opened_turns, \
+            COUNT(*) FILTER (WHERE f.starts_turn = 1 \
+                AND (f.continues_context = 1 OR e.id IN first_openers)) AS opened_turns, \
             COUNT(*) FILTER (WHERE e.event_type = 'request') AS requests, \
             COUNT(*) FILTER (WHERE e.event_type = 'response') AS responses, \
             COALESCE(SUM(e.input_tokens), 0) AS input_tokens, \
@@ -1363,7 +1375,6 @@ mod tests {
             IngestEventsRequest, RawEventsQuery, SummaryQuery,
             preview::{PreviewQuery, Window},
             segments::SegmentQuery,
-            streams::AttachedBy,
         },
     };
 
@@ -1679,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_sub_agent_ids_are_stored_and_attach_the_sub_agent_segment() {
+    fn declared_sub_agent_ids_are_stored_and_group_the_sub_agent_segment() {
         let mut database = database();
         let event = |id: &str, second: u8, event_type: &str, declared: serde_json::Value| {
             let mut event = json!({
@@ -1750,8 +1761,9 @@ mod tests {
             attachments,
             [
                 ("m", None, None, None),
-                ("s", Some("a1"), Some("m"), Some(AttachedBy::Declared)),
-                ("o", Some("a2"), Some("m"), Some(AttachedBy::Time)),
+                // Sub-agent segments are never attached.
+                ("s", Some("a1"), None, None),
+                ("o", Some("a2"), None, None),
             ]
         );
     }
@@ -1799,7 +1811,8 @@ mod tests {
         let user = |text: &str| json!({"role": "user", "text": text});
         let call = |id: &str| json!({"role": "tool_call", "text": "{}", "call_id": id});
         let result = |id: &str| json!({"role": "tool_result", "text": "ok", "call_id": id});
-        let said = |text: &str| json!([{"role": "assistant", "text": text}]);
+        let answer = |text: &str| json!({"role": "assistant", "text": text});
+        let said = |text: &str| json!([answer(text)]);
         let (cc, codex) = ("claude-code", "codex");
         let none = json!({});
         let request = turn_events(&[
@@ -1874,7 +1887,9 @@ mod tests {
                 codex,
                 8,
                 none.clone(),
-                json!([user("two")]),
+                // A plain chat carries its history: each later question
+                // follows an answer, so each opens a turn.
+                json!([user("one"), answer("1"), user("two")]),
                 said("2"),
             ),
             (
@@ -1883,7 +1898,13 @@ mod tests {
                 codex,
                 9,
                 none,
-                json!([user("three")]),
+                json!([
+                    user("one"),
+                    answer("1"),
+                    user("two"),
+                    answer("2"),
+                    user("three")
+                ]),
                 said("3"),
             ),
         ]);
@@ -2142,10 +2163,14 @@ mod tests {
                 } else {
                     json!({"input_tokens": 0_i64, "output_tokens": 5_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 5_i64})
                 },
-                // A request asking in words opens a turn; a response opens none.
+                // A request asking in words after an answer opens a turn; a
+                // response opens none.
                 "metadata": if id.ends_with("req") {
                     json!({"raw_body": "large", "conversation": {
-                        "entries": [{"role": "user", "text": "ask"}],
+                        "entries": [
+                            {"role": "assistant", "text": "earlier"},
+                            {"role": "user", "text": "ask"}
+                        ],
                         "completeness": "complete"
                     }})
                 } else {

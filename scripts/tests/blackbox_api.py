@@ -507,10 +507,12 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
 
 
 def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
-    """Declared sub-agent ids are stored with each event, and a sub-agent's
-    root segment shows beside the main-line segment of the same turn. The
-    main line, its sub-agent, and an undeclared side request form one turn,
-    counted once by the session list and the header."""
+    """Declared sub-agent ids are stored with each event and group the turn's
+    exchanges: the sub-agent's exchanges form a segment of their own, never
+    attached to the main line. The undeclared request belongs to the main
+    agent; nothing in that group is continued, so it stays on the main line
+    beside the main request. The turn is counted once by the session list and
+    the header."""
     session_id = f"session-subagent-{run_id}"
 
     def declared_event(
@@ -578,15 +580,14 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
         segments
         == [
             (f"main-{run_id}", None, None, None),
-            (f"sub-{run_id}", f"agent-{run_id}", f"main-{run_id}", "declared"),
-            (f"side-{run_id}", None, None, None),
+            (f"sub-{run_id}", f"agent-{run_id}", None, None),
         ],
-        f"the sub-agent segment attaches to the main segment of its turn: {segments}",
+        f"the main agent and the sub-agent each have one segment, unattached: {segments}",
     )
     turns = [(segment.get("turn_id"), segment.get("turn")) for segment in streams.json()["segments"]]
     require(
-        turns == [(f"turn-{run_id}", 1)] * 3,
-        f"the main line, the sub-agent, and the side request share turn 1: {turns}",
+        turns == [(f"turn-{run_id}", 1)] * 2,
+        f"the main agent and the sub-agent share turn 1: {turns}",
     )
     turn_view = request(
         base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/turns", token=token
@@ -612,12 +613,12 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
                 f"turn-{run_id}",
                 True,
                 [
-                    (None, [f"main-{run_id}"], [f"side-{run_id}"]),
+                    (None, [f"main-{run_id}"], []),
                     (f"agent-{run_id}", [f"sub-{run_id}"], []),
                 ],
             )
         ],
-        f"one turn node holds the main line, its side request, and the sub-agent: {turn_nodes}",
+        f"one turn node holds the main agent and the sub-agent: {turn_nodes}",
     )
     header = request(
         base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/header", token=token

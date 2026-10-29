@@ -1,13 +1,11 @@
-//! The turn view of one session: one node per turn, holding the segments of
-//! each executor in the turn, split into a main line and side segments.
-
-use std::collections::HashMap;
+//! The turn view of one session: one node per turn, holding the groups of
+//! the turn's exchanges, each with its main-line segment and side segments.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::{EntryLabel, SessionStructure};
+use super::{EntryLabel, SessionStructure, segmentation::Group};
 
 #[derive(Debug, Serialize)]
 /// Turns of one session, without their exchanges or any content.
@@ -31,8 +29,8 @@ pub struct TurnNode {
     pub end: DateTime<Utc>,
     /// Number of exchanges in the turn's segments.
     pub exchange_count: usize,
-    /// Label of the earliest labelled segment on the main line of the first
-    /// executor: the main line (no sub-agent) when it takes part.
+    /// Label of the first labelled exchange on the main line of the first
+    /// group: the main agent's when it takes part.
     pub label: Option<EntryLabel>,
     /// Whether the first executor's main line begins a new context: its first
     /// exchange has no base.
@@ -53,10 +51,10 @@ pub struct TurnExecutor {
     /// executor's earliest segment declares it; `None` when the main agent
     /// started it, and for the main line.
     pub parent_subagent_id: Option<String>,
-    /// Heads of the main line: the root-to-leaf path of the executor's
-    /// segment forest with the most exchanges, in path order.
+    /// Head of the group's main-line segment: every exchange of the group
+    /// that is not a side exchange; empty when the group has none.
     pub main: Vec<String>,
-    /// Heads of the other segments, by start.
+    /// Heads of the group's side segments, one per side exchange, by start.
     pub side: Vec<String>,
     /// Number of exchanges in the executor's segments.
     pub exchange_count: usize,
@@ -99,10 +97,12 @@ impl SessionStructure {
         let executors = self.executors(members);
         let first = executors.first();
         let label = first.and_then(|executor| {
-            executor
-                .main
-                .iter()
-                .find_map(|&segment| segments[segment].label.clone())
+            executor.main.iter().find_map(|&segment| {
+                self.segmentation.segments[segment]
+                    .exchanges
+                    .iter()
+                    .find_map(|&exchange| self.label(exchange))
+            })
         });
         let new_context = self.new_context(first.and_then(|executor| executor.main.first()));
         TurnNode {
@@ -149,46 +149,47 @@ impl SessionStructure {
         }
     }
 
-    /// The executors of one turn's segments, each split into its main line
-    /// and side segments, in the depth-first order of who started whom.
+    /// The groups of one turn's segments (see `Segmentation::cut`), each
+    /// holding its main-line segment and its side segments, in the
+    /// depth-first order of who started whom.
     fn executors(&self, members: &[usize]) -> Vec<Executor> {
-        let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+        let mut groups: Vec<(&Group, Vec<usize>)> = Vec::new();
         for &segment in members {
-            let subagent = self.segments[segment].subagent_id.as_deref();
-            match groups.iter_mut().find(|(id, _)| *id == subagent) {
-                Some((_, group)) => group.push(segment),
-                None => groups.push((subagent, vec![segment])),
+            let group = &self.segmentation.segments[segment].group;
+            match groups.iter_mut().find(|(id, _)| *id == group) {
+                Some((_, segments)) => segments.push(segment),
+                None => groups.push((group, vec![segment])),
             }
         }
-        let by_start = |segments: &mut Vec<usize>| {
+        for (_, segments) in &mut groups {
             segments.sort_by_key(|&segment| (self.segments[segment].start, segment));
-        };
-        for (_, group) in &mut groups {
-            by_start(group);
         }
-        groups.sort_by_key(|(subagent, group)| {
+        groups.sort_by_key(|(group, segments)| {
             (
-                subagent.is_some(),
-                group.first().map(|&segment| self.segments[segment].start),
+                matches!(group, Group::Declared(Some(_))),
+                segments
+                    .first()
+                    .map(|&segment| self.segments[segment].start),
             )
         });
         let executors = groups
             .into_iter()
-            .map(|(subagent, group)| {
-                let main = self.main_line(&group);
-                let side = group
+            .map(|(group, segments)| {
+                let (side, main): (Vec<usize>, Vec<usize>) = segments
                     .iter()
-                    .copied()
-                    .filter(|segment| !main.contains(segment))
-                    .collect();
-                let parent_subagent_id = subagent.and_then(|_| {
-                    let first = *self.segmentation.segments[*group.first()?]
+                    .partition(|&&segment| self.segmentation.segments[segment].side);
+                let subagent_id = match group {
+                    Group::Declared(subagent) => subagent.clone(),
+                    Group::Line(_) => None,
+                };
+                let parent_subagent_id = subagent_id.as_ref().and_then(|_| {
+                    let first = *self.segmentation.segments[*segments.first()?]
                         .exchanges
                         .first()?;
                     self.exchanges[first].parent_subagent_id.clone()
                 });
                 Executor {
-                    subagent_id: subagent.map(str::to_owned),
+                    subagent_id,
                     parent_subagent_id,
                     main,
                     side,
@@ -241,58 +242,6 @@ impl SessionStructure {
             .into_iter()
             .filter_map(|index| slots[index].take())
             .collect()
-    }
-
-    /// The root-to-leaf path with the most exchanges in the forest that the
-    /// `parent` links within `group` form; of equal paths, the one whose
-    /// segments start earliest, compared from the root. `group` is ordered
-    /// by start.
-    fn main_line(&self, group: &[usize]) -> Vec<usize> {
-        let parent_of = |segment: usize| {
-            self.segmentation.segments[segment]
-                .parent
-                .filter(|parent| group.contains(parent))
-        };
-        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &segment in group {
-            if let Some(parent) = parent_of(segment) {
-                children.entry(parent).or_default().push(segment);
-            }
-        }
-        // Children come after their parent in segment order, so walking the
-        // group backwards by segment index sees every child first.
-        let mut order = group.to_vec();
-        order.sort_unstable();
-        let mut best: HashMap<usize, (usize, Option<usize>)> = HashMap::new();
-        for &segment in order.iter().rev() {
-            let mut chosen: Option<(usize, usize)> = None;
-            for &child in children.get(&segment).into_iter().flatten() {
-                let weight = best.get(&child).map_or(0, |(weight, _)| *weight);
-                if chosen.is_none_or(|(most, _)| weight > most) {
-                    chosen = Some((weight, child));
-                }
-            }
-            let own = self.segments[segment].exchange_count;
-            let weight = own.saturating_add(chosen.map_or(0, |(weight, _)| weight));
-            best.insert(segment, (weight, chosen.map(|(_, child)| child)));
-        }
-        let mut root: Option<(usize, usize)> = None;
-        for &segment in group {
-            if parent_of(segment).is_some() {
-                continue;
-            }
-            let weight = best.get(&segment).map_or(0, |(weight, _)| *weight);
-            if root.is_none_or(|(most, _)| weight > most) {
-                root = Some((weight, segment));
-            }
-        }
-        let mut path = Vec::new();
-        let mut next = root.map(|(_, segment)| segment);
-        while let Some(segment) = next {
-            path.push(segment);
-            next = best.get(&segment).and_then(|(_, child)| *child);
-        }
-        path
     }
 
     /// Whether the first exchange of a turn's first main-line segment has no
@@ -425,6 +374,8 @@ mod tests {
             p("p2"),
         );
         // The user rewinds to an earlier point of turn 1: still a continuation.
+        // Its sibling m3 is continued in turn 1, but turn 3 has nothing else,
+        // so r1 is turn 3's main line, not a side exchange.
         session.declared(
             "r1",
             9,
@@ -445,12 +396,9 @@ mod tests {
                     Some("p1".to_owned()),
                     true,
                     vec![
-                        (
-                            None,
-                            strings(&["m1", "m3"]),
-                            strings(&["search", "recap"]),
-                            6
-                        ),
+                        // m1 to m4 form one main-line segment; the recap
+                        // and the search are not continued.
+                        (None, strings(&["m1"]), strings(&["search", "recap"]), 6),
                         (Some("a1".to_owned()), strings(&["sub"]), vec![], 1),
                     ]
                 ),

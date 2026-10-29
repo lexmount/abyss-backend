@@ -152,28 +152,36 @@ pub(super) struct NewStreamFacts {
     pub(super) subagent_id: Option<String>,
     pub(super) parent_subagent_id: Option<String>,
     pub(super) turn_id: Option<String>,
+    pub(super) continues_context: Option<bool>,
 }
 
 impl NewStreamFacts {
-    /// Columns of the facts read from an event's metadata, by its type;
-    /// without the ids the client declared.
+    /// Columns of the facts read from an event's metadata, by its type, and
+    /// whether the event names the response it continues; without the ids
+    /// the client declared.
     pub(super) fn read(
         event_pk: String,
         event_type: &str,
         metadata: &Value,
+        names_previous: bool,
     ) -> Result<Self, AppError> {
         if event_type == UsageEventType::Request.as_str() {
-            Self::request(event_pk, &RequestFacts::read(metadata))
+            Self::request(event_pk, &RequestFacts::read(metadata), names_previous)
         } else {
             Self::response(event_pk, &ResponseFacts::read(metadata))
         }
     }
 
     /// Columns of a request's facts.
-    pub(super) fn request(event_pk: String, facts: &RequestFacts) -> Result<Self, AppError> {
+    pub(super) fn request(
+        event_pk: String,
+        facts: &RequestFacts,
+        names_previous: bool,
+    ) -> Result<Self, AppError> {
         Ok(Self {
             event_pk,
             new_from: Some(facts.new_from),
+            continues_context: Some(facts.new_from > 0_i32 || names_previous),
             starts_turn: Some(facts.starts_turn),
             last_identity: facts.last_identity.clone(),
             trailing: Some(json_text(&facts.trailing, "trailing roles")?),

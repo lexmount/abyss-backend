@@ -1,0 +1,1 @@
+ALTER TABLE llm_usage_event_stream_facts DROP COLUMN continues_context;

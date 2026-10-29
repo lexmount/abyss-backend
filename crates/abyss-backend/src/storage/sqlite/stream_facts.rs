@@ -58,17 +58,18 @@ pub(super) fn rebuild(connection: &mut SqliteConnection) -> Result<(), AppError>
                 llm_usage_events::session_pk,
                 llm_usage_events::event_type,
                 llm_usage_events::metadata,
+                llm_usage_events::previous_response_id,
             ))
-            .load::<(String, String, String, String)>(connection)?;
+            .load::<(String, String, String, String, Option<String>)>(connection)?;
         let Some((last, ..)) = page.last() else {
             break;
         };
         after.clone_from(last);
-        for (event_pk, session_pk, event_type, metadata) in page {
+        for (event_pk, session_pk, event_type, metadata, previous) in page {
             let metadata = serde_json::from_str::<Value>(&metadata).map_err(|error| {
                 AppError::internal(format!("stored metadata of event {event_pk}: {error}"))
             })?;
-            let facts = NewStreamFacts::read(event_pk, &event_type, &metadata)?;
+            let facts = NewStreamFacts::read(event_pk, &event_type, &metadata, previous.is_some())?;
             if write(connection, &facts)? > 0 {
                 changed.insert(session_pk);
             }
@@ -220,10 +221,12 @@ mod tests {
         diesel::delete(llm_usage_event_stream_facts::table.find(&chat_events[3]))
             .execute(&mut database)
             .expect("missing facts");
-        let reverted = database
-            .revert_last_migration(MIGRATIONS)
-            .expect("revert the rebuild");
-        assert_eq!(reverted.to_string(), "20261029120000");
+        for version in ["20261029130000", "20261029120000"] {
+            let reverted = database
+                .revert_last_migration(MIGRATIONS)
+                .expect("revert down to the rebuild");
+            assert_eq!(reverted.to_string(), version);
+        }
         assert_eq!(
             roots(&mut database, &chat),
             2,

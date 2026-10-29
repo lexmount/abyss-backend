@@ -38,7 +38,12 @@ const ACTIVITY_CTE: &str = "\
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
             (SELECT CASE WHEN COUNT(tf.turn_id) > 0 THEN COUNT(DISTINCT tf.turn_id) \
-                    ELSE COUNT(*) FILTER (WHERE tf.starts_turn = 1) END \
+                    ELSE COUNT(*) FILTER (WHERE tf.starts_turn = 1 AND tf.continues_context = 1) \
+                    + COALESCE((SELECT 1 - ff.continues_context \
+                        FROM llm_usage_events fe \
+                        JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
+                        WHERE fe.session_pk = s.id AND ff.starts_turn = 1 \
+                        ORDER BY fe.observed_at, fe.id LIMIT 1), 0) END \
              FROM llm_usage_events te \
              JOIN llm_usage_event_stream_facts tf ON tf.event_pk = te.id \
              WHERE te.session_pk = s.id) AS turns, \
@@ -243,9 +248,12 @@ mod tests {
             "llm": {"provider": "OpenAI", "model": model},
             "event_type": "request",
             "token_usage": {"input_tokens": 0_i64, "output_tokens": 10_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 10_i64},
-            // Each event asks in words, so each opens a turn.
+            // Each event asks in words after an answer, so each opens a turn.
             "metadata": {"conversation": {
-                "entries": [{"role": "user", "text": format!("ask {turn}")}],
+                "entries": [
+                    {"role": "assistant", "text": "earlier"},
+                    {"role": "user", "text": format!("ask {turn}")}
+                ],
                 "completeness": "complete"
             }}
         })

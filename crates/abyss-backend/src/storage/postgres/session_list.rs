@@ -33,7 +33,12 @@ const ACTIVITY_CTE: &str = "\
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
             (SELECT CASE WHEN COUNT(tf.turn_id) > 0 THEN COUNT(DISTINCT tf.turn_id) \
-                    ELSE COUNT(*) FILTER (WHERE tf.starts_turn) END \
+                    ELSE COUNT(*) FILTER (WHERE tf.starts_turn AND tf.continues_context) \
+                    + COALESCE((SELECT CASE WHEN ff.continues_context THEN 0 ELSE 1 END \
+                        FROM llm_usage_events fe \
+                        JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
+                        WHERE fe.session_pk = s.id AND ff.starts_turn \
+                        ORDER BY fe.observed_at, fe.id LIMIT 1), 0) END \
              FROM llm_usage_events te \
              JOIN llm_usage_event_stream_facts tf ON tf.event_pk = te.id \
              WHERE te.session_pk = s.id)::bigint AS turns, \

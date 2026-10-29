@@ -58,12 +58,14 @@ pub(super) fn read(
     event_pk: Uuid,
     event_type: &str,
     metadata: &Value,
+    names_previous: bool,
 ) -> Result<NewStreamFacts, AppError> {
     Ok(if event_type == UsageEventType::Request.as_str() {
         let facts = RequestFacts::read(metadata);
         NewStreamFacts {
             event_pk,
             new_from: Some(facts.new_from),
+            continues_context: Some(facts.new_from > 0_i32 || names_previous),
             starts_turn: Some(facts.starts_turn),
             last_identity: facts.last_identity,
             trailing: Some(json_value(&facts.trailing, "trailing roles")?),
@@ -101,14 +103,16 @@ pub(super) fn rebuild(connection: &mut PgConnection) -> Result<(), AppError> {
                 llm_usage_events::session_pk,
                 llm_usage_events::event_type,
                 llm_usage_events::metadata,
+                llm_usage_events::previous_response_id,
             ))
-            .load::<(Uuid, Uuid, String, Value)>(connection)?;
+            .load::<(Uuid, Uuid, String, Value, Option<String>)>(connection)?;
         let Some(&(last, ..)) = page.last() else {
             break;
         };
         after = last;
-        for (event_pk, session_pk, event_type, metadata) in page {
-            if write(connection, &read(event_pk, &event_type, &metadata)?)? > 0 {
+        for (event_pk, session_pk, event_type, metadata, previous) in page {
+            let facts = read(event_pk, &event_type, &metadata, previous.is_some())?;
+            if write(connection, &facts)? > 0 {
                 changed.insert(session_pk);
             }
         }

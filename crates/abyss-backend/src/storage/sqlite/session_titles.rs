@@ -534,7 +534,7 @@ mod tests {
 
         // Return to the initial schema, including the previous search tables.
         // Reapplying facts must run its SQL and title rebuild in one transaction.
-        for version in ["20261029120000", "20261019120000"] {
+        for version in ["20261029130000", "20261029120000", "20261019120000"] {
             let reverted = database
                 .revert_last_migration(MIGRATIONS)
                 .expect("revert the facts migrations");

@@ -360,6 +360,9 @@ pub struct NewStreamFacts {
     pub parent_subagent_id: Option<String>,
     /// Turn the client declared the event works for.
     pub turn_id: Option<String>,
+    /// Request: whether it holds model output or names the response it
+    /// continues.
+    pub continues_context: Option<bool>,
 }
 
 #[derive(Insertable)]

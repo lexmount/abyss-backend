@@ -114,6 +114,15 @@ impl Exchange {
             .as_ref()
             .is_some_and(|request| request.facts.starts_turn)
     }
+
+    /// Whether the request continues a context: it holds model output (its
+    /// new part does not begin at its first entry), or it names the response
+    /// it continues, as a request that sends only what is new does.
+    pub(super) fn continues_context(&self) -> bool {
+        self.request.as_ref().is_some_and(|request| {
+            request.facts.new_from > 0_i32 || request.previous_response_id.is_some()
+        })
+    }
 }
 
 /// Pairs events into exchanges by `response_id`, ordered by request time;

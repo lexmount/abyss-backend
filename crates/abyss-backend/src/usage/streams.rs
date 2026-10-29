@@ -104,15 +104,19 @@ pub struct StreamSegment {
     pub turn: Option<i64>,
     /// Sub-agent the first exchange declares.
     pub subagent_id: Option<String>,
-    /// Head of the parent stream's segment this sub-agent segment shows
-    /// beside; only a root segment of a sub-agent is attached.
+    /// Always `None`: sub-agent segments are no longer attached to their
+    /// parent; the field stays for the response shape.
     pub attached_to: Option<String>,
-    /// How the attachment was found.
+    /// Always `None`, as `attached_to`.
     pub attached_by: Option<AttachedBy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[expect(
+    dead_code,
+    reason = "attachment is gone; the type stays for `attached_by` in the response shape"
+)]
 /// How a sub-agent's root segment was attached to a segment of its parent
 /// stream. Attachment only decides where the segment shows; it changes no
 /// base and no segment.
@@ -222,14 +226,6 @@ impl SessionStructure {
             .iter()
             .map(|segment| structure.segment(segment))
             .collect();
-        for (index, attachment) in structure.attachments().into_iter().enumerate() {
-            if let Some((target, by)) = attachment {
-                let head = structure.segment_head(target).to_owned();
-                let segment = &mut structure.segments[index];
-                segment.attached_to = Some(head);
-                segment.attached_by = Some(by);
-            }
-        }
         structure
     }
 
@@ -367,58 +363,6 @@ impl SessionStructure {
             attached_to: None,
             attached_by: None,
         }
-    }
-
-    /// Where each sub-agent root segment shows: in its parent stream, the
-    /// first segment holding a request with the same declared turn;
-    /// without a declared turn, or when no parent segment holds it, the
-    /// earliest segment whose time range holds the sub-agent's start.
-    ///
-    /// The parent stream is the segments of the declared parent sub-agent, or
-    /// those of no sub-agent when none is declared. Other segments are not
-    /// attached.
-    fn attachments(&self) -> Vec<Option<(usize, AttachedBy)>> {
-        let segments = &self.segmentation.segments;
-        let stream_of = |index: usize| self.segments[index].subagent_id.as_deref();
-        let mut by_stream: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
-        let mut by_turn: HashMap<(Option<&str>, &str), usize> = HashMap::new();
-        for (index, segment) in segments.iter().enumerate() {
-            let stream = stream_of(index);
-            by_stream.entry(stream).or_default().push(index);
-            for &exchange in &segment.exchanges {
-                if let Some(turn) = self.exchanges[exchange].turn_id.as_deref() {
-                    by_turn.entry((stream, turn)).or_insert(index);
-                }
-            }
-        }
-        self.segments
-            .iter()
-            .zip(segments)
-            .map(|(segment, members)| {
-                if segment.kind != SegmentKind::Root || segment.subagent_id.is_none() {
-                    return None;
-                }
-                let first = &self.exchanges[*members.exchanges.first()?];
-                let parent = first.parent_subagent_id.as_deref();
-                if let Some(&target) = first
-                    .turn_id
-                    .as_deref()
-                    .and_then(|turn| by_turn.get(&(parent, turn)))
-                {
-                    return Some((target, AttachedBy::Declared));
-                }
-                by_stream
-                    .get(&parent)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .find(|&target| {
-                        let target = &self.segments[target];
-                        (target.start..=target.end).contains(&segment.start)
-                    })
-                    .map(|target| (target, AttachedBy::Time))
-            })
-            .collect()
     }
 }
 
@@ -599,12 +543,10 @@ mod tests {
     }
 
     #[test]
-    fn sub_agents_attach_by_declared_turn_by_time_or_not_at_all() {
+    fn sub_agent_segments_are_grouped_by_their_declaration_and_never_attached() {
         let mut session = Session::new();
         let main = (None, None, Some("p1"));
         let a1 = (Some("a1"), None, Some("p1"));
-        // Claude Code: the main line names its prompt; a sub-agent carries its
-        // own id and the prompt that started it.
         session.declared(
             "ask",
             0,
@@ -633,177 +575,15 @@ mod tests {
             &json!([assistant("planned")]),
             main,
         );
-        // Codex: a sub-agent started by sub-agent `a1` names its parent; with
-        // no turn declared it attaches to the parent segment active when
-        // it starts.
-        session.declared(
-            "nested",
-            6,
-            &json!([user("count lines")]),
-            &json!([assistant("2")]),
-            (Some("t2"), Some("a1"), None),
-        );
-        // Nothing to attach to: starts after the main line ended, one with a
-        // declared turn no parent segment holds and one without any.
-        session.declared(
-            "stray",
-            40,
-            &json!([user("hi")]),
-            &json!([assistant("hello")]),
-            (Some("a3"), None, Some("p9")),
-        );
-        session.declared(
-            "late",
-            100,
-            &json!([user("hi")]),
-            &json!([assistant("hello")]),
-            (Some("a4"), None, None),
-        );
         let streams = sorted_streams(&session);
         assert_eq!(
             attachments(&streams),
-            [
-                ("ask", None, None, None),
-                ("agent", Some("a1"), Some("ask"), Some(AttachedBy::Declared)),
-                ("nested", Some("t2"), Some("agent"), Some(AttachedBy::Time)),
-                ("stray", Some("a3"), None, None),
-                ("late", Some("a4"), None, None),
-            ]
-        );
-        assert_eq!(streams.segments[1].exchange_count, 2);
-
-        let mut events = session.events.clone();
-        events.sort_by_key(|event| event.observed_at);
-        let run = segment_run(events, "nested").expect("a run");
-        let nested = &run.exchanges[0];
-        // Declaring no turn in a session that declares turns, it joins the
-        // turn in progress.
-        assert_eq!(
-            (
-                nested.subagent_id.as_deref(),
-                nested.parent_subagent_id.as_deref(),
-                nested.turn_id.as_deref(),
-                nested.turn,
-            ),
-            (Some("t2"), Some("a1"), Some("p1"), Some(1))
+            [("ask", None, None, None), ("agent", Some("a1"), None, None),]
         );
     }
 
     #[test]
-    fn a_declared_turn_the_parent_lacks_falls_back_to_time() {
-        let mut session = Session::new();
-        // Codex: the main line declares no turn, while its sub-agent
-        // carries the turn that started it.
-        session.exchange("main", 0, &json!([user("go")]), &json!([call("spawn")]));
-        session.exchange(
-            "main-back",
-            20,
-            &json!([user("go"), call("spawn"), result("spawn")]),
-            &json!([assistant("done")]),
-        );
-        session.declared(
-            "sub",
-            5,
-            &json!([user("look")]),
-            &json!([assistant("seen")]),
-            (Some("t1"), None, Some("turn-1")),
-        );
-        let streams = sorted_streams(&session);
-        assert_eq!(
-            attachments(&streams)[1],
-            ("sub", Some("t1"), Some("main"), Some(AttachedBy::Time))
-        );
-    }
-
-    #[test]
-    fn of_several_parent_segments_active_at_the_start_the_earliest_is_taken() {
-        let mut session = Session::new();
-        session.exchange("main", 0, &json!([user("go")]), &json!([call("m")]));
-        session.exchange(
-            "main-2",
-            10,
-            &json!([user("go"), call("m"), result("m")]),
-            &json!([assistant("ok")]),
-        );
-        session.exchange(
-            "side",
-            3,
-            &json!([user("title")]),
-            &json!([assistant("Go")]),
-        );
-        session.declared(
-            "sub",
-            3,
-            &json!([user("look")]),
-            &json!([assistant("seen")]),
-            (Some("a"), None, None),
-        );
-        let streams = sorted_streams(&session);
-        assert_eq!(streams.segments[1].head, "side");
-        assert_eq!(
-            attachments(&streams)[2],
-            ("sub", Some("a"), Some("main"), Some(AttachedBy::Time))
-        );
-    }
-
-    #[test]
-    fn only_root_segments_of_sub_agents_attach_and_attachment_changes_no_segment() {
-        let mut session = Session::new();
-        let a = (Some("a"), None, Some("p1"));
-        session.declared(
-            "ask",
-            0,
-            &json!([user("plan")]),
-            &json!([call("task")]),
-            (None, None, Some("p1")),
-        );
-        session.declared(
-            "sub",
-            1,
-            &json!([user("look")]),
-            &json!([item(assistant("seen"), "msg_1")]),
-            a,
-        );
-        // The user speaking to the sub-agent starts a new turn, which opens a
-        // turn segment; it keeps its place without attaching.
-        session.declared(
-            "sub-2",
-            2,
-            &json!([user("look"), item(assistant("seen"), "msg_1"), user("more")]),
-            &json!([assistant("more")]),
-            (Some("a"), None, Some("p2")),
-        );
-        let declared = sorted_streams(&session);
-        let mut plain = session.events.clone();
-        for event in &mut plain {
-            event.subagent_id = None;
-            event.parent_subagent_id = None;
-            event.turn_id = None;
-        }
-        plain.sort_by_key(|event| event.observed_at);
-        let plain = session_streams(Uuid::nil(), plain);
-        let shape = |streams: &SessionStreamsResponse| {
-            streams
-                .segments
-                .iter()
-                .map(|segment| (segment.head.clone(), segment.kind, segment.parent.clone()))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(shape(&declared), shape(&plain));
-        assert_eq!(
-            attachments(&declared),
-            [
-                ("ask", None, None, None),
-                ("sub", Some("a"), Some("ask"), Some(AttachedBy::Declared)),
-                ("sub-2", Some("a"), None, None),
-            ]
-        );
-        assert_eq!(declared.segments[2].kind, SegmentKind::Turn);
-        assert!(attachments(&plain).iter().all(|row| row.2.is_none()));
-    }
-
-    #[test]
-    fn segments_open_at_roots_turns_and_branches() {
+    fn a_group_s_main_line_is_one_segment_and_each_side_exchange_its_own() {
         let mut session = Session::new();
         let asked = json!([user("fix it")]);
         let done = json!([user("fix it"), call("a"), result("a")]);
@@ -819,7 +599,9 @@ mod tests {
         session.exchange("e1", 1, &asked, &json!([call("a")]));
         session.exchange("e2", 2, &done, &json!([item(assistant("done"), "msg_1")]));
         session.exchange("e3", 3, &answered, &json!([call("b")]));
-        session.exchange("e4", 4, &json!(branch), &json!([assistant("one")]));
+        // e3 is continued twice; only e4 is continued in turn, so e5, a
+        // recap whose answer nobody takes up, is a side exchange.
+        session.exchange("e4", 4, &json!(branch), &json!([call("c")]));
         session.exchange("e5", 5, &json!(branch), &json!([assistant("two")]));
         session.exchange(
             "e6",
@@ -827,6 +609,9 @@ mod tests {
             &json!([user("unrelated")]),
             &json!([assistant("ok")]),
         );
+        let mut onward = branch.clone();
+        onward.extend([call("c"), result("c")]);
+        session.exchange("e7", 7, &json!(onward), &json!([assistant("done")]));
 
         let streams = session_streams(Uuid::nil(), session.events);
         let segments = streams
@@ -845,10 +630,11 @@ mod tests {
         assert_eq!(
             segments,
             [
+                // Turn 1, then turn 2 opened by "next": e3, e4, e7.
                 ("e1", SegmentKind::Root, None, None, 2),
-                ("e3", SegmentKind::Turn, Some("e1"), Some("e2"), 1),
-                ("e4", SegmentKind::Branch, Some("e3"), Some("e3"), 1),
+                ("e3", SegmentKind::Turn, Some("e1"), Some("e2"), 3),
                 ("e5", SegmentKind::Branch, Some("e3"), Some("e3"), 1),
+                // A line of its own: nothing in it is continued.
                 ("e6", SegmentKind::Root, None, None, 1),
             ]
         );
@@ -971,11 +757,22 @@ mod tests {
             .filter_map(|event| event.turn_id.as_deref())
             .collect::<HashSet<_>>();
         if declared.is_empty() {
+            // The SQL formula: a turn-opening request that holds model output
+            // or names the response it continues, or the first turn-opening
+            // request of the session.
+            let mut opened = false;
             events
                 .iter()
-                .filter(
-                    |event| matches!(&event.facts, EventFacts::Request(facts) if facts.starts_turn),
-                )
+                .filter(|event| match &event.facts {
+                    EventFacts::Request(facts) if facts.starts_turn => {
+                        let continues =
+                            facts.new_from > 0_i32 || event.previous_response_id.is_some();
+                        let opens = continues || !opened;
+                        opened = true;
+                        opens
+                    }
+                    _ => false,
+                })
                 .count()
         } else {
             declared.len()
@@ -1132,7 +929,8 @@ mod tests {
             &json!([user("fix it"), call("a"), result("a")]),
             &json!([call("b")]),
         );
-        // A side request with user words opens its own turn.
+        // A side request with user words but no model output joins the turn
+        // in progress: a line's first request opens a turn only before any.
         session.exchange(
             "title",
             3,
@@ -1161,6 +959,10 @@ mod tests {
             &json!([item(assistant("done"), "msg_1"), user("next")]),
             &json!([assistant("ok")]),
         );
+        // Only what is new, with a pointer to the answer it follows: the
+        // context continues, so the user's words open a turn.
+        session.ask("e5", 7, Some("e4"), &json!([user("and then")]));
+        session.answer("e5", 7, &json!([assistant("done")]));
         let turns = exchange_turns(session.events.clone());
         assert_eq!(
             turns
@@ -1171,10 +973,11 @@ mod tests {
                 ("lonely", None, None),
                 ("e1", Some("e1"), Some(1)),
                 ("e2", Some("e1"), Some(1)),
-                ("title", Some("title"), Some(2)),
-                ("stray", Some("title"), Some(2)),
+                ("title", Some("e1"), Some(1)),
+                ("stray", Some("e1"), Some(1)),
                 ("e3", Some("e1"), Some(1)),
-                ("e4", Some("e4"), Some(3)),
+                ("e4", Some("e4"), Some(2)),
+                ("e5", Some("e5"), Some(3)),
             ]
         );
         let structure = SessionStructure::derive(session.events.clone());

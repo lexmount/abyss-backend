@@ -80,7 +80,17 @@ define_sql_function!(fn greatest<ST: SingleValue>(left: ST, right: ST) -> ST);
 /// group, then summed: the distinct declared `turn_id` values when the
 /// session declares any turn, else the requests that open a turn.
 const SUMMARY_AGGREGATE_SQL: &str = "\
-    WITH by_session AS ( \
+    WITH first_openers AS ( \
+        SELECT id FROM ( \
+            SELECT fe.id, ROW_NUMBER() OVER ( \
+                PARTITION BY fe.session_pk ORDER BY fe.observed_at, fe.id \
+            ) AS n \
+            FROM llm_usage_events fe \
+            JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
+            WHERE ff.starts_turn \
+        ) firsts WHERE n = 1 \
+    ), \
+    by_session AS ( \
         SELECT \
             CASE WHEN $1 THEN to_char(e.observed_at AT TIME ZONE $30, 'YYYY-MM-DD') END AS day, \
             CASE WHEN $2 THEN e.user_id END AS user_id, \
@@ -100,7 +110,8 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
                 WHERE de.session_pk = e.session_pk AND df.turn_id IS NOT NULL \
             ) AS declares_turns, \
             COUNT(DISTINCT f.turn_id)::bigint AS declared_turns, \
-            COUNT(*) FILTER (WHERE f.starts_turn)::bigint AS opened_turns, \
+            COUNT(*) FILTER (WHERE f.starts_turn \
+                AND (f.continues_context OR e.id IN first_openers))::bigint AS opened_turns, \
             COUNT(*) FILTER (WHERE e.event_type = 'request')::bigint AS requests, \
             COUNT(*) FILTER (WHERE e.event_type = 'response')::bigint AS responses, \
             COALESCE(SUM(e.input_tokens), 0)::bigint AS input_tokens, \
@@ -813,7 +824,12 @@ fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFac
         subagent_id: event.subagent_id.clone(),
         parent_subagent_id: event.parent_subagent_id.clone(),
         turn_id: event.turn_id.clone(),
-        ..super::stream_facts::read(event_pk, event.event_type.as_str(), &event.metadata)?
+        ..super::stream_facts::read(
+            event_pk,
+            event.event_type.as_str(),
+            &event.metadata,
+            event.previous_response_id.is_some(),
+        )?
     })
 }
 

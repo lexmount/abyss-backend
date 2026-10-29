@@ -21,11 +21,13 @@ impl Turns {
     ///
     /// When any exchange of the session declares a turn, an exchange with a
     /// declaration belongs to the turn it declares, and one without opens no
-    /// turn. When none does, an exchange whose request opens a turn opens one
-    /// named by the exchange's id. Any other exchange takes the turn of its
-    /// base; without a base, or with a base later in session order, it joins
-    /// the turn that most recently began before it, and belongs to no turn
-    /// when no turn began before it.
+    /// turn. When none does, an exchange whose request opens a turn and
+    /// continues a context (holds model output or names the response it
+    /// continues) opens one named by the exchange's id; one that continues
+    /// none opens a turn only when no turn began before it. Any other
+    /// exchange takes the turn of its base; without a base, or with a base
+    /// later in session order, it joins the turn that most recently began
+    /// before it, and belongs to no turn when no turn began before it.
     pub(super) fn assign(
         exchanges: &[Exchange],
         bases: &[Result<(usize, BaseRule), NoBaseReason>],
@@ -38,7 +40,12 @@ impl Turns {
             let opened = if declared {
                 exchange.turn_id.as_deref()
             } else {
-                exchange.starts_turn().then_some(exchange.id.as_str())
+                // A request that continues no context, holding no model output
+                // and naming no response, can be a sub-agent's task or a
+                // client's own request as well as the user's words: it opens a
+                // turn only before any turn began.
+                (exchange.starts_turn() && (exchange.continues_context() || ids.is_empty()))
+                    .then_some(exchange.id.as_str())
             };
             let turn = match opened {
                 Some(id) => Some(*known.entry(id).or_insert_with(|| {
