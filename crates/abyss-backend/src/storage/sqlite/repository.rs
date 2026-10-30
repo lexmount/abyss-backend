@@ -587,6 +587,7 @@ pub(super) fn stream_events(
             llm_usage_event_stream_facts::new_from.nullable(),
             llm_usage_event_stream_facts::starts_turn.nullable(),
             llm_usage_event_stream_facts::last_identity.nullable(),
+            llm_usage_event_stream_facts::previous_identity.nullable(),
             llm_usage_event_stream_facts::trailing.nullable(),
             llm_usage_event_stream_facts::result_ids.nullable(),
             llm_usage_event_stream_facts::emitted_ids.nullable(),

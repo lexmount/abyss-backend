@@ -110,6 +110,11 @@ pub struct RequestFacts {
     /// the `item:`-prefixed item id of a model-side entry, else the
     /// `text:`-prefixed text identity of an `assistant` or `reasoning` entry.
     pub last_identity: Option<String>,
+    /// The identity before `last_identity` among all of the request's
+    /// identities in order, repeats of `last_identity` skipped; none when
+    /// nothing before it has an identity or without `last_identity`. It tells
+    /// apart the emitters of an identity that more than one response emitted.
+    pub previous_identity: Option<String>,
     /// Roles of the model-side entries after the one holding
     /// `last_identity`, in order; none of them has an identity. Empty without
     /// `last_identity`.
@@ -185,6 +190,7 @@ impl RequestFacts {
             return Self {
                 new_from: 0,
                 last_identity: None,
+                previous_identity: None,
                 trailing: Vec::new(),
                 result_ids: result_ids(&entries),
                 starts_turn: starts_turn(&entries),
@@ -200,6 +206,13 @@ impl RequestFacts {
             .iter()
             .rposition(|entry| entry.identities().next().is_some());
         let last_identity = held.and_then(|held| run[held].identities().last());
+        let previous_identity = held.zip(last_identity.as_deref()).and_then(|(held, last)| {
+            entries[..=start.saturating_add(held)]
+                .iter()
+                .rev()
+                .flat_map(|entry| entry.identities().collect::<Vec<_>>().into_iter().rev())
+                .find(|identity| identity != last)
+        });
         let trailing = held.map_or_else(Vec::new, |held| {
             run[held.saturating_add(1)..]
                 .iter()
@@ -211,6 +224,7 @@ impl RequestFacts {
         Self {
             new_from: i32::try_from(new_from).unwrap_or(i32::MAX),
             last_identity,
+            previous_identity,
             trailing,
             result_ids: Vec::new(),
             starts_turn: starts_turn(&entries[new_from..]),
@@ -279,6 +293,7 @@ mod tests {
             RequestFacts {
                 new_from: 7,
                 last_identity: Some("b".to_owned()),
+                previous_identity: Some("a".to_owned()),
                 trailing: Vec::new(),
                 result_ids: Vec::new(),
                 starts_turn: false,
@@ -297,6 +312,11 @@ mod tests {
         ]))));
         assert_eq!(facts.new_from, 4_i32);
         assert_eq!(facts.last_identity, Some(said("assistant", "fixed")));
+        assert_eq!(
+            facts.previous_identity.as_deref(),
+            Some("a"),
+            "the identity before the answer, past the tool result"
+        );
         assert!(facts.trailing.is_empty());
         assert!(facts.starts_turn);
         assert!(facts.result_ids.is_empty());
@@ -309,6 +329,7 @@ mod tests {
             assistant(" \n")
         ]))));
         assert_eq!(facts.last_identity.as_deref(), Some("a"));
+        assert_eq!(facts.previous_identity, None, "nothing before the call");
         assert_eq!(facts.trailing, ["reasoning", "assistant"]);
         // Without model output, every entry is new and tool results answer
         // calls that live elsewhere.
@@ -321,6 +342,7 @@ mod tests {
             RequestFacts {
                 new_from: 0,
                 last_identity: None,
+                previous_identity: None,
                 trailing: Vec::new(),
                 result_ids: ids(&["a", "b"]),
                 starts_turn: false,
@@ -418,12 +440,22 @@ mod tests {
         ]);
         let facts = RequestFacts::read(Some(&conversation(&json!(request))));
         assert_eq!(facts.last_identity.as_deref(), Some("item:msg_2"));
+        assert_eq!(
+            facts.previous_identity.as_deref(),
+            Some("a"),
+            "the item's other entry repeats its id and is skipped"
+        );
         assert!(facts.trailing.is_empty());
         let mut request = vec![user("go")];
         request.extend(output);
         request.extend([result("a"), reasoning(), assistant("")]);
         let facts = RequestFacts::read(Some(&conversation(&json!(request))));
         assert_eq!(facts.last_identity.as_deref(), Some("a"));
+        assert_eq!(
+            facts.previous_identity.as_deref(),
+            Some("item:fc_1"),
+            "a call's item comes before its call id"
+        );
         assert_eq!(
             facts.trailing,
             ["reasoning", "assistant"],

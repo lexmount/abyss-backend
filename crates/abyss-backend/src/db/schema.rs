@@ -98,6 +98,7 @@ diesel::table! {
         parent_subagent_id -> Nullable<Text>,
         turn_id -> Nullable<Text>,
         continues_context -> Nullable<Bool>,
+        previous_identity -> Nullable<Text>,
     }
 }
 

@@ -25,21 +25,23 @@ const SESSIONS_PER_UPDATE: usize = 500;
 /// already; the ids the client declared stay as ingest stored them.
 const UPSERT: &str = "\
     INSERT INTO llm_usage_event_stream_facts AS f \
-        (event_pk, new_from, starts_turn, last_identity, trailing, result_ids, \
-         emitted_ids, output_skeleton, label_index, label_text, label_length) \
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        (event_pk, new_from, starts_turn, last_identity, previous_identity, trailing, \
+         result_ids, emitted_ids, output_skeleton, label_index, label_text, label_length) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
     ON CONFLICT (event_pk) DO UPDATE SET \
         new_from = excluded.new_from, starts_turn = excluded.starts_turn, \
-        last_identity = excluded.last_identity, trailing = excluded.trailing, \
+        last_identity = excluded.last_identity, previous_identity = excluded.previous_identity, \
+        trailing = excluded.trailing, \
         result_ids = excluded.result_ids, emitted_ids = excluded.emitted_ids, \
         output_skeleton = excluded.output_skeleton, label_index = excluded.label_index, \
         label_text = excluded.label_text, label_length = excluded.label_length \
-    WHERE (f.new_from, f.starts_turn, f.last_identity, f.trailing, f.result_ids, \
-           f.emitted_ids, f.output_skeleton, f.label_index, f.label_text, f.label_length) \
+    WHERE (f.new_from, f.starts_turn, f.last_identity, f.previous_identity, f.trailing, \
+           f.result_ids, f.emitted_ids, f.output_skeleton, f.label_index, f.label_text, \
+           f.label_length) \
         IS NOT (excluded.new_from, excluded.starts_turn, excluded.last_identity, \
-           excluded.trailing, excluded.result_ids, excluded.emitted_ids, \
-           excluded.output_skeleton, excluded.label_index, excluded.label_text, \
-           excluded.label_length)";
+           excluded.previous_identity, excluded.trailing, excluded.result_ids, \
+           excluded.emitted_ids, excluded.output_skeleton, excluded.label_index, \
+           excluded.label_text, excluded.label_length)";
 
 /// Reads the stream facts of every stored event again from its conversation,
 /// page by page inside the caller's write transaction, and bumps the
@@ -94,6 +96,7 @@ fn write(connection: &mut SqliteConnection, facts: &NewStreamFacts) -> Result<us
         .bind::<Nullable<Integer>, _>(facts.new_from)
         .bind::<Nullable<Bool>, _>(facts.starts_turn)
         .bind::<Nullable<Text>, _>(facts.last_identity.as_deref())
+        .bind::<Nullable<Text>, _>(facts.previous_identity.as_deref())
         .bind::<Nullable<Text>, _>(facts.trailing.as_deref())
         .bind::<Nullable<Text>, _>(facts.result_ids.as_deref())
         .bind::<Nullable<Text>, _>(facts.emitted_ids.as_deref())
@@ -230,17 +233,22 @@ mod tests {
         diesel::delete(llm_usage_event_stream_facts::table.find(&chat_events[3]))
             .execute(&mut database)
             .expect("missing facts");
-        for version in ["20261029140000", "20261029130000", "20261029120000"] {
-            let reverted = database
-                .revert_last_migration(MIGRATIONS)
-                .expect("revert down to the rebuild");
-            assert_eq!(reverted.to_string(), version);
-        }
         assert_eq!(
             roots(&mut database, &chat),
             2,
             "stale facts break the stream"
         );
+        for version in [
+            "20261030120000",
+            "20261029140000",
+            "20261029130000",
+            "20261029120000",
+        ] {
+            let reverted = database
+                .revert_last_migration(MIGRATIONS)
+                .expect("revert down to the rebuild");
+            assert_eq!(reverted.to_string(), version);
+        }
 
         migrations::run(&mut database).expect("rebuild");
         assert_eq!(roots(&mut database, &chat), 1);
@@ -268,5 +276,13 @@ mod tests {
         forget_the_answer(&mut database, &chat_events[1]);
         migrations::run(&mut database).expect("already rebuilt");
         assert_eq!(roots(&mut database, &chat), 2);
+
+        // A new fact read from the conversation reads them all again as well.
+        let reverted = database
+            .revert_last_migration(MIGRATIONS)
+            .expect("revert the previous identity");
+        assert_eq!(reverted.to_string(), "20261030120000");
+        migrations::run(&mut database).expect("rebuild for the new fact");
+        assert_eq!(roots(&mut database, &chat), 1);
     }
 }

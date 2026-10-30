@@ -32,21 +32,23 @@ const PAGE: i64 = 64;
 /// `trailing` is a reserved word in PostgreSQL.
 const UPSERT: &str = "\
     INSERT INTO llm_usage_event_stream_facts AS f \
-        (event_pk, new_from, starts_turn, last_identity, \"trailing\", result_ids, \
-         emitted_ids, output_skeleton, label_index, label_text, label_length) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+        (event_pk, new_from, starts_turn, last_identity, previous_identity, \"trailing\", \
+         result_ids, emitted_ids, output_skeleton, label_index, label_text, label_length) \
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
     ON CONFLICT (event_pk) DO UPDATE SET \
         new_from = EXCLUDED.new_from, starts_turn = EXCLUDED.starts_turn, \
-        last_identity = EXCLUDED.last_identity, \"trailing\" = EXCLUDED.\"trailing\", \
+        last_identity = EXCLUDED.last_identity, previous_identity = EXCLUDED.previous_identity, \
+        \"trailing\" = EXCLUDED.\"trailing\", \
         result_ids = EXCLUDED.result_ids, emitted_ids = EXCLUDED.emitted_ids, \
         output_skeleton = EXCLUDED.output_skeleton, label_index = EXCLUDED.label_index, \
         label_text = EXCLUDED.label_text, label_length = EXCLUDED.label_length \
-    WHERE (f.new_from, f.starts_turn, f.last_identity, f.\"trailing\", f.result_ids, \
-           f.emitted_ids, f.output_skeleton, f.label_index, f.label_text, f.label_length) \
+    WHERE (f.new_from, f.starts_turn, f.last_identity, f.previous_identity, f.\"trailing\", \
+           f.result_ids, f.emitted_ids, f.output_skeleton, f.label_index, f.label_text, \
+           f.label_length) \
         IS DISTINCT FROM (EXCLUDED.new_from, EXCLUDED.starts_turn, EXCLUDED.last_identity, \
-           EXCLUDED.\"trailing\", EXCLUDED.result_ids, EXCLUDED.emitted_ids, \
-           EXCLUDED.output_skeleton, EXCLUDED.label_index, EXCLUDED.label_text, \
-           EXCLUDED.label_length)";
+           EXCLUDED.previous_identity, EXCLUDED.\"trailing\", EXCLUDED.result_ids, \
+           EXCLUDED.emitted_ids, EXCLUDED.output_skeleton, EXCLUDED.label_index, \
+           EXCLUDED.label_text, EXCLUDED.label_length)";
 
 fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, AppError> {
     serde_json::to_value(value)
@@ -69,6 +71,7 @@ pub(super) fn read(
             continues_context: Some(facts.new_from > 0_i32 || names_previous),
             starts_turn: Some(facts.starts_turn),
             last_identity: facts.last_identity,
+            previous_identity: facts.previous_identity,
             trailing: Some(json_value(&facts.trailing, "trailing roles")?),
             result_ids: Some(json_value(&facts.result_ids, "result ids")?),
             label_index: facts.label.as_ref().map(|label| label.index),
@@ -133,6 +136,7 @@ fn write(connection: &mut PgConnection, facts: &NewStreamFacts) -> Result<usize,
         .bind::<Nullable<Integer>, _>(facts.new_from)
         .bind::<Nullable<Bool>, _>(facts.starts_turn)
         .bind::<Nullable<Text>, _>(facts.last_identity.as_deref())
+        .bind::<Nullable<Text>, _>(facts.previous_identity.as_deref())
         .bind::<Nullable<Jsonb>, _>(facts.trailing.as_ref())
         .bind::<Nullable<Jsonb>, _>(facts.result_ids.as_ref())
         .bind::<Nullable<Jsonb>, _>(facts.emitted_ids.as_ref())

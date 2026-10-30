@@ -57,6 +57,13 @@ startup after the upgrade, and its time is mostly spent reading metadata.
 metadata into the new column and removes it from metadata, so it rewrites the
 event table once.
 
+`20261030120000_stream_facts_previous_identity` adds the request fact
+`previous_identity`: the identity before a request's last one, which tells
+apart the responses that emitted the same last identity, such as an answer
+given word for word in every round. Only an event's conversation holds it, so
+applying this migration reads the stream facts of every stored event again in
+the same way, once; when both versions are pending, the facts are read once.
+
 Existing databases require separate handling: an already recorded migration is
 not reapplied when its source SQL changes. A database with the old turn schema
 must have its physical schema updated, including the event columns, dependent

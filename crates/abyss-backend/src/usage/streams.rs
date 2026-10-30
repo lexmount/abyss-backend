@@ -30,7 +30,7 @@ pub use self::{
     timeline::SessionTurnsResponse,
 };
 use self::{
-    base::{Exchange, emitters, find_base, group_exchanges},
+    base::{Exchange, emitters, find_bases, group_exchanges},
     segmentation::{Segment, Segmentation},
     turns::Turns,
 };
@@ -187,9 +187,7 @@ impl SessionStructure {
             .filter_map(|(index, exchange)| Some((exchange.response_id.as_deref()?, index)))
             .collect::<HashMap<_, _>>();
         let by_id = emitters(&exchanges);
-        let bases = (0..exchanges.len())
-            .map(|index| find_base(index, &exchanges, &by_response_id, &by_id))
-            .collect::<Vec<_>>();
+        let bases = find_bases(&exchanges, &by_response_id, &by_id);
         let turns = Turns::assign(&exchanges, &bases);
         let segmentation = Segmentation::cut(&exchanges, &bases, &turns);
         let summary = StreamSummary {

@@ -221,12 +221,36 @@ fn said_after(output: &[SkeletonEntry], last: &str, trailing: &[String]) -> bool
         .all(|role| said.any(|spoken| spoken == role))
 }
 
+/// The base of every exchange and the rule that found it, or why it has
+/// none: first each by [`find_base`]; then a request whose last identity
+/// more than one other exchange emitted takes the emitter that saw what the
+/// request has before that identity ([`tell_apart`]).
+pub(super) fn find_bases(
+    exchanges: &[Exchange],
+    by_response_id: &HashMap<&str, usize>,
+    by_id: &HashMap<&str, Vec<usize>>,
+) -> Vec<Result<(usize, BaseRule), NoBaseReason>> {
+    let first = (0..exchanges.len())
+        .map(|index| find_base(index, exchanges, by_response_id, by_id))
+        .collect::<Vec<_>>();
+    first
+        .iter()
+        .enumerate()
+        .map(|(index, &found)| match found {
+            Err(NoBaseReason::MultipleResponses) => {
+                tell_apart(index, exchanges, by_id, &first).unwrap_or(found)
+            }
+            found => found,
+        })
+        .collect()
+}
+
 /// The base of exchange `index` and the rule that found it: the response
 /// its pointer names; else the one other exchange that emitted its last
 /// identity, when that exchange said everything trailing it; else, without
 /// model output, the one exchange that emitted the calls its tool results
 /// answer.
-pub(super) fn find_base(
+fn find_base(
     index: usize,
     exchanges: &[Exchange],
     by_response_id: &HashMap<&str, usize>,
@@ -246,16 +270,7 @@ pub(super) fn find_base(
     let facts = &request.facts;
     if let Some(last) = facts.last_identity.as_deref() {
         let emitter = only_emitter([last], index, by_id)?;
-        let output = exchanges[emitter]
-            .response
-            .as_ref()
-            .map(|response| response.facts.output_skeleton.as_slice())
-            .unwrap_or_default();
-        return if said_after(output, last, &facts.trailing) {
-            Ok((emitter, BaseRule::LastOutput))
-        } else {
-            Err(NoBaseReason::TextOnly)
-        };
+        return continued(emitter, exchanges, last, &facts.trailing);
     }
     // The last run has model output without any identity.
     if facts.new_from > 0_i32 {
@@ -266,6 +281,80 @@ pub(super) fn find_base(
     }
     only_emitter(facts.result_ids.iter().map(String::as_str), index, by_id)
         .map(|base| (base, BaseRule::ResultsOnly))
+}
+
+/// `emitter` as the base of a request whose last identity it emitted, when
+/// it said everything trailing that identity.
+fn continued(
+    emitter: usize,
+    exchanges: &[Exchange],
+    last: &str,
+    trailing: &[String],
+) -> Result<(usize, BaseRule), NoBaseReason> {
+    let output = exchanges[emitter]
+        .response
+        .as_ref()
+        .map(|response| response.facts.output_skeleton.as_slice())
+        .unwrap_or_default();
+    if said_after(output, last, trailing) {
+        Ok((emitter, BaseRule::LastOutput))
+    } else {
+        Err(NoBaseReason::TextOnly)
+    }
+}
+
+/// For request `index`, whose last identity more than one other exchange
+/// emitted: the one emitter that, before saying it, saw what the request
+/// has before it. The context is resent as it grew, so the identity before
+/// the last one either came just before the emitter spoke or was said by
+/// the emitter itself. When one other exchange P0 emitted that identity,
+/// the emitter is P0 or an exchange whose base by [`find_base`] is P0;
+/// when nothing before the last identity has one, the emitter started
+/// without any context and said it first. None emits it: the client
+/// rewrote the context, `unknown_ids`; more than one: `multiple_responses`.
+/// `None` when the identity before the last one has no single emitter.
+fn tell_apart(
+    index: usize,
+    exchanges: &[Exchange],
+    by_id: &HashMap<&str, Vec<usize>>,
+    first: &[Result<(usize, BaseRule), NoBaseReason>],
+) -> Option<Result<(usize, BaseRule), NoBaseReason>> {
+    let facts = &exchanges[index].request.as_ref()?.facts;
+    let last = facts.last_identity.as_deref()?;
+    let before = match facts.previous_identity.as_deref() {
+        Some(previous) => Some(only_emitter([previous], index, by_id).ok()?),
+        None => None,
+    };
+    // An emitter that had no context and spoke the identity first.
+    let said_first_without_context = |emitter: usize| {
+        first[emitter] == Err(NoBaseReason::NoOutput)
+            && exchanges[emitter]
+                .request
+                .as_ref()
+                .is_some_and(|request| request.previous_response_id.is_none())
+            && exchanges[emitter]
+                .response
+                .as_ref()
+                .and_then(|response| response.facts.emitted_ids.first())
+                .is_some_and(|said| said == last)
+    };
+    let saw = |emitter: usize| {
+        before.map_or_else(
+            || said_first_without_context(emitter),
+            |before| emitter == before || matches!(first[emitter], Ok((base, _)) if base == before),
+        )
+    };
+    let mut kept = by_id
+        .get(last)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|&emitter| emitter != index && saw(emitter));
+    Some(match (kept.next(), kept.next()) {
+        (Some(emitter), None) => continued(emitter, exchanges, last, &facts.trailing),
+        (None, _) => Err(NoBaseReason::UnknownIds),
+        (Some(_), Some(_)) => Err(NoBaseReason::MultipleResponses),
+    })
 }
 
 #[cfg(test)]
@@ -409,7 +498,7 @@ mod tests {
                 Err(NoBaseReason::UnknownIds),
             ),
             (
-                "an answer two replies said",
+                "an answer two replies said, both without context",
                 vec![json!([assistant("ok")]), json!([assistant("ok")])],
                 json!([user("go"), assistant("ok"), user("more")]),
                 Err(NoBaseReason::MultipleResponses),
@@ -418,6 +507,86 @@ mod tests {
         for (case, outputs, request, expected) in cases {
             assert_eq!(base_after(&outputs, &request), expected, "{case}");
         }
+    }
+
+    #[test]
+    fn a_repeated_answer_is_told_apart_by_what_came_before_it() {
+        // /loop: every round runs the check and answers the same words.
+        let mut session = Session::new();
+        let mut history = vec![user("check")];
+        for (round, call_id) in ["1", "2"].into_iter().enumerate() {
+            let second = i64::try_from(round).expect("small").saturating_mul(10);
+            session.exchange(
+                &format!("run{call_id}"),
+                second.saturating_add(1),
+                &json!(history),
+                &json!([call(call_id)]),
+            );
+            history.extend([call(call_id), result(call_id)]);
+            session.exchange(
+                &format!("said{call_id}"),
+                second.saturating_add(2),
+                &json!(history),
+                &json!([assistant("no change")]),
+            );
+            history.extend([assistant("no change"), user("check")]);
+        }
+        session.ask("next", 30, None, &json!(history));
+        // The second round began after the first answer, which a later
+        // round said as well.
+        assert_eq!(session.base("run2"), Ok(linked("said1")));
+        assert_eq!(session.base("next"), Ok(linked("said2")));
+
+        // The same words after thinking only one reply signed.
+        let mut session = Session::new();
+        for (second, signature) in [(1, "sig1"), (2, "sig2")] {
+            session.exchange(
+                signature,
+                second,
+                &json!([user("go")]),
+                &json!([item(reasoning(), signature), assistant("same")]),
+            );
+        }
+        session.ask(
+            "next",
+            3,
+            None,
+            &json!([
+                user("go"),
+                item(reasoning(), "sig1"),
+                assistant("same"),
+                user("more")
+            ]),
+        );
+        assert_eq!(session.base("next"), Ok(linked("sig1")));
+    }
+
+    #[test]
+    fn a_repeated_answer_with_nothing_before_it_was_said_without_context() {
+        let mut session = Session::new();
+        session.exchange("fresh", 1, &json!([user("hi")]), &json!([assistant("ok")]));
+        session.exchange("look", 2, &json!([user("go")]), &json!([call("c1")]));
+        let looked = [user("go"), call("c1"), result("c1")];
+        session.exchange("found", 3, &json!(looked), &json!([assistant("ok")]));
+        session.exchange("found_too", 4, &json!(looked), &json!([assistant("fine")]));
+        session.exchange("again", 5, &json!(looked), &json!([assistant("fine")]));
+        // Only the reply that spoke first without any context fits.
+        session.ask(
+            "next",
+            6,
+            None,
+            &json!([user("hi"), assistant("ok"), user("more")]),
+        );
+        // A summary followed by the last answer, as compaction rebuilds a
+        // context: no reply said it without context.
+        session.ask(
+            "compacted",
+            7,
+            None,
+            &json!([user("summary"), assistant("fine"), user("more")]),
+        );
+        assert_eq!(session.base("next"), Ok(linked("fresh")));
+        assert_eq!(session.base("compacted"), Err(NoBaseReason::UnknownIds));
     }
 
     #[test]

@@ -528,6 +528,7 @@ mod tests {
         // Return to the initial schema, including the previous search tables.
         // Reapplying facts must run its SQL and title rebuild in one transaction.
         for version in [
+            "20261030120000",
             "20261029140000",
             "20261029130000",
             "20261029120000",

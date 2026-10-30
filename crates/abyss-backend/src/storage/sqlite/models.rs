@@ -155,6 +155,7 @@ pub(super) struct NewStreamFacts {
     pub(super) parent_subagent_id: Option<String>,
     pub(super) turn_id: Option<String>,
     pub(super) continues_context: Option<bool>,
+    pub(super) previous_identity: Option<String>,
 }
 
 impl NewStreamFacts {
@@ -186,6 +187,7 @@ impl NewStreamFacts {
             continues_context: Some(facts.new_from > 0_i32 || names_previous),
             starts_turn: Some(facts.starts_turn),
             last_identity: facts.last_identity.clone(),
+            previous_identity: facts.previous_identity.clone(),
             trailing: Some(json_text(&facts.trailing, "trailing roles")?),
             result_ids: Some(json_text(&facts.result_ids, "result ids")?),
             label_index: facts.label.as_ref().map(|label| label.index),
@@ -219,6 +221,7 @@ pub(super) struct StreamEventRow {
     pub(super) new_from: Option<i32>,
     pub(super) starts_turn: Option<bool>,
     pub(super) last_identity: Option<String>,
+    pub(super) previous_identity: Option<String>,
     pub(super) trailing: Option<String>,
     pub(super) result_ids: Option<String>,
     pub(super) emitted_ids: Option<String>,
@@ -238,6 +241,7 @@ impl StreamEventRow {
                 new_from: self.new_from.unwrap_or_default(),
                 starts_turn: self.starts_turn.unwrap_or_default(),
                 last_identity: self.last_identity,
+                previous_identity: self.previous_identity,
                 trailing: json_list(self.trailing.as_deref(), "trailing roles")?,
                 result_ids: json_list(self.result_ids.as_deref(), "result ids")?,
                 label: Label::from_columns(self.label_index, self.label_text, self.label_length),

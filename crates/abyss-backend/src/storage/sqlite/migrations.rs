@@ -19,7 +19,8 @@ pub(super) fn run(connection: &mut SqliteConnection) -> Result<(), AppError> {
         if applied("20261019120000") {
             super::session_titles::rebuild(connection)?;
         }
-        if applied("20261029120000") {
+        // Facts read differently, or a new fact only the conversation holds.
+        if applied("20261029120000") || applied("20261030120000") {
             super::stream_facts::rebuild(connection)?;
         }
         Ok(())
@@ -99,10 +100,12 @@ mod tests {
         );
 
         // The previous schema kept the conversation in metadata.
-        let reverted = database
-            .revert_last_migration(MIGRATIONS)
-            .expect("revert the move");
-        assert_eq!(reverted.to_string(), "20261029140000");
+        for version in ["20261030120000", "20261029140000"] {
+            let reverted = database
+                .revert_last_migration(MIGRATIONS)
+                .expect("revert the move");
+            assert_eq!(reverted.to_string(), version);
+        }
         let metadata = sql_query(
             "SELECT metadata, NULL AS conversation FROM llm_usage_events ORDER BY event_id",
         )

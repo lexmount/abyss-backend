@@ -19,7 +19,8 @@ pub(super) fn run(connection: &mut PgConnection) -> Result<(), AppError> {
         if applied("20261019120000") {
             super::session_titles::rebuild(connection)?;
         }
-        if applied("20261029120000") {
+        // Facts read differently, or a new fact only the conversation holds.
+        if applied("20261029120000") || applied("20261030120000") {
             super::stream_facts::rebuild(connection)?;
         }
         Ok(())

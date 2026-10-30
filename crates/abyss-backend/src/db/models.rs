@@ -310,6 +310,8 @@ pub struct StreamEventRow {
     pub starts_turn: Option<bool>,
     /// Request: last identity of the last run.
     pub last_identity: Option<String>,
+    /// Request: the identity before the last one.
+    pub previous_identity: Option<String>,
     /// Request: roles of the model-side entries after it.
     pub trailing: Option<Value>,
     /// Request without model output: call ids of its tool results.
@@ -344,6 +346,8 @@ pub struct NewStreamFacts {
     pub starts_turn: Option<bool>,
     /// Request: last identity of the last run.
     pub last_identity: Option<String>,
+    /// Request: the identity before the last one.
+    pub previous_identity: Option<String>,
     /// Request: roles of the model-side entries after it.
     pub trailing: Option<Value>,
     /// Request without model output: call ids of its tool results.
