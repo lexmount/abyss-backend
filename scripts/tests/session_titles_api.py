@@ -8,19 +8,17 @@ from blackbox_api import event, request, require, require_status, token_usage
 
 
 PROMPT = "Draw a pelican riding a bicycle"
-CODEX_NAMING = "Generate a concise, single-line task title\nUser prompt:\n" + PROMPT
+INSTRUCTION = "Generate a concise, single-line task title\nUser prompt:\n" + PROMPT
 
 
 def run_title_contract(base_url: str, token: str, run_id: str) -> None:
-    def make(session, kind, text, *, naming_thread=False, agent="codex", metadata=None):
+    def make(session, kind, text, *, agent="codex"):
         value = event(str(uuid.uuid4()), f"{run_id}-{session}", kind, text, token_usage(), run_id)
         value.pop("attachments", None)
         value["agent"]["name"] = agent
         value["device"]["host_name"] = f"title-contract-{run_id}"
         value["observed_at"] = "2026-09-30T00:00:01Z" if kind == "request" else "2026-09-30T00:00:02Z"
-        value["metadata"] = dict(metadata or {})
-        if naming_thread:
-            value["naming_thread"] = True
+        value["metadata"] = {}
         if kind == "request":
             value["conversation"] = {
                 "entries": [{"role": "user", "text": text}], "completeness": "complete",
@@ -46,41 +44,16 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
         require(header.json()["title"] == value["title"], "header and list share one title")
         return value
 
-    # Historical collector-generated titles cannot override user input,
-    # regardless of delivery order.
-    naming = {"purpose": "session_title"}
-    for name, title_first in [("claude", False), ("claude-late-input", True)]:
-        events = [
-            make(name, "request", "fix the build", agent="claude-code"),
-            make(name, "request", "<session>fix the build</session>", agent="claude-code", metadata=naming),
-            make(name, "response", '{"title":"Build fix"}', agent="claude-code",
-                 metadata={**naming, "session_title": "Build fix"}),
-        ]
-        events[1]["observed_at"] = "2026-09-30T00:00:02Z"
-        if title_first:
-            events.reverse()
-        for value in events:
-            ingest(value)
-        value = session(name)
-        require(value["title"]["text"] == "fix the build", f"{name}: the earliest request label names the session")
-        require(value["purpose"] is None, f"{name}: a session naming itself is not a title thread")
-
-    # Old naming flags do not change the common title rule.
-    ingest(make("naming", "request", CODEX_NAMING, naming_thread=True),
-           make("naming", "response", '{"title":"Draw a pelican"}', naming_thread=True))
-    value = session("naming")
-    require(value["purpose"] is None, "old naming flags do not classify sessions")
-    require(value["title"]["text"] == CODEX_NAMING[:50], "naming requests use their earliest request label")
     ingest(make("task", "request", PROMPT))
-    require(session("task")["title"]["text"] == PROMPT, "Codex tasks keep their earliest request label")
+    require(session("task")["title"]["text"] == PROMPT, "a session takes its earliest request label")
 
     # Instruction text and title-shaped replies never name a session by themselves.
     for agent, name in [("claude-code", "quoted-claude"), ("cursor", "generic-codex")]:
-        ingest(make(name, "request", CODEX_NAMING, agent=agent),
+        ingest(make(name, "request", INSTRUCTION, agent=agent),
                make(name, "response", '{"title":"Build fix"}', agent=agent))
         value = session(name)
-        require(value["title"]["text"] == CODEX_NAMING[:50], f"{agent}/{name} keeps its first input")
-        require(value["purpose"] is None, f"{agent}/{name} is not a title thread")
+        require(value["title"]["text"] == INSTRUCTION[:50], f"{agent}/{name} keeps its first input")
+        require(value["purpose"] is None, f"{agent}/{name} has no purpose")
 
     first = make("default", "request", "  修复\n登录问题 " + "好" * 90, agent="cursor")
     ingest(first)

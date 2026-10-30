@@ -42,7 +42,7 @@ use super::{
     session_titles,
 };
 
-pub(super) use self::index::{backfill, index_event};
+pub(super) use self::index::index_event;
 
 pub(super) fn session_search(
     connection: &mut SqliteConnection,

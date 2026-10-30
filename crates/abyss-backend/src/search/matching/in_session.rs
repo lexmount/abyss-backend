@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn names_only_the_texts_of_the_returned_hits() {
         let response = InSessionSearchResponse::from_hits(
-            "aether".to_owned(),
+            "nimbus".to_owned(),
             vec![hit(12), hit(3), hit(12)],
             HashMap::from([
                 (3, vec![[0, 6]]),
@@ -89,7 +89,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&response).expect("serializes"),
             json!({
-                "query": "aether",
+                "query": "nimbus",
                 "texts": [{"id": 3_i64, "ranges": [[0_i64, 6_i64]]}, {"id": 12_i64, "ranges": [[3_i64, 9_i64], [40_i64, 46_i64]]}],
                 "hits": [
                     {"event_pk": Uuid::from_u128(1), "entry_index": 0_i64, "field": "text", "new": true, "text_id": 12_i64, "segment": "e1"},

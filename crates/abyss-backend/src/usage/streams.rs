@@ -747,8 +747,9 @@ mod tests {
             .collect()
     }
 
-    /// TURN-DESIGN 第三节: distinct declared turns when any event declares
-    /// one, else the requests that open a turn; read from events alone.
+    /// A session's turn count: its distinct declared turns when any event
+    /// declares one, else the requests that open a turn; read from events
+    /// alone.
     fn counted_turns(events: &[StreamEvent]) -> usize {
         let declared = events
             .iter()

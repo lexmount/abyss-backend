@@ -17,24 +17,22 @@ and search.
 - Health and storage-readiness probes.
 - Embedded migrations for both supported storage profiles.
 
-Every session view uses the same stored title: the first nonempty `user` entry
-of the earliest readable request, ordered by observation time and event primary
-key. Whitespace is collapsed to one line. The title is at most 80 Unicode scalar
-values; longer input becomes its first 79 characters plus `…`. Empty or
-incomplete conversations provide no title, and later delivery of an earlier
-request corrects it. Collector-generated titles and naming flags do not change
-this rule. Stream segment labels retain their separate role of showing the new
-user text of that segment; they do not name sessions.
+Every session view uses the same title: the label of the session's earliest
+request, ordered by observation time and event primary key, even when that
+request has no label. A request's label is the last `user` entry with text in
+the request's new part, as `{"event_pk", "entry_index", "text", "length"}`:
+`text` is the entry's text cut to its first 50 UTF-16 code units, unformatted,
+and `length` is the whole text's length in UTF-16 code units. A session whose
+earliest request has no label has a `null` title, and later delivery of an
+earlier request corrects it. A segment label is the label of the segment's first
+request; it does not name the session.
 
-The session header's `title` is a string or `null`, just like the session list
-and legacy session APIs. Upgrade the dashboard alongside the backend.
-
-`20261014150000_initial_schema` defines sessions with `structure_revision` and
-omits the retired turn hierarchy. `20261030130000_event_conversation_and_stream_facts`
-adds the event `conversation` column and the stream facts table, and in SQLite
-replaces the FTS5 projection with the search text tables. Neither migration
-moves or rebuilds stored data: databases created by earlier releases are not
-upgraded and must be recreated.
+`20261014150000_initial_schema` creates the owner, device, session, event,
+attachment, diagnostic, and session title tables, and in PostgreSQL the search
+outbox. `20261030130000_event_conversation_and_stream_facts` adds the event
+`conversation` column and the stream facts table, and in SQLite the search text
+tables. Neither migration moves or rebuilds stored data: databases created by
+earlier releases are not upgraded and must be recreated.
 
 Exactly one storage profile is compiled into a binary:
 
@@ -70,9 +68,8 @@ cargo run --locked --package abyss-backend \
 ```
 
 The backend creates the parent directory, database, schema, and search index
-on startup. After its migrations it indexes, once and in logged batches, the
-stored events the search index does not cover yet. A `sqlite://` prefix is
-also accepted, for example `sqlite://./data/abyss.sqlite`.
+on startup. A `sqlite://` prefix is also accepted, for example
+`sqlite://./data/abyss.sqlite`.
 
 ## Run with PostgreSQL
 
@@ -107,9 +104,12 @@ curl \
 | `GET` | `/readyz` | Selected storage readiness. |
 | `POST` | `/v1/agent-usage/events` | Ingest events and correlated diagnostic captures. |
 | `GET` | `/v1/agent-usage/events` | Query raw events. |
+| `GET` | `/v1/agent-usage/events/{event_pk}` | Read one event. |
+| `GET` | `/v1/agent-usage/events/{event_pk}/conversation` | Read one event's conversation, all of it or the asked entries. |
 | `GET` | `/v1/agent-usage/events/{event_pk}/location` | Resolve an event to its current session, segment, and exchange. |
 | `GET` | `/v1/agent-usage/attachments/{id}` | Download stored image content. |
 | `GET` | `/v1/agent-usage/summary` | Aggregate event and token usage. |
+| `GET` | `/v1/agent-usage/sessions` | List sessions with their titles, counts, and token totals. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/header` | Session title, counts, and token totals. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/streams` | Read the session’s derived segments. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/turns` | One node per turn: its executors' main-line and side segments. |
@@ -118,19 +118,12 @@ curl \
 | `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite. |
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session (SQLite). |
 
-The retired session timeline, outline, and trajectory endpoints have been removed.
-Events and search matches no longer carry `turn_pk` or `turn_index`, and raw
-queries no longer filter on a stored turn number. A turn is one user input and
-all the work it causes; the backend reads only the `turn_id` an event declares.
-Turn counts (session list, summary `turns`, header `turn_count`) are, per
-session, the number of distinct `turn_id` values when the session declares any,
-else the number of requests whose persisted `starts_turn` fact is true; a
-summary row applies the same rule to the events of its group. The initial schema now omits the old turn hierarchy
-and its event columns and includes the session revision that advances when
-ingestion adds an event. Event IDs, content, attachments, stream facts, and
-search references retain their roles. Existing databases need the explicit
-schema and title maintenance described above; there is no automatic standalone
-turn-removal migration.
+A turn is one user input and all the work it causes; the backend reads only
+the `turn_id` an event declares. Turn counts (session list, summary `turns`,
+header `turn_count`) are, per session, the number of distinct `turn_id` values
+when the session declares any, else the number of requests whose persisted
+`starts_turn` fact is true; a summary row applies the same rule to the events
+of its group.
 
 Every `/v1/agent-usage/*` endpoint requires the bearer token. Health and
 readiness endpoints are unauthenticated for orchestrator probes.

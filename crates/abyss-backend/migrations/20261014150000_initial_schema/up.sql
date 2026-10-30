@@ -69,8 +69,6 @@ CREATE TABLE llm_usage_events (
     llm_provider text NOT NULL,
     llm_model text NOT NULL,
     event_type text NOT NULL CHECK (event_type IN ('request', 'response')),
-    text text,
-    text_sha256 bytea,
     input_tokens bigint NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
     output_tokens bigint NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
     cache_read_tokens bigint NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
@@ -176,11 +174,10 @@ CREATE INDEX search_outbox_pending_idx
     ON search_outbox (available_at, id)
     WHERE processed_at IS NULL AND dead_lettered_at IS NULL;
 
-
 -- Session titles register the earliest request by observation time and event
 -- primary key, including requests without a label. Readers join that event's
--- existing stream facts for its label; the historical title string is unused.
--- purpose and parent_session_pk remain nullable historical columns.
+-- stream facts for its label rather than the title column. purpose and
+-- parent_session_pk are separate session metadata.
 CREATE TABLE session_titles (
     session_pk uuid PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,

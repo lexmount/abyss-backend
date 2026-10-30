@@ -1,7 +1,7 @@
 //! HTTP boundary for standalone Agent event ingestion and queries.
 //!
 //! The health endpoints are public, while every event, attachment, summary,
-//! timeline, and search endpoint authenticates the deployment bearer token.
+//! session, and search endpoint authenticates the deployment bearer token.
 //! Storage implementation details remain behind the configured backend trait.
 
 use axum::{

@@ -159,8 +159,6 @@ mod tests {
             llm_provider: "openai".to_owned(),
             llm_model: "gpt-5".to_owned(),
             event_type: "request".to_owned(),
-            text: None,
-            text_sha256: None,
             input_tokens: 1,
             output_tokens: 0,
             cache_read_tokens: 0,

@@ -61,8 +61,6 @@ CREATE TABLE llm_usage_events (
     llm_provider TEXT NOT NULL,
     llm_model TEXT NOT NULL,
     event_type TEXT NOT NULL CHECK (event_type IN ('request', 'response')),
-    text TEXT,
-    text_sha256 BLOB,
     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
     output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
     cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
@@ -137,21 +135,9 @@ CREATE TABLE agent_diagnostic_capture_events (
 CREATE INDEX agent_diagnostic_capture_events_event_idx
     ON agent_diagnostic_capture_events (event_pk);
 
-CREATE VIRTUAL TABLE usage_events_fts USING fts5(
-    event_pk UNINDEXED,
-    user_id UNINDEXED,
-    session_pk UNINDEXED,
-    session_id,
-    content,
-    tool_names,
-    tool_content,
-    tokenize = 'unicode61'
-);
-
-
 -- The earliest request is the title anchor, including requests without a label.
--- API titles read this event's existing stream facts; the historical title
--- string is unused. purpose and parent_session_pk remain separate metadata.
+-- API titles read this event's stream facts rather than the title column.
+-- purpose and parent_session_pk are separate session metadata.
 CREATE TABLE session_titles (
     session_pk TEXT PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -163,11 +149,11 @@ CREATE TABLE session_titles (
     updated_at INTEGER NOT NULL
 ) STRICT;
 
--- Event rows hold each event's conversation in metadata, tens of kilobytes,
--- so a leaf page holds about one row and reading any column from the row
--- reads a page per event. These indexes carry every column the usage summary
--- and the session list read, letting both answer from the index alone; the
--- summary joins stream facts by id.
+-- Event rows hold each event's conversation, tens of kilobytes, so a leaf
+-- page holds about one row and reading any column from the row reads a page
+-- per event. These indexes carry every column the usage summary and the
+-- session list read, letting both answer from the index alone; the summary
+-- joins stream facts by id.
 CREATE INDEX llm_usage_events_summary_cover_idx
     ON llm_usage_events (
         user_id, observed_at, agent_name, llm_provider, llm_model, event_type,

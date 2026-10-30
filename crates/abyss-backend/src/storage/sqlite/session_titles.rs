@@ -183,7 +183,7 @@ mod tests {
 
     /// A request whose collector conversation holds one user entry.
     fn request(agent: &str, session: &str, id: &str, at: &str, input: &str) -> Value {
-        let mut request = event(agent, session, id, at, "request", json!({}));
+        let mut request = event(agent, session, id, at, "request");
         request["conversation"] = json!({
             "entries": [{"role": "user", "text": input}],
             "completeness": "complete"
@@ -191,20 +191,8 @@ mod tests {
         request
     }
 
-    /// The response of a naming call, carrying the collector's title.
-    fn titled_response(session: &str, id: &str, at: &str, title: &str) -> Value {
-        event(
-            "claude-code",
-            session,
-            id,
-            at,
-            "response",
-            json!({"purpose": "session_title", "session_title": title}),
-        )
-    }
-
-    fn event(agent: &str, session: &str, id: &str, at: &str, kind: &str, metadata: Value) -> Value {
-        let mut event = json!({
+    fn event(agent: &str, session: &str, id: &str, at: &str, kind: &str) -> Value {
+        json!({
             "event_id": id,
             "observed_at": at,
             "device": {"host_name": "local", "platform": "macos"},
@@ -213,9 +201,7 @@ mod tests {
             "llm": {"provider": "anthropic", "model": "claude-haiku"},
             "event_type": kind,
             "token_usage": {"input_tokens": 0_i64, "output_tokens": 1_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 1_i64}
-        });
-        event["metadata"] = metadata;
-        event
+        })
     }
 
     fn ingest(database: &mut SqliteConnection, events: &[Value]) {
@@ -239,83 +225,25 @@ mod tests {
     }
 
     #[test]
-    fn names_a_session_from_user_input_and_ignores_collector_titles() {
-        let mut database = database();
-        let mut naming = request(
-            "claude-code",
-            "cc",
-            "r2",
-            "2026-09-30T00:00:02Z",
-            "<session>fix the build</session>",
-        );
-        naming["metadata"]["purpose"] = json!("session_title");
-        ingest(
-            &mut database,
-            &[
-                request(
-                    "claude-code",
-                    "cc",
-                    "r1",
-                    "2026-09-30T00:00:00Z",
-                    "fix the build",
-                ),
-                naming,
-                titled_response("cc", "s2", "2026-09-30T00:00:03Z", "Build fix"),
-            ],
-        );
-
-        assert_eq!(
-            session_title(&mut database, "cc"),
-            (Some("fix the build".to_owned()), None)
-        );
-    }
-
-    #[test]
-    fn collector_titles_are_ignored_in_any_arrival_order() {
-        for title_first in [false, true] {
-            let mut database = database();
-            let mut events = vec![
-                request(
-                    "claude-code",
-                    "cc",
-                    "r1",
-                    "2026-09-30T00:00:00Z",
-                    "fix the build",
-                ),
-                titled_response("cc", "s1", "2026-09-30T00:00:03Z", "Build fix"),
-            ];
-            // The user input remains authoritative even when a title response arrives first.
-            if title_first {
-                events.reverse();
-            }
-            for value in events {
-                ingest(&mut database, &[value]);
-            }
-            assert_eq!(
-                session_title(&mut database, "cc").0.as_deref(),
-                Some("fix the build"),
-                "title first: {title_first}"
-            );
-        }
-    }
-
-    #[test]
     fn responses_without_user_requests_have_no_title() {
         let mut database = database();
-        ingest(
-            &mut database,
-            &[titled_response(
-                "cc",
-                "s1",
-                "2026-09-30T01:00:01Z",
-                "Generated title",
-            )],
+        let mut reply = event(
+            "claude-code",
+            "cc",
+            "s1",
+            "2026-09-30T01:00:01Z",
+            "response",
         );
+        reply["conversation"] = json!({
+            "entries": [{"role": "assistant", "text": "Generated title"}],
+            "completeness": "complete"
+        });
+        ingest(&mut database, &[reply]);
         assert_eq!(session_title(&mut database, "cc"), (None, None));
     }
 
     #[test]
-    fn title_like_replies_without_the_collector_field_are_ordinary_output() {
+    fn title_like_replies_do_not_name_a_session() {
         let mut database = database();
         let mut reply = event(
             "claude-code",
@@ -323,13 +251,11 @@ mod tests {
             "s1",
             "2026-09-30T00:00:01Z",
             "response",
-            json!({}),
         );
         reply["conversation"] = json!({
             "entries": [{"role": "assistant", "text": "{\"title\":\"Quoted\"}"}],
             "completeness": "complete"
         });
-        reply["text"] = json!("{\"title\":\"Quoted\"}");
         ingest(
             &mut database,
             &[
@@ -386,52 +312,5 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn old_naming_flags_do_not_change_the_first_request_label_rule() {
-        let mut database = database();
-        let mut naming = request(
-            "codex",
-            "title-thread",
-            "n1",
-            "2026-09-30T00:00:01Z",
-            "Generate a concise, single-line task title.\nUser prompt:\n画一只鹈鹕",
-        );
-        naming["naming_thread"] = json!(true);
-        let task = request(
-            "codex",
-            "task",
-            "t1",
-            "2026-09-30T00:00:00Z",
-            "<environment_context>…",
-        );
-        ingest(
-            &mut database,
-            &[
-                task,
-                naming,
-                event(
-                    "codex",
-                    "title-thread",
-                    "n2",
-                    "2026-09-30T00:00:02Z",
-                    "response",
-                    json!({}),
-                ),
-            ],
-        );
-
-        assert_eq!(
-            session_title(&mut database, "task").0.as_deref(),
-            Some("<environment_context>…")
-        );
-        assert_eq!(
-            session_title(&mut database, "title-thread"),
-            (
-                Some("Generate a concise, single-line task title.\nUser p".to_owned()),
-                None
-            )
-        );
     }
 }

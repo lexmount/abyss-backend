@@ -132,8 +132,8 @@ mod tests {
             "a double quote is written twice inside the string"
         );
         assert_eq!(
-            Pattern::new("新起一条流").trigram_expression().as_deref(),
-            Some(r#""新起一" AND "起一条" AND "一条流""#)
+            Pattern::new("开始新任务").trigram_expression().as_deref(),
+            Some(r#""开始新" AND "始新任" AND "新任务""#)
         );
         assert_eq!(
             Pattern::new("a b").trigram_expression().as_deref(),
@@ -190,8 +190,8 @@ mod tests {
 
     #[test]
     fn utf16_ranges_count_astral_characters_twice() {
-        let text = "😀 aether 😀AETHER";
-        let ranges = Pattern::new("aether").occurrences(text);
+        let text = "😀 nimbus 😀NIMBUS";
+        let ranges = Pattern::new("nimbus").occurrences(text);
         assert_eq!(ranges, [2..8, 10..16]);
         let utf16 = utf16_ranges(text, &ranges);
         assert_eq!(utf16, [[3, 9], [12, 18]]);
@@ -201,7 +201,7 @@ mod tests {
                 String::from_utf16(&units[start..end])
                     .expect("ranges fall on character boundaries")
                     .to_lowercase(),
-                "aether"
+                "nimbus"
             );
         }
         assert_eq!(

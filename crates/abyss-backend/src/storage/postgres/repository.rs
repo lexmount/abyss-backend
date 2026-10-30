@@ -19,8 +19,7 @@ use diesel::{
     result::OptionalExtension,
     sql_query,
     sql_types::{
-        Array, BigInt, Bool, Bytea, Jsonb, Nullable, SingleValue, Text, Timestamptz,
-        Uuid as SqlUuid,
+        Array, BigInt, Bool, Jsonb, Nullable, SingleValue, Text, Timestamptz, Uuid as SqlUuid,
     },
     upsert::excluded,
 };
@@ -1142,8 +1141,6 @@ fn load_filtered_events(
             llm_usage_events::llm_provider,
             llm_usage_events::llm_model,
             llm_usage_events::event_type,
-            None::<String>.into_sql::<Nullable<Text>>(),
-            None::<Vec<u8>>.into_sql::<Nullable<Bytea>>(),
             llm_usage_events::input_tokens,
             llm_usage_events::output_tokens,
             llm_usage_events::cache_read_tokens,
@@ -2022,8 +2019,6 @@ mod tests {
             llm_provider: "openai".to_owned(),
             llm_model: "gpt-5.5".to_owned(),
             event_type: event_type.to_owned(),
-            text: None,
-            text_sha256: None,
             input_tokens,
             output_tokens,
             cache_read_tokens: 0_i64,

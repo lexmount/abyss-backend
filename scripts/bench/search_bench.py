@@ -7,25 +7,21 @@ median warm latency, the session total, and a hash of the canonical response
 body so two runs can be compared for identical results.
 
     python3 scripts/bench/search_bench.py \
-        --base-url http://127.0.0.1:53792 --token-file run/token \
+        --base-url http://127.0.0.1:8080 --token-file run/token \
         --out run/baseline.json
     python3 scripts/bench/search_bench.py --compare run/baseline.json run/after.json
-
---phases DB times the three SQL phases of the original implementation with
-Python's sqlite3 against a database copy, to attribute where time goes.
 """
 
 import argparse
 import hashlib
 import json
-import sqlite3
 import statistics
 import sys
 import time
 import urllib.parse
 import urllib.request
 
-# Terms chosen from real records: hit counts range from none to ~24k events.
+# Terms range from matching nothing to matching most events.
 QUERIES = [
     {"name": "missing", "q": "qqvvxxnone7"},
     {"name": "rare", "q": "bm25"},
@@ -36,7 +32,7 @@ QUERIES = [
     {"name": "common_dashboard", "q": "dashboard"},
     {"name": "very_common_the", "q": "the"},
     {"name": "and_two_terms", "q": "cargo sqlite"},
-    {"name": "and_three_terms", "q": "git status worktree"},
+    {"name": "and_three_terms", "q": "git status branch"},
     {"name": "entry_page2", "q": "entry", "page": 2},
     {"name": "entry_page5", "q": "entry", "page": 5},
     {"name": "entry_page_size50", "q": "entry", "page_size": 50},
@@ -112,30 +108,6 @@ def compare(before_path, after_path):
         print(f"{name:20} {old['median_s']:8.3f}s {new['median_s']:8.3f}s {speedup:7.1f}x  {same}")
 
 
-def phases(db_path, term):
-    """Times the original three SQL phases for one term."""
-    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    user_id = db.execute("SELECT id FROM app_users LIMIT 1").fetchone()[0]
-    match = " AND ".join('"' + part.replace('"', '""') + '"' for part in term.split())
-    source = ("FROM usage_events_fts INNER JOIN llm_usage_events e ON e.id = usage_events_fts.event_pk "
-              "WHERE usage_events_fts MATCH ? AND e.user_id = ?")
-
-    def timed(label, sql, params):
-        started = time.perf_counter()
-        rows = db.execute(sql, params).fetchall()
-        print(f"{label:34} {time.perf_counter() - started:7.3f}s  rows {len(rows)}")
-        return rows
-
-    timed("count sessions", f"SELECT COUNT(DISTINCT e.session_pk) {source}", (match, user_id))
-    rows = timed("all matches, ordered", f"SELECT e.session_pk {source} ORDER BY bm25(usage_events_fts), "
-                 "e.observed_at DESC, e.session_pk", (match, user_id))
-    page = list(dict.fromkeys(row[0] for row in rows))[:20]
-    marks = ",".join("?" * len(page))
-    snippets = ", ".join(f"snippet(usage_events_fts, {column}, '[', ']', '…', 32)" for column in (4, 7, 8, 5, 6))
-    timed("page matches with snippets", f"SELECT e.id, {snippets} {source} AND e.session_pk IN ({marks}) "
-          "ORDER BY bm25(usage_events_fts), e.observed_at DESC, e.id", (match, user_id, *page))
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-url")
@@ -143,17 +115,13 @@ def main():
     parser.add_argument("--out")
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"))
-    parser.add_argument("--phases", metavar="DB")
-    parser.add_argument("--term", default="entry")
     args = parser.parse_args()
     if args.compare:
         compare(*args.compare)
-    elif args.phases:
-        phases(args.phases, args.term)
     elif args.base_url and args.token_file and args.out:
         run(args)
     else:
-        parser.error("pass --base-url, --token-file and --out, or --compare, or --phases")
+        parser.error("pass --base-url, --token-file and --out, or --compare")
 
 
 if __name__ == "__main__":

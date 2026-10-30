@@ -57,7 +57,6 @@ impl SqliteFtsBackend {
             connection::configure_database(&mut database)?;
             if config.run_migrations {
                 migrations::run(&mut database)?;
-                search::backfill(&mut database)?;
             }
         }
         Ok(Self {

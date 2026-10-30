@@ -47,7 +47,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::{BigInt, Bytea, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid};
+    use diesel::sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid};
 
     llm_usage_events (id) {
         id -> Uuid,
@@ -61,8 +61,6 @@ diesel::table! {
         llm_provider -> Text,
         llm_model -> Text,
         event_type -> Text,
-        text -> Nullable<Text>,
-        text_sha256 -> Nullable<Bytea>,
         input_tokens -> BigInt,
         output_tokens -> BigInt,
         cache_read_tokens -> BigInt,

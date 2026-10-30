@@ -83,6 +83,8 @@ expected = {
     "llm_usage_event_attachments",
     "agent_diagnostic_captures",
     "agent_diagnostic_capture_events",
+    "session_titles",
+    "llm_usage_event_stream_facts",
     "search_texts",
     "search_texts_trigram",
     "search_refs",
@@ -90,8 +92,6 @@ expected = {
 missing = expected - tables
 if missing:
     raise SystemExit(f"SQLite migration is missing tables: {sorted(missing)}")
-if "usage_events_fts" in tables:
-    raise SystemExit("SQLite migration still creates usage_events_fts")
 text_columns = [row[1] for row in database.execute("PRAGMA table_info(search_texts)")]
 if text_columns != ["id", "user_id", "sha256", "text"]:
     raise SystemExit(f"search_texts columns are wrong: {text_columns}")

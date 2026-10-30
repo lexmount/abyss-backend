@@ -384,7 +384,9 @@ mod tests {
 
     #[test]
     fn a_request_continues_the_emitter_of_its_last_identity_unless_more_trails_it() {
-        // The examples of STREAM-DESIGN "base 怎么判定": the outputs of the
+        // A request's base is the exchange that emitted the last identity in
+        // its history, when exactly one exchange did and it said all the model
+        // output after that identity. Each case lists the outputs of the
         // earlier replies p1, p2, …, then what the next request carries back.
         let cases = [
             (

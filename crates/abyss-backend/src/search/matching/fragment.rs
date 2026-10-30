@@ -184,8 +184,11 @@ mod tests {
     #[test]
     fn highlights_follow_the_original_case_and_astral_characters() {
         assert_eq!(
-            render(&fragment_of("😀 AETHER.aucept.in 😀", "aether.AUCEPT.in")),
-            "😀 [AETHER.aucept.in] 😀"
+            render(&fragment_of(
+                "😀 NIMBUS.example.org 😀",
+                "nimbus.EXAMPLE.org"
+            )),
+            "😀 [NIMBUS.example.org] 😀"
         );
     }
 }

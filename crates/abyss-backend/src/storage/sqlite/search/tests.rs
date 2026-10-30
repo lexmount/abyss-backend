@@ -25,7 +25,7 @@ use super::{
         repository::{ingest_events, session_segment, session_streams},
         schema::{agent_sessions, search_refs, search_texts},
     },
-    backfill, search_in_session, session_search,
+    search_in_session, session_search,
 };
 
 const OWNER_ID: Uuid = Uuid::from_u128(1);
@@ -46,7 +46,7 @@ fn event(id: &str, session: &str, second: u32, event_type: &str, entries: &Value
         "token_usage": {"input_tokens": 1_i64, "output_tokens": 1_i64},
         "conversation": {"entries": entries, "completeness": "complete"},
         "metadata": {
-            "request_headers": [{"name": "x-api-key", "value": "aether-secret"}]
+            "request_headers": [{"name": "x-api-key", "value": "test-secret"}]
         }
     })
 }
@@ -154,11 +154,11 @@ fn result(id: &str, text: &str) -> Value {
 /// Requests that replay their history, responses, and another owner's copy
 /// of the same text.
 fn fixture() -> Vec<Value> {
-    let system = json!({"role": "system", "text": "You are Abyss. 先搜索，再回答。Use STATUS.md."});
-    let ask = user("find aether.aucept.in in STATUS.md");
-    let grep = call("c1", "Grep", "{\"pattern\":\"aether\"}");
-    let found = result("c1", "STATUS.md: aether.aucept.in 😀 AETHER.AUCEPT.IN");
-    let answer = assistant("新起一条流 for the worktree; run cargo test.");
+    let system = json!({"role": "system", "text": "You are Abyss. 先搜索，再回答。Use NOTES.md."});
+    let ask = user("find nimbus.example.org in NOTES.md");
+    let grep = call("c1", "Grep", "{\"pattern\":\"nimbus\"}");
+    let found = result("c1", "NOTES.md: nimbus.example.org 😀 NIMBUS.EXAMPLE.ORG");
+    let answer = assistant("开始新的任务 for the branch; run cargo test.");
     let mut events = vec![
         event("a1", "alpha", 1, "request", &json!([system, ask])),
         event("a1r", "alpha", 2, "response", &json!([grep])),
@@ -200,7 +200,7 @@ fn fixture() -> Vec<Value> {
             "beta",
             7,
             "response",
-            &json!([call("c2", "Read", "STATUS.md")]),
+            &json!([call("c2", "Read", "NOTES.md")]),
         ),
         event(
             "b2",
@@ -210,8 +210,8 @@ fn fixture() -> Vec<Value> {
             &json!([
                 json!({"role": "developer", "text": "ÄBC ΣΟΦΙΑ Straße İstanbul ＡＢＣ ﬁle"}),
                 user("ababa aaaaa \u{212a}elvin a\0b\0c abc"),
-                call("c2", "Read", "STATUS.md"),
-                result("c2", "# Status\nworktrees/search 新起一条流"),
+                call("c2", "Read", "NOTES.md"),
+                result("c2", "# Notes\nbranches/search 开始新的任务"),
                 json!({"role": "reasoning", "text": ""}),
             ]),
         ),
@@ -220,7 +220,7 @@ fn fixture() -> Vec<Value> {
             "gamma",
             9,
             "response",
-            &json!([assistant("搜索 cargo test aether")]),
+            &json!([assistant("搜索 cargo test nimbus")]),
         ),
     ];
     events.push(event("e1", "empty", 11, "request", &json!([])));
@@ -404,12 +404,12 @@ fn naive_hits(events: &[StoredEvent], query: &str, session: Option<&str>) -> Nai
 
 const QUERIES: [&str; 22] = [
     "搜索",
-    "aether.aucept.in",
-    "AETHER",
-    "worktree",
-    "新起一条流",
+    "nimbus.example.org",
+    "NIMBUS",
+    "branch",
+    "开始新的任务",
     "cargo test",
-    "STATUS.md",
+    "NOTES.md",
     "a",
     "s",
     "ab",
@@ -652,7 +652,7 @@ fn ingest_stores_each_distinct_text_once_per_owner() {
 #[test]
 fn searches_are_scoped_to_the_owner() {
     let mut database = seeded();
-    let found = search(&mut database, json!({"q": "aether"}));
+    let found = search(&mut database, json!({"q": "nimbus"}));
     assert_eq!(
         found
             .items
@@ -668,7 +668,7 @@ fn searches_are_scoped_to_the_owner() {
         OWNER_ID,
         other_session,
         &InSessionSearchQuery {
-            q: "aether".to_owned(),
+            q: "nimbus".to_owned(),
         },
         &StreamCache::default(),
     );
@@ -681,19 +681,19 @@ fn searches_are_scoped_to_the_owner() {
         OWNER_ID,
         Uuid::from_u128(99),
         &InSessionSearchQuery {
-            q: "aether".to_owned(),
+            q: "nimbus".to_owned(),
         },
         &StreamCache::default(),
     );
     assert!(matches!(unknown, Err(crate::error::AppError::NotFound(_))));
-    let empty = search_session(&mut database, "empty", "aether");
+    let empty = search_session(&mut database, "empty", "nimbus");
     assert!(empty.hits.is_empty() && empty.texts.is_empty() && !empty.truncated);
 }
 
 #[test]
 fn hits_mark_new_and_inherited_pieces() {
     let mut database = seeded();
-    let response = search_session(&mut database, "alpha", "STATUS.md");
+    let response = search_session(&mut database, "alpha", "NOTES.md");
     let events = stored_events(&mut database, OWNER_ID);
     // a2 replays [system, ask, grep, found]; only `found`, after the call, is new.
     let a2 = events
@@ -713,7 +713,7 @@ fn hits_mark_new_and_inherited_pieces() {
         "every alpha event is in an exchange"
     );
 
-    let found = search(&mut database, json!({"q": "STATUS.md"}));
+    let found = search(&mut database, json!({"q": "NOTES.md"}));
     let alpha = found
         .items
         .iter()
@@ -803,47 +803,6 @@ fn a_page_past_the_end_still_counts_the_sessions() {
 }
 
 #[test]
-fn backfill_indexes_stored_events_once() {
-    let mut database = seeded();
-    let before = (
-        serde_json::to_value(search(&mut database, json!({"q": "aether"}))).expect("serializes"),
-        serde_json::to_value(search_session(&mut database, "alpha", "STATUS.md"))
-            .expect("serializes"),
-    );
-    database
-        .batch_execute(
-            "DELETE FROM search_refs; DELETE FROM search_texts; \
-             INSERT INTO search_texts_trigram (search_texts_trigram) VALUES ('delete-all');",
-        )
-        .expect("index clears");
-    assert!(
-        search(&mut database, json!({"q": "aether"}))
-            .items
-            .is_empty()
-    );
-
-    backfill(&mut database).expect("backfill succeeds");
-    let refs = stored(&mut database, Table::Refs);
-    backfill(&mut database).expect("a second backfill succeeds");
-    assert_eq!(
-        stored(&mut database, Table::Refs),
-        refs,
-        "a second backfill writes nothing"
-    );
-    let after = (
-        serde_json::to_value(search(&mut database, json!({"q": "aether"}))).expect("serializes"),
-        serde_json::to_value(search_session(&mut database, "alpha", "STATUS.md"))
-            .expect("serializes"),
-    );
-    // Text ids differ after rebuilding; compare everything else.
-    assert_eq!(before.0, after.0);
-    assert_eq!(
-        before.1["hits"].as_array().map(Vec::len),
-        after.1["hits"].as_array().map(Vec::len)
-    );
-}
-
-#[test]
 fn a_nul_character_does_not_hide_later_trigrams() {
     let mut database = seeded();
     // b1 holds "a\0b\0c abc": the trigram index must still find "c abc".
@@ -856,7 +815,7 @@ fn a_nul_character_does_not_hide_later_trigrams() {
 #[test]
 fn fragments_highlight_every_occurrence_in_their_window() {
     let mut database = seeded();
-    let found = search(&mut database, json!({"q": "aether.aucept.in"}));
+    let found = search(&mut database, json!({"q": "nimbus.example.org"}));
     let alpha = found
         .items
         .iter()
@@ -875,6 +834,6 @@ fn fragments_highlight_every_occurrence_in_their_window() {
         .collect::<String>();
     assert_eq!(
         rendered,
-        "STATUS.md: [aether.aucept.in] 😀 [AETHER.AUCEPT.IN]"
+        "NOTES.md: [nimbus.example.org] 😀 [NIMBUS.EXAMPLE.ORG]"
     );
 }

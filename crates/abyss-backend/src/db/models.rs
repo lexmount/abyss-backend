@@ -139,12 +139,6 @@ pub struct UsageEvent {
     pub llm_model: String,
     /// Canonical request or response value.
     pub event_type: String,
-    /// Retired event text; no longer written, always empty.
-    #[expect(dead_code, reason = "the column stays in the schema; nothing reads it")]
-    pub text: Option<String>,
-    /// Retired digest of the event text; always empty.
-    #[expect(dead_code, reason = "the column stays in the schema; nothing reads it")]
-    pub text_sha256: Option<Vec<u8>>,
     /// Normalized input-token count.
     pub input_tokens: i64,
     /// Normalized output-token count.

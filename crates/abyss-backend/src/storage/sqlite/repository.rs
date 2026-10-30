@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_body_archive_survives_ingest_retries_and_preview_projection() {
+    fn opaque_metadata_survives_ingest_retries_and_preview_projection() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use sha2::Digest as _;
         let original =
@@ -1504,7 +1504,7 @@ mod tests {
         let mut database = database();
         let mut request = request_with_text("hello");
         request.events[0].event_type = crate::usage::UsageEventType::Request;
-        request.events[0].metadata["raw_body"] = json!({"transport":"http", "parts":[{
+        request.events[0].metadata["archive"] = json!({"transport":"http", "parts":[{
             "content_base64": STANDARD.encode(original), "byte_size": original.len(), "truncated": false,
             "sha256": hex::encode(sha2::Sha256::digest(original))
         }]});
@@ -1523,7 +1523,7 @@ mod tests {
         assert_eq!(
             STANDARD
                 .decode(
-                    stored["raw_body"]["parts"][0]["content_base64"]
+                    stored["archive"]["parts"][0]["content_base64"]
                         .as_str()
                         .unwrap()
                 )
@@ -2172,7 +2172,7 @@ mod tests {
             assert_eq!(listed.metadata, json!({}));
             assert!(listed.conversation.is_none());
             assert!(listed.attachments.is_empty());
-            assert_eq!(complete.metadata["raw_body"], json!("large"));
+            assert_eq!(complete.metadata["archive"], json!("large"));
         }
     }
 
@@ -2206,7 +2206,7 @@ mod tests {
                     ],
                     "completeness": "complete"
                 })),
-                "metadata": {"raw_body": "large"}
+                "metadata": {"archive": "large"}
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({

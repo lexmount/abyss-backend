@@ -50,7 +50,6 @@ CREATE TABLE llm_usage_event_stream_facts (
 -- event refers to its text; replayed history therefore adds references, not
 -- text. A trigram index over the folded texts, without positions, narrows
 -- the candidates the backend verifies.
-DROP TABLE usage_events_fts;
 
 CREATE TABLE search_texts (
     id INTEGER PRIMARY KEY,
