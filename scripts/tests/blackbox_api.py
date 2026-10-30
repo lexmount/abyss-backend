@@ -110,13 +110,11 @@ def event(
         "llm": {"provider": "openai", "model": "gpt-5.5"},
         "event_type": event_type,
         "token_usage": token_usage,
-        "metadata": {
-            "test_run": run_id,
-            "conversation": {
-                "entries": [{"role": "user" if event_type == "request" else "assistant", "text": text}],
-                "completeness": "complete",
-            },
+        "conversation": {
+            "entries": [{"role": "user" if event_type == "request" else "assistant", "text": text}],
+            "completeness": "complete",
         },
+        "metadata": {"test_run": run_id},
     }
     if event_type == "request":
         value["attachments"] = [
@@ -243,6 +241,14 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         ),
         "events must return the exchange identities they were ingested with",
     )
+    require(
+        all(
+            item["conversation"]["completeness"] == "complete"
+            and item["metadata"] == {"test_run": run_id}
+            for item in raw_events
+        ),
+        "events must return the conversation at the top level, outside metadata",
+    )
 
     # The list projection carries what an event list shows and no content.
     list_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
@@ -255,10 +261,10 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         [item["id"] for item in listed_events] == [item["id"] for item in raw_events],
         "event list must return the same events in the same order",
     )
-    content_fields = {"metadata", "attachments"}
+    content_fields = {"conversation", "metadata", "attachments"}
     require(
         all(content_fields.isdisjoint(item) for item in listed_events),
-        "event list items must leave out metadata and attachments",
+        "event list items must leave out conversation, metadata, and attachments",
     )
     require(
         all(

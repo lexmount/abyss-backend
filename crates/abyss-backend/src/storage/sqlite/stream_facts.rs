@@ -1,5 +1,5 @@
 //! One-time rebuild of the SQLite stream facts of stored events from their
-//! metadata, for a change in how facts are read.
+//! conversations, for a change in how facts are read.
 
 use std::collections::HashSet;
 
@@ -15,13 +15,13 @@ use super::{
 };
 use crate::error::AppError;
 
-/// Events whose metadata one page holds.
+/// Events whose conversations one page holds.
 const PAGE: i64 = 64;
 
 /// Sessions whose revision one statement bumps.
 const SESSIONS_PER_UPDATE: usize = 500;
 
-/// Writes the facts read from an event's metadata unless they are stored
+/// Writes the facts read from an event's conversation unless they are stored
 /// already; the ids the client declared stay as ingest stored them.
 const UPSERT: &str = "\
     INSERT INTO llm_usage_event_stream_facts AS f \
@@ -41,7 +41,7 @@ const UPSERT: &str = "\
            excluded.output_skeleton, excluded.label_index, excluded.label_text, \
            excluded.label_length)";
 
-/// Reads the stream facts of every stored event again from its metadata,
+/// Reads the stream facts of every stored event again from its conversation,
 /// page by page inside the caller's write transaction, and bumps the
 /// structure revision of each session whose facts changed. An event stored
 /// before facts were read gets them now, without declared ids.
@@ -57,19 +57,28 @@ pub(super) fn rebuild(connection: &mut SqliteConnection) -> Result<(), AppError>
                 llm_usage_events::id,
                 llm_usage_events::session_pk,
                 llm_usage_events::event_type,
-                llm_usage_events::metadata,
+                llm_usage_events::conversation,
                 llm_usage_events::previous_response_id,
             ))
-            .load::<(String, String, String, String, Option<String>)>(connection)?;
+            .load::<(String, String, String, Option<String>, Option<String>)>(connection)?;
         let Some((last, ..)) = page.last() else {
             break;
         };
         after.clone_from(last);
-        for (event_pk, session_pk, event_type, metadata, previous) in page {
-            let metadata = serde_json::from_str::<Value>(&metadata).map_err(|error| {
-                AppError::internal(format!("stored metadata of event {event_pk}: {error}"))
-            })?;
-            let facts = NewStreamFacts::read(event_pk, &event_type, &metadata, previous.is_some())?;
+        for (event_pk, session_pk, event_type, conversation, previous) in page {
+            let conversation = conversation
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+                .map_err(|error| {
+                    AppError::internal(format!("stored conversation of event {event_pk}: {error}"))
+                })?;
+            let facts = NewStreamFacts::read(
+                event_pk,
+                &event_type,
+                conversation.as_ref(),
+                previous.is_some(),
+            )?;
             if write(connection, &facts)? > 0 {
                 changed.insert(session_pk);
             }
@@ -139,7 +148,7 @@ mod tests {
             "turn_id": format!("turn.{id}"),
             "llm": {"provider": "deepseek", "model": "deepseek-chat"},
             "event_type": kind,
-            "metadata": {"conversation": {"entries": entries, "completeness": "complete"}}
+            "conversation": {"entries": entries, "completeness": "complete"}
         })
     }
 
@@ -221,7 +230,7 @@ mod tests {
         diesel::delete(llm_usage_event_stream_facts::table.find(&chat_events[3]))
             .execute(&mut database)
             .expect("missing facts");
-        for version in ["20261029130000", "20261029120000"] {
+        for version in ["20261029140000", "20261029130000", "20261029120000"] {
             let reverted = database
                 .revert_last_migration(MIGRATIONS)
                 .expect("revert down to the rebuild");

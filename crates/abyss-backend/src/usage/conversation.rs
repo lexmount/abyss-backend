@@ -35,9 +35,8 @@ pub struct Entry {
 impl Conversation {
     /// The completely decoded conversation of an event, as the `AgentEvent`
     /// contract defines it.
-    pub fn read(metadata: &Value) -> Option<Self> {
-        let value = metadata.get("conversation")?;
-        let conversation: Self = Self::deserialize(value).ok()?;
+    pub fn read(conversation: Option<&Value>) -> Option<Self> {
+        let conversation: Self = Self::deserialize(conversation?).ok()?;
         (conversation.completeness == Completeness::Complete).then_some(conversation)
     }
 }
@@ -48,7 +47,7 @@ mod tests {
 
     #[test]
     fn roles_are_kept_as_reported() {
-        let metadata = serde_json::json!({"conversation": {
+        let value = serde_json::json!({
             "entries": [
                 {"role": "reasoning", "text": "plan", "item_id": "rs_1"},
                 {"role": "some_new_role", "text": "other"},
@@ -56,8 +55,8 @@ mod tests {
                 {"role": "user", "text": "hello"}
             ],
             "completeness": "complete"
-        }});
-        let conversation = Conversation::read(&metadata).expect("complete conversation");
+        });
+        let conversation = Conversation::read(Some(&value)).expect("complete conversation");
         assert_eq!(
             conversation
                 .entries
@@ -78,8 +77,8 @@ mod tests {
             serde_json::json!({"entries": entries, "completeness": "partial"}),
             serde_json::json!({"messages": entries, "completeness": "complete"}),
         ] {
-            let metadata = serde_json::json!({"conversation": conversation});
-            assert!(Conversation::read(&metadata).is_none());
+            assert!(Conversation::read(Some(&conversation)).is_none());
         }
+        assert!(Conversation::read(None).is_none());
     }
 }

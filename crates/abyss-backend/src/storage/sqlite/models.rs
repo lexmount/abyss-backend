@@ -104,6 +104,7 @@ pub(super) struct EventRow {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
+    pub(super) conversation: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -132,6 +133,7 @@ pub(super) struct NewEvent {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
+    pub(super) conversation: Option<String>,
 }
 
 /// Stream facts of a new event; the other side's columns stay NULL.
@@ -156,19 +158,19 @@ pub(super) struct NewStreamFacts {
 }
 
 impl NewStreamFacts {
-    /// Columns of the facts read from an event's metadata, by its type, and
-    /// whether the event names the response it continues; without the ids
-    /// the client declared.
+    /// Columns of the facts read from an event's conversation, by its type,
+    /// and whether the event names the response it continues; without the
+    /// ids the client declared.
     pub(super) fn read(
         event_pk: String,
         event_type: &str,
-        metadata: &Value,
+        conversation: Option<&Value>,
         names_previous: bool,
     ) -> Result<Self, AppError> {
         if event_type == UsageEventType::Request.as_str() {
-            Self::request(event_pk, &RequestFacts::read(metadata), names_previous)
+            Self::request(event_pk, &RequestFacts::read(conversation), names_previous)
         } else {
-            Self::response(event_pk, &ResponseFacts::read(metadata))
+            Self::response(event_pk, &ResponseFacts::read(conversation))
         }
     }
 
@@ -378,6 +380,7 @@ pub(super) struct EventRecord {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
+    pub(super) conversation: Option<Value>,
 }
 
 pub(super) struct AttachmentRecord {
@@ -432,6 +435,11 @@ impl EventRow {
             stream_id: self.stream_id,
             response_id: self.response_id,
             previous_response_id: self.previous_response_id,
+            conversation: self
+                .conversation
+                .as_deref()
+                .map(|conversation| parse_json(conversation, "event conversation"))
+                .transpose()?,
         })
     }
 }

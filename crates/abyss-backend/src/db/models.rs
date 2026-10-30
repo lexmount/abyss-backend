@@ -169,6 +169,8 @@ pub struct UsageEvent {
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
     pub previous_response_id: Option<String>,
+    /// Conversation of the event, as the collector reported it.
+    pub conversation: Option<Value>,
 }
 
 #[derive(Queryable, Selectable)]
@@ -282,6 +284,8 @@ pub struct NewUsageEvent {
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
     pub previous_response_id: Option<String>,
+    /// Conversation of the event, as the collector reported it.
+    pub conversation: Option<Value>,
 }
 
 #[derive(Queryable)]

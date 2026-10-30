@@ -10,7 +10,7 @@ use super::{
 };
 
 pub(super) fn conversation(entries: &Value) -> Value {
-    json!({"conversation": {"entries": entries, "completeness": "complete"}})
+    json!({"entries": entries, "completeness": "complete"})
 }
 
 pub(super) fn user(text: &str) -> Value {
@@ -118,13 +118,13 @@ impl Session {
 
     /// Adds the request of exchange `name` at `second`.
     pub(super) fn ask(&mut self, name: &str, second: i64, previous: Option<&str>, entries: &Value) {
-        let facts = EventFacts::Request(RequestFacts::read(&conversation(entries)));
+        let facts = EventFacts::Request(RequestFacts::read(Some(&conversation(entries))));
         self.add(name, second.saturating_mul(1_000), previous, facts);
     }
 
     /// Adds the response of exchange `name`, half a second after `second`.
     pub(super) fn answer(&mut self, name: &str, second: i64, entries: &Value) {
-        let facts = EventFacts::Response(ResponseFacts::read(&conversation(entries)));
+        let facts = EventFacts::Response(ResponseFacts::read(Some(&conversation(entries))));
         let millis = second.saturating_mul(1_000).saturating_add(500);
         self.add(name, millis, None, facts);
     }

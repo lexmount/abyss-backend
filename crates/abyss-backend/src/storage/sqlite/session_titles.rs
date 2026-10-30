@@ -232,17 +232,12 @@ mod tests {
 
     /// A request whose collector conversation holds one user entry.
     fn request(agent: &str, session: &str, id: &str, at: &str, input: &str) -> Value {
-        event(
-            agent,
-            session,
-            id,
-            at,
-            "request",
-            json!({"conversation": {
-                "entries": [{"role": "user", "text": input}],
-                "completeness": "complete"
-            }}),
-        )
+        let mut request = event(agent, session, id, at, "request", json!({}));
+        request["conversation"] = json!({
+            "entries": [{"role": "user", "text": input}],
+            "completeness": "complete"
+        });
+        request
     }
 
     /// The response of a naming call, carrying the collector's title.
@@ -377,11 +372,12 @@ mod tests {
             "s1",
             "2026-09-30T00:00:01Z",
             "response",
-            json!({"conversation": {
-                "entries": [{"role": "assistant", "text": "{\"title\":\"Quoted\"}"}],
-                "completeness": "complete"
-            }}),
+            json!({}),
         );
+        reply["conversation"] = json!({
+            "entries": [{"role": "assistant", "text": "{\"title\":\"Quoted\"}"}],
+            "completeness": "complete"
+        });
         reply["text"] = json!("{\"title\":\"Quoted\"}");
         ingest(
             &mut database,
@@ -491,8 +487,13 @@ mod tests {
     #[test]
     fn title_registration_rebuild_preserves_missing_facts_and_runs_only_once() {
         let mut database = database();
+        let mut legacy = request("codex", "legacy", "old", "2026-09-30T00:00:00Z", "");
+        legacy["conversation"] = json!({
+            "messages": [{"role": "user", "text": "Old format"}],
+            "completeness": "complete"
+        });
         let mut input = request("codex", "task", "r1", "2026-09-30T00:00:01Z", "unused");
-        input["metadata"]["conversation"]["entries"] = json!([
+        input["conversation"]["entries"] = json!([
             {"role": "user", "text": "  "},
             {"role": "user", "text": "First\n  input"},
             {"role": "assistant", "text": "Previous reply"},
@@ -504,15 +505,7 @@ mod tests {
                 request("codex", "task", "r0", "2026-09-30T00:00:00Z", ""),
                 input,
                 titled_response("task", "s1", "2026-09-30T00:00:02Z", "Old agent title"),
-                event(
-                    "codex",
-                    "legacy",
-                    "old",
-                    "2026-09-30T00:00:00Z",
-                    "request",
-                    json!({"conversation": {"messages": [{"role": "user", "text": "Old format"}],
-                    "completeness": "complete"}}),
-                ),
+                legacy,
             ],
         );
         let pk = agent_sessions::table
@@ -534,7 +527,12 @@ mod tests {
 
         // Return to the initial schema, including the previous search tables.
         // Reapplying facts must run its SQL and title rebuild in one transaction.
-        for version in ["20261029130000", "20261029120000", "20261019120000"] {
+        for version in [
+            "20261029140000",
+            "20261029130000",
+            "20261029120000",
+            "20261019120000",
+        ] {
             let reverted = database
                 .revert_last_migration(MIGRATIONS)
                 .expect("revert the facts migrations");

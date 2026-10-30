@@ -139,6 +139,11 @@ fn ingest_one_event(
     let tokens = &event.token_usage;
     let event_pk = Uuid::now_v7();
     let metadata = serialize_json(&event.metadata, "event metadata")?;
+    let conversation = event
+        .conversation
+        .as_ref()
+        .map(|conversation| serialize_json(conversation, "event conversation"))
+        .transpose()?;
 
     let inserted = diesel::insert_into(llm_usage_events::table)
         .values(NewEvent {
@@ -165,6 +170,7 @@ fn ingest_one_event(
             stream_id: event.stream_id.clone(),
             response_id: event.response_id.clone(),
             previous_response_id: event.previous_response_id.clone(),
+            conversation,
         })
         .on_conflict(llm_usage_events::event_id)
         .do_nothing()
@@ -179,7 +185,7 @@ fn ingest_one_event(
         connection,
         &user_id.to_string(),
         &event_pk.to_string(),
-        &event.metadata,
+        event.conversation.as_ref(),
     )?;
     session_titles::capture(
         connection,
@@ -607,7 +613,7 @@ fn insert_stream_facts(
     let facts = NewStreamFacts::read(
         event_pk.to_string(),
         event.event_type.as_str(),
-        &event.metadata,
+        event.conversation.as_ref(),
         event.previous_response_id.is_some(),
     )?;
     let facts = NewStreamFacts {
@@ -760,8 +766,9 @@ struct EventFilters<'a> {
     offset: i64,
 }
 
-/// Loads matching events newest first. Without content, text and metadata are
-/// not read: they hold whole request bodies, and an event list never shows them.
+/// Loads matching events newest first. Without content, the conversation and
+/// metadata are not read: the conversation holds whole request bodies, and an
+/// event list shows neither.
 fn load_filtered_events(
     connection: &mut SqliteConnection,
     filters: &EventFilters<'_>,
@@ -836,6 +843,7 @@ fn load_filtered_events(
                 llm_usage_events::stream_id,
                 llm_usage_events::response_id,
                 llm_usage_events::previous_response_id,
+                None::<String>.into_sql::<Nullable<Text>>(),
             ))
             .load::<EventRow>(connection)?
     };
@@ -1000,7 +1008,7 @@ fn day_offsets(
 
 /// Usage totals grouped in SQL, reading only the columns a summary reports.
 ///
-/// Event metadata holds each event's conversation, so reading event rows
+/// Each event row holds the event's conversation, so reading event rows
 /// reads a page per event; the summary cover index carries every event column
 /// used here, `id` included for the stream facts join. The owner is the single
 /// standalone user, so the user dimension is filled in afterwards.
@@ -1345,6 +1353,7 @@ fn event_response(
         stream_id: event.stream_id,
         response_id: event.response_id,
         previous_response_id: event.previous_response_id,
+        conversation: event.conversation,
         metadata: event.metadata,
         attachments,
     }
@@ -1497,6 +1506,7 @@ mod tests {
         let event = super::usage_event(&mut database, OWNER_ID, event_pk).unwrap();
         let stored = &event.metadata;
         assert_eq!(*stored, expected);
+        assert_eq!(event.conversation, request.events[0].conversation);
         assert_eq!(
             STANDARD
                 .decode(
@@ -1538,7 +1548,7 @@ mod tests {
         assert_eq!(stored.llm_model, " Model ");
         assert_eq!(stored.platform.as_deref(), Some("macOS"));
         assert_eq!(
-            stored.metadata["conversation"]["entries"][0]["text"],
+            stored.conversation.as_ref().expect("conversation")["entries"][0]["text"],
             json!("  hello \n")
         );
     }
@@ -1563,7 +1573,7 @@ mod tests {
                 "session_id": "sqlite-session",
                 "llm": {"provider": "openai", "model": "gpt-5"},
                 "event_type": event_type,
-                "metadata": {"conversation": {"entries": entries, "completeness": "complete"}}
+                "conversation": {"entries": entries, "completeness": "complete"}
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({"events": [
@@ -1633,7 +1643,7 @@ mod tests {
                 "llm": {"provider": "openai", "model": "gpt-5"},
                 "event_type": event_type,
                 "response_id": response,
-                "metadata": {"conversation": {"entries": entries, "completeness": "complete"}}
+                "conversation": {"entries": entries, "completeness": "complete"}
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({"events": [
@@ -1702,10 +1712,10 @@ mod tests {
                 "llm": {"provider": "anthropic", "model": "claude"},
                 "event_type": event_type,
                 "response_id": &id[..1],
-                "metadata": {"conversation": {
+                "conversation": {
                     "entries": [{"role": "user", "text": id}],
                     "completeness": "complete"
-                }}
+                }
             });
             for (key, value) in declared.as_object().into_iter().flatten() {
                 event[key] = value.clone();
@@ -1793,7 +1803,7 @@ mod tests {
                     "llm": {"provider": "anthropic", "model": "claude"},
                     "event_type": side,
                     "response_id": name,
-                    "metadata": {"conversation": {"entries": entries, "completeness": "complete"}}
+                    "conversation": {"entries": entries, "completeness": "complete"}
                 });
                 for (key, value) in declared.as_object().into_iter().flatten() {
                     event[key] = value.clone();
@@ -2137,6 +2147,7 @@ mod tests {
             assert_eq!(listed.total_tokens, complete.total_tokens);
             assert_eq!(listed.host_name.as_deref(), Some("alice-mbp"));
             assert_eq!(listed.metadata, json!({}));
+            assert!(listed.conversation.is_none());
             assert!(listed.attachments.is_empty());
             assert_eq!(complete.metadata["raw_body"], json!("large"));
         }
@@ -2165,17 +2176,14 @@ mod tests {
                 },
                 // A request asking in words after an answer opens a turn; a
                 // response opens none.
-                "metadata": if id.ends_with("req") {
-                    json!({"raw_body": "large", "conversation": {
-                        "entries": [
-                            {"role": "assistant", "text": "earlier"},
-                            {"role": "user", "text": "ask"}
-                        ],
-                        "completeness": "complete"
-                    }})
-                } else {
-                    json!({"raw_body": "large"})
-                }
+                "conversation": id.ends_with("req").then(|| json!({
+                    "entries": [
+                        {"role": "assistant", "text": "earlier"},
+                        {"role": "user", "text": "ask"}
+                    ],
+                    "completeness": "complete"
+                })),
+                "metadata": {"raw_body": "large"}
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({
@@ -2468,10 +2476,10 @@ mod tests {
                 "llm": {"provider": "openai", "model": "gpt-5"},
                 "event_type": "response",
                 "token_usage": {"input_tokens": 0_i64, "output_tokens": 3_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 3_i64},
-                "metadata": {"conversation": {
+                "conversation": {
                     "entries": [{"role": "assistant", "text": text}],
                     "completeness": "complete"
-                }}
+                }
             }]
         }))
         .expect("test ingest request should deserialize")

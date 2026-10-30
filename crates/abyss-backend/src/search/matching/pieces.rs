@@ -29,7 +29,7 @@ impl PieceField {
 /// One nonempty string value of one entry.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Piece<'a> {
-    /// Position of the entry in `metadata.conversation.entries`.
+    /// Position of the entry in `conversation.entries`.
     pub entry_index: usize,
     /// Which value of the entry it is.
     pub field: PieceField,
@@ -37,14 +37,14 @@ pub struct Piece<'a> {
     pub text: &'a str,
 }
 
-/// The pieces of `metadata.conversation.entries`, in entry order and `name`
-/// before `text` within an entry. Nothing outside the entries is read, so
-/// headers and other collector metadata are never searched; an empty value
-/// is not a piece, and entries are never joined.
+/// The pieces of the event's `conversation.entries`, in entry order and
+/// `name` before `text` within an entry. Nothing outside the entries is read,
+/// and metadata never is, so headers are never searched; an empty value is
+/// not a piece, and entries are never joined.
 #[must_use]
-pub fn pieces(metadata: &Value) -> Vec<Piece<'_>> {
-    metadata
-        .pointer("/conversation/entries")
+pub fn pieces(conversation: Option<&Value>) -> Vec<Piece<'_>> {
+    conversation
+        .and_then(|conversation| conversation.get("entries"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -72,20 +72,19 @@ mod tests {
 
     #[test]
     fn reads_the_text_and_name_of_every_entry_and_nothing_else() {
-        let metadata = json!({
-            "request_headers": [{"name": "authorization", "value": "Bearer secret"}],
-            "conversation": {"entries": [
+        let conversation = json!({
+            "entries": [
                 {"role": "system", "text": "You are an agent"},
                 {"role": "reasoning", "text": ""},
                 {"role": "tool_call", "text": "{\"command\":\"cargo test\"}", "call_id": "c1", "name": "Bash"},
                 {"role": "tool_result", "text": "all tests passed", "call_id": "c1"},
                 {"role": "unknown"},
                 {"role": "user", "text": 3_i64, "name": ""}
-            ]}
+            ]
         });
 
         assert_eq!(
-            pieces(&metadata),
+            pieces(Some(&conversation)),
             [
                 Piece {
                     entry_index: 0,
@@ -109,8 +108,8 @@ mod tests {
                 },
             ]
         );
-        assert!(pieces(&json!({})).is_empty());
-        assert!(pieces(&json!({"conversation": {"entries": "none"}})).is_empty());
+        assert!(pieces(None).is_empty());
+        assert!(pieces(Some(&json!({"entries": "none"}))).is_empty());
     }
 
     #[test]

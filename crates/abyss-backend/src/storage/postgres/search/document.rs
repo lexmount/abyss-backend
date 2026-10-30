@@ -1,8 +1,9 @@
-//! Search document projection and bounded extraction from usage-event metadata.
+//! Search document projection and bounded extraction from usage-event
+//! conversations.
 //!
-//! Only explicitly allowlisted metadata enters the index. Extraction limits
-//! depth, value count, and character length to bound CPU, allocation, request
-//! size, and accidental indexing of unrelated collector metadata. PostgreSQL
+//! Only conversation entries enter the index; metadata never does. Extraction
+//! limits depth, value count, and character length to bound CPU, allocation,
+//! and request size. PostgreSQL
 //! retains the complete source event and remains the recovery source.
 
 use serde::Serialize;
@@ -38,7 +39,7 @@ pub struct SearchDocument {
     /// Bounded prompt or response text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Bounded names extracted from tool-call metadata.
+    /// Bounded names extracted from tool-call entries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_names: Vec<String>,
     /// Bounded raw tool inputs and outputs.
@@ -50,7 +51,7 @@ impl SearchDocument {
     /// Projects one source event into the strict Elasticsearch mapping.
     #[must_use]
     pub fn from_event(event: UsageEvent) -> Self {
-        let projection = SearchProjection::from_source(&event.metadata);
+        let projection = SearchProjection::from_source(event.conversation.as_ref());
         Self {
             event_pk: event.id,
             user_id: event.user_id,
@@ -80,17 +81,17 @@ mod tests {
 
     /// `entries` as an event's complete conversation.
     fn conversation(entries: &serde_json::Value) -> serde_json::Value {
-        json!({"conversation": {"entries": entries, "completeness": "complete"}})
+        json!({"entries": entries, "completeness": "complete"})
     }
 
     #[test]
     fn indexes_every_entry_text_and_the_called_tool_names_only() {
         let mut event = usage_event();
-        event.metadata = conversation(&json!([
+        event.conversation = Some(conversation(&json!([
             {"role": "user", "text": "run the tests"},
             {"role": "tool_call", "text": "{\"command\":\"cargo test\"}", "call_id": "c1", "name": "Bash"},
             {"role": "tool_result", "text": "all tests passed", "call_id": "c1"}
-        ]));
+        ])));
         event.metadata["headers"] = json!([{"name": "authorization", "value": "Bearer secret"}]);
 
         let document = SearchDocument::from_event(event);
@@ -108,9 +109,9 @@ mod tests {
     #[test]
     fn truncates_oversized_content_on_a_utf8_boundary() {
         let mut event = usage_event();
-        event.metadata = conversation(&json!([
+        event.conversation = Some(conversation(&json!([
             {"role": "user", "text": "会".repeat(MAX_CONTENT_CHARACTERS + 1)}
-        ]));
+        ])));
 
         let document = SearchDocument::from_event(event);
 
@@ -128,7 +129,7 @@ mod tests {
     fn strips_highlight_markers_from_every_searchable_field() {
         let mut event = usage_event();
         event.session_id = format!("session-{HIGHLIGHT_START}one{HIGHLIGHT_END}");
-        event.metadata = conversation(&json!([
+        event.conversation = Some(conversation(&json!([
             {"role": "user", "text": format!("before {HIGHLIGHT_START}match{HIGHLIGHT_END} after")},
             {
                 "role": "tool_call",
@@ -136,7 +137,7 @@ mod tests {
                 "call_id": "c1",
                 "name": format!("{HIGHLIGHT_START}Bash{HIGHLIGHT_END}")
             }
-        ]));
+        ])));
 
         let serialized = serde_json::to_string(&SearchDocument::from_event(event))
             .expect("document should serialize");
@@ -172,6 +173,7 @@ mod tests {
             stream_id: None,
             response_id: None,
             previous_response_id: None,
+            conversation: None,
         }
     }
 }

@@ -44,9 +44,9 @@ fn event(id: &str, session: &str, second: u32, event_type: &str, entries: &Value
         "llm": {"provider": "openai", "model": "gpt-5"},
         "event_type": event_type,
         "token_usage": {"input_tokens": 1_i64, "output_tokens": 1_i64},
+        "conversation": {"entries": entries, "completeness": "complete"},
         "metadata": {
-            "request_headers": [{"name": "x-api-key", "value": "aether-secret"}],
-            "conversation": {"entries": entries, "completeness": "complete"}
+            "request_headers": [{"name": "x-api-key", "value": "aether-secret"}]
         }
     })
 }
@@ -290,11 +290,11 @@ fn stored_events(database: &mut SqliteConnection, owner: Uuid) -> Vec<StoredEven
         observed_at: i64,
         #[diesel(sql_type = diesel::sql_types::Text)]
         event_type: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        metadata: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        conversation: Option<String>,
     }
     diesel::sql_query(
-        "SELECT id, event_id, session_id, observed_at, event_type, metadata \
+        "SELECT id, event_id, session_id, observed_at, event_type, conversation \
          FROM llm_usage_events WHERE user_id = ?",
     )
     .bind::<diesel::sql_types::Text, _>(owner.to_string())
@@ -302,14 +302,16 @@ fn stored_events(database: &mut SqliteConnection, owner: Uuid) -> Vec<StoredEven
     .expect("events should load")
     .into_iter()
     .map(|row| {
-        let metadata = serde_json::from_str::<Value>(&row.metadata).expect("metadata is JSON");
+        let conversation = row.conversation.map_or(Value::Null, |conversation| {
+            serde_json::from_str::<Value>(&conversation).expect("conversation is JSON")
+        });
         StoredEvent {
             pk: Uuid::parse_str(&row.id).expect("event id is a UUID"),
             event_id: row.event_id,
             session_id: row.session_id,
             observed_at: row.observed_at,
             response: row.event_type == "response",
-            entries: metadata["conversation"]["entries"]
+            entries: conversation["entries"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default(),

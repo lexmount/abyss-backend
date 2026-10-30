@@ -128,7 +128,7 @@ pub struct Chunk {
 
 /// Previews the conversation of `event` through `window`.
 pub fn preview(event: UsageEventResponse, window: &Window) -> ConversationPreview {
-    let conversation = event.metadata.get("conversation");
+    let conversation = event.conversation.as_ref();
     let entries = conversation
         .and_then(|conversation| conversation.get("entries"))
         .and_then(Value::as_array)

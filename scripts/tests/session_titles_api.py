@@ -22,9 +22,11 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
         if naming_thread:
             value["naming_thread"] = True
         if kind == "request":
-            value["metadata"]["conversation"] = {
+            value["conversation"] = {
                 "entries": [{"role": "user", "text": text}], "completeness": "complete",
             }
+        else:
+            value.pop("conversation", None)
         return value
 
     def ingest(*events):
@@ -82,7 +84,7 @@ def run_title_contract(base_url: str, token: str, run_id: str) -> None:
 
     first = make("default", "request", "  修复\n登录问题 " + "好" * 90, agent="cursor")
     ingest(first)
-    expected = first["metadata"]["conversation"]["entries"][0]["text"][:50]
+    expected = first["conversation"]["entries"][0]["text"][:50]
     require(session("default")["title"]["text"] == expected, "title returns the unformatted fifty-unit request label")
     later = make("default", "request", "Later request", agent="cursor")
     later["observed_at"] = "2026-09-30T00:00:03Z"

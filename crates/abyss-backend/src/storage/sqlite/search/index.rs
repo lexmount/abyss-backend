@@ -8,7 +8,7 @@ use std::time::Instant;
 use diesel::{
     ExpressionMethods, OptionalExtension, QueryDsl, QueryableByName, RunQueryDsl, SqliteConnection,
     sql_query,
-    sql_types::{BigInt, Text},
+    sql_types::{BigInt, Nullable, Text},
 };
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -37,10 +37,10 @@ pub(in crate::storage::sqlite) fn index_event(
     connection: &mut SqliteConnection,
     owner: &str,
     event_pk: &str,
-    metadata: &Value,
+    conversation: Option<&Value>,
 ) -> Result<(), AppError> {
     let mut refs = Vec::new();
-    for piece in pieces(metadata) {
+    for piece in pieces(conversation) {
         refs.push(NewSearchRef {
             event_pk,
             entry_index: i32::try_from(piece.entry_index).map_err(|error| {
@@ -105,8 +105,8 @@ struct UnindexedEvent {
     id: String,
     #[diesel(sql_type = Text)]
     user_id: String,
-    #[diesel(sql_type = Text)]
-    metadata: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    conversation: Option<String>,
 }
 
 /// Indexes the stored events that have no reference yet, in batches that
@@ -129,7 +129,7 @@ pub(in crate::storage::sqlite) fn backfill(
         let batch = connection.immediate_transaction(|connection| {
             let events = sql_query(format!(
                 "SELECT e.rowid AS rowid, e.id AS id, e.user_id AS user_id, \
-                     e.metadata AS metadata \
+                     e.conversation AS conversation \
                  {UNINDEXED_EVENTS} AND e.rowid > ? \
                  ORDER BY e.rowid LIMIT ?"
             ))
@@ -137,10 +137,17 @@ pub(in crate::storage::sqlite) fn backfill(
             .bind::<BigInt, _>(BACKFILL_EVENTS_PER_BATCH)
             .load::<UnindexedEvent>(connection)?;
             for event in &events {
-                let metadata = serde_json::from_str::<Value>(&event.metadata).map_err(|error| {
-                    AppError::internal(format!("stored event metadata is invalid JSON: {error}"))
-                })?;
-                index_event(connection, &event.user_id, &event.id, &metadata)?;
+                let conversation = event
+                    .conversation
+                    .as_deref()
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()
+                    .map_err(|error| {
+                        AppError::internal(format!(
+                            "stored event conversation is invalid JSON: {error}"
+                        ))
+                    })?;
+                index_event(connection, &event.user_id, &event.id, conversation.as_ref())?;
             }
             Ok::<_, AppError>(events.last().map(|event| (event.rowid, events.len())))
         })?;

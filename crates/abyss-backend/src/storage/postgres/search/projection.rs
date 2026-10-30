@@ -23,12 +23,11 @@ pub struct SearchProjection {
 
 impl SearchProjection {
     /// Reads the event's conversation entries: the text of every entry, of
-    /// every role, in order, and the names of the tools it calls. Every other
-    /// metadata key is ignored, so headers, credentials, and image data never
-    /// enter a derived full-text index.
-    pub fn from_source(metadata: &Value) -> Self {
-        let entries = metadata
-            .get("conversation")
+    /// every role, in order, and the names of the tools it calls. Metadata is
+    /// never read, so headers, credentials, and image data never enter a
+    /// derived full-text index.
+    pub fn from_source(conversation: Option<&Value>) -> Self {
+        let entries = conversation
             .and_then(|conversation| conversation.get("entries"))
             .and_then(Value::as_array)
             .map(Vec::as_slice)

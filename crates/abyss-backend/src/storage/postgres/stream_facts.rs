@@ -1,5 +1,6 @@
-//! Stream facts of PostgreSQL events read from their metadata: at ingest, and
-//! once more for every stored event when the way facts are read changes.
+//! Stream facts of PostgreSQL events read from their conversations: at
+//! ingest, and once more for every stored event when the way facts are read
+//! changes.
 
 use std::collections::HashSet;
 
@@ -23,10 +24,10 @@ use crate::{
     },
 };
 
-/// Events whose metadata one page holds.
+/// Events whose conversations one page holds.
 const PAGE: i64 = 64;
 
-/// Writes the facts read from an event's metadata unless they are stored
+/// Writes the facts read from an event's conversation unless they are stored
 /// already; the ids the client declared stay as ingest stored them.
 /// `trailing` is a reserved word in PostgreSQL.
 const UPSERT: &str = "\
@@ -52,16 +53,16 @@ fn json_value<T: Serialize>(value: &T, field: &str) -> Result<Value, AppError> {
         .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
 }
 
-/// Fact columns read from an event's metadata, by its type; the other
+/// Fact columns read from an event's conversation, by its type; the other
 /// side's columns and the ids the client declared stay NULL.
 pub(super) fn read(
     event_pk: Uuid,
     event_type: &str,
-    metadata: &Value,
+    conversation: Option<&Value>,
     names_previous: bool,
 ) -> Result<NewStreamFacts, AppError> {
     Ok(if event_type == UsageEventType::Request.as_str() {
-        let facts = RequestFacts::read(metadata);
+        let facts = RequestFacts::read(conversation);
         NewStreamFacts {
             event_pk,
             new_from: Some(facts.new_from),
@@ -76,7 +77,7 @@ pub(super) fn read(
             ..NewStreamFacts::default()
         }
     } else {
-        let facts = ResponseFacts::read(metadata);
+        let facts = ResponseFacts::read(conversation);
         NewStreamFacts {
             event_pk,
             emitted_ids: Some(json_value(&facts.emitted_ids, "emitted ids")?),
@@ -86,7 +87,7 @@ pub(super) fn read(
     })
 }
 
-/// Reads the stream facts of every stored event again from its metadata,
+/// Reads the stream facts of every stored event again from its conversation,
 /// page by page inside the caller's transaction, and bumps the structure
 /// revision of each session whose facts changed. An event stored before
 /// facts were read gets them now, without declared ids.
@@ -102,16 +103,21 @@ pub(super) fn rebuild(connection: &mut PgConnection) -> Result<(), AppError> {
                 llm_usage_events::id,
                 llm_usage_events::session_pk,
                 llm_usage_events::event_type,
-                llm_usage_events::metadata,
+                llm_usage_events::conversation,
                 llm_usage_events::previous_response_id,
             ))
-            .load::<(Uuid, Uuid, String, Value, Option<String>)>(connection)?;
+            .load::<(Uuid, Uuid, String, Option<Value>, Option<String>)>(connection)?;
         let Some(&(last, ..)) = page.last() else {
             break;
         };
         after = last;
-        for (event_pk, session_pk, event_type, metadata, previous) in page {
-            let facts = read(event_pk, &event_type, &metadata, previous.is_some())?;
+        for (event_pk, session_pk, event_type, conversation, previous) in page {
+            let facts = read(
+                event_pk,
+                &event_type,
+                conversation.as_ref(),
+                previous.is_some(),
+            )?;
             if write(connection, &facts)? > 0 {
                 changed.insert(session_pk);
             }

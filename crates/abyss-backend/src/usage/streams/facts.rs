@@ -66,8 +66,8 @@ impl Entry {
 
 /// The entries of the event's conversation; none when it is not completely
 /// decoded.
-fn conversation_entries(metadata: &Value) -> Vec<Entry> {
-    Conversation::read(metadata)
+fn conversation_entries(conversation: Option<&Value>) -> Vec<Entry> {
+    Conversation::read(conversation)
         .map(|conversation| conversation.entries)
         .unwrap_or_default()
 }
@@ -177,10 +177,10 @@ impl Label {
 }
 
 impl RequestFacts {
-    /// Reads the facts of a request event from its metadata.
+    /// Reads the facts of a request event from its conversation.
     /// core logic of connect exchanges.
-    pub fn read(metadata: &Value) -> Self {
-        let entries = conversation_entries(metadata);
+    pub fn read(conversation: Option<&Value>) -> Self {
+        let entries = conversation_entries(conversation);
         let Some(last) = entries.iter().rposition(Entry::is_model_side) else {
             return Self {
                 new_from: 0,
@@ -240,9 +240,9 @@ pub struct ResponseFacts {
 }
 
 impl ResponseFacts {
-    /// Reads the facts of a response event from its metadata.
-    pub fn read(metadata: &Value) -> Self {
-        let entries = conversation_entries(metadata);
+    /// Reads the facts of a response event from its conversation.
+    pub fn read(conversation: Option<&Value>) -> Self {
+        let entries = conversation_entries(conversation);
         Self {
             emitted_ids: identities(&entries),
             output_skeleton: skeleton(&entries),
@@ -264,7 +264,7 @@ mod tests {
     fn request_facts_follow_the_last_run_and_the_new_part() {
         // A tool loop resent with its history: the last run walks back
         // through the client's tool result to the user entry.
-        let facts = RequestFacts::read(&conversation(&json!([
+        let facts = RequestFacts::read(Some(&conversation(&json!([
             system("rules"),
             user("fix it"),
             reasoning(),
@@ -273,7 +273,7 @@ mod tests {
             reasoning(),
             call("b"),
             result("b")
-        ])));
+        ]))));
         assert_eq!(
             facts,
             RequestFacts {
@@ -287,37 +287,37 @@ mod tests {
         );
         // New user text after the last answer opens a turn; the answer's
         // text is its identity.
-        let facts = RequestFacts::read(&conversation(&json!([
+        let facts = RequestFacts::read(Some(&conversation(&json!([
             user("fix it"),
             call("a"),
             result("a"),
             assistant("fixed"),
             system("<reminder>"),
             user("next")
-        ])));
+        ]))));
         assert_eq!(facts.new_from, 4_i32);
         assert_eq!(facts.last_identity, Some(said("assistant", "fixed")));
         assert!(facts.trailing.is_empty());
         assert!(facts.starts_turn);
         assert!(facts.result_ids.is_empty());
         // Blank model text has no identity, so it trails the last call.
-        let facts = RequestFacts::read(&conversation(&json!([
+        let facts = RequestFacts::read(Some(&conversation(&json!([
             user("fix it"),
             call("a"),
             result("a"),
             reasoning(),
             assistant(" \n")
-        ])));
+        ]))));
         assert_eq!(facts.last_identity.as_deref(), Some("a"));
         assert_eq!(facts.trailing, ["reasoning", "assistant"]);
         // Without model output, every entry is new and tool results answer
         // calls that live elsewhere.
         assert_eq!(
-            RequestFacts::read(&conversation(&json!([
+            RequestFacts::read(Some(&conversation(&json!([
                 result("a"),
                 result("b"),
                 user("go")
-            ]))),
+            ])))),
             RequestFacts {
                 new_from: 0,
                 last_identity: None,
@@ -333,22 +333,25 @@ mod tests {
         );
         // A run without identities has nothing to align on and nothing
         // trailing; the run stops at the user entry before it.
-        let facts = RequestFacts::read(&conversation(&json!([
+        let facts = RequestFacts::read(Some(&conversation(&json!([
             call("a"),
             result("a"),
             user("thanks"),
             assistant(" ")
-        ])));
+        ]))));
         assert_eq!((facts.last_identity, facts.trailing), (None, Vec::new()));
         // Empty user text opens no turn; a request without a complete
         // conversation has no facts.
-        assert!(!RequestFacts::read(&conversation(&json!([assistant("a"), user("")]))).starts_turn);
-        assert_eq!(RequestFacts::read(&json!({})), RequestFacts::default());
+        assert!(
+            !RequestFacts::read(Some(&conversation(&json!([assistant("a"), user("")]))))
+                .starts_turn
+        );
+        assert_eq!(RequestFacts::read(None), RequestFacts::default());
         assert_eq!(
-            RequestFacts::read(&json!({"conversation": {
+            RequestFacts::read(Some(&json!({
                 "entries": [assistant("a"), user("next")],
                 "completeness": "partial"
-            }})),
+            }))),
             RequestFacts::default()
         );
     }
@@ -357,13 +360,13 @@ mod tests {
     fn response_facts_list_emitted_calls_and_the_output_skeleton() {
         let look = said("assistant", "let me look");
         assert_eq!(
-            ResponseFacts::read(&conversation(&json!([
+            ResponseFacts::read(Some(&conversation(&json!([
                 reasoning(),
                 assistant("let me look"),
                 call("a"),
                 call("b"),
                 {"role": "tool_result", "text": "found", "call_id": "s"}
-            ]))),
+            ])))),
             ResponseFacts {
                 emitted_ids: vec![look.clone(), "a".to_owned(), "b".to_owned()],
                 output_skeleton: skeleton(&[
@@ -376,7 +379,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ResponseFacts::read(&json!({"conversation": {}})),
+            ResponseFacts::read(Some(&json!({}))),
             ResponseFacts::default()
         );
     }
@@ -390,7 +393,7 @@ mod tests {
             item(assistant("let me look"), "msg_1"),
             item(call("a"), "fc_1"),
         ];
-        let facts = ResponseFacts::read(&conversation(&json!(output)));
+        let facts = ResponseFacts::read(Some(&conversation(&json!(output))));
         assert_eq!(
             facts.emitted_ids,
             ids(&["item:rs_1", "item:msg_1", "item:fc_1", "a"])
@@ -413,13 +416,13 @@ mod tests {
             item(assistant("done,"), "msg_2"),
             item(assistant("really"), "msg_2"),
         ]);
-        let facts = RequestFacts::read(&conversation(&json!(request)));
+        let facts = RequestFacts::read(Some(&conversation(&json!(request))));
         assert_eq!(facts.last_identity.as_deref(), Some("item:msg_2"));
         assert!(facts.trailing.is_empty());
         let mut request = vec![user("go")];
         request.extend(output);
         request.extend([result("a"), reasoning(), assistant("")]);
-        let facts = RequestFacts::read(&conversation(&json!(request)));
+        let facts = RequestFacts::read(Some(&conversation(&json!(request))));
         assert_eq!(facts.last_identity.as_deref(), Some("a"));
         assert_eq!(
             facts.trailing,
@@ -432,13 +435,13 @@ mod tests {
     fn model_text_without_ids_is_identified_by_its_digest_unless_blank() {
         // Chat Completions: `reasoning_content`, `content`, and the calls; only
         // the calls carry ids.
-        let facts = ResponseFacts::read(&conversation(&json!([
+        let facts = ResponseFacts::read(Some(&conversation(&json!([
             thought("plan"),
             assistant("abc"),
             call("a"),
             thought(" \n\t"),
             assistant("")
-        ])));
+        ]))));
         let (plan, abc) = (said("reasoning", "plan"), said("assistant", "abc"));
         assert_eq!(
             facts.emitted_ids,
@@ -462,18 +465,18 @@ mod tests {
         assert_ne!(said("assistant", "abc "), abc, "the exact text, untrimmed");
         assert_ne!(said("reasoning", "abc"), abc, "the role is part of it");
         // Entries with ids keep exactly those ids; other roles have none.
-        let facts = ResponseFacts::read(&conversation(&json!([
+        let facts = ResponseFacts::read(Some(&conversation(&json!([
             item(assistant("abc"), "msg_1"),
             item(thought("plan"), "rs_1"),
             call("a"),
             user("abc"),
             system("abc"),
             {"role": "tool_result", "text": "abc"}
-        ])));
+        ]))));
         assert_eq!(facts.emitted_ids, ids(&["item:msg_1", "item:rs_1", "a"]));
         // A request carries the answer back: blank thinking before it, as
         // OpenCode adds to an answer without thinking, does not trail it.
-        let facts = RequestFacts::read(&conversation(&json!([
+        let facts = RequestFacts::read(Some(&conversation(&json!([
             user("go"),
             thought("plan"),
             call("a"),
@@ -481,14 +484,15 @@ mod tests {
             thought(" "),
             assistant("abc"),
             user("next")
-        ])));
+        ]))));
         assert_eq!(facts.last_identity, Some(abc));
         assert!(facts.trailing.is_empty());
     }
 
     #[test]
     fn a_label_is_the_last_user_text_of_the_new_part_cut_to_fifty_units() {
-        let label = |entries: &serde_json::Value| RequestFacts::read(&conversation(entries)).label;
+        let label =
+            |entries: &serde_json::Value| RequestFacts::read(Some(&conversation(entries))).label;
         // Injected context comes first; the user's own words come last.
         let words = format!("{}😀tail", "a".repeat(49));
         assert_eq!(

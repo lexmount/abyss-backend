@@ -76,6 +76,7 @@ diesel::table! {
         stream_id -> Nullable<Text>,
         response_id -> Nullable<Text>,
         previous_response_id -> Nullable<Text>,
+        conversation -> Nullable<Text>,
     }
 }
 

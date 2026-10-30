@@ -273,7 +273,7 @@ pub struct MatchedText {
 pub struct InSessionHit {
     /// Event the piece belongs to.
     pub event_pk: Uuid,
-    /// Position of the entry in the event's `metadata.conversation.entries`.
+    /// Position of the entry in the event's `conversation.entries`.
     pub entry_index: u32,
     /// Which value of the entry the piece is.
     pub field: PieceField,

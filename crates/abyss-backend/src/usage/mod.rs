@@ -79,10 +79,14 @@ pub struct IngestUsageEvent {
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.
     pub event_type: UsageEventType,
+    /// Conversation of the `AgentEvent`, stored exactly as received.
+    #[serde(default)]
+    pub conversation: Option<Value>,
     /// Token counters of the `AgentEvent`; absent counters are stored as zero.
     #[serde(default)]
     pub token_usage: TokenUsagePayload,
-    /// Collector metadata retained with the raw event.
+    /// Collector metadata retained with the raw event; the conversation is
+    /// not part of it.
     #[serde(default = "empty_metadata")]
     pub metadata: Value,
     /// Optional image metadata and content ordered within the event.
@@ -395,7 +399,7 @@ pub struct RawEventsQuery {
 }
 
 impl RawEventsQuery {
-    /// Whether events carry their text, metadata, and attachments.
+    /// Whether events carry their conversation, metadata, and attachments.
     pub fn includes_content(&self) -> bool {
         self.fields.unwrap_or_default() == RawEventFields::Full
     }
@@ -405,11 +409,12 @@ impl RawEventsQuery {
 #[serde(rename_all = "snake_case")]
 /// Response projection requested from the raw-event endpoint.
 pub enum RawEventFields {
-    /// Return every event field, including text, metadata, and attachments.
+    /// Return every event field, including conversation, metadata, and attachments.
     #[default]
     Full,
-    /// Return what an event list shows. Text and metadata hold whole request
-    /// bodies, so storage does not read them and attachments are not loaded.
+    /// Return what an event list shows. Conversations hold whole request
+    /// bodies, so storage reads neither them nor metadata, and attachments are
+    /// not loaded.
     List,
 }
 
@@ -447,7 +452,7 @@ impl RawEventListResponse {
 
 #[derive(Debug, Serialize)]
 /// One usage event as an event list shows it: identity, model, Agent, device,
-/// and token counts, without text, metadata, or attachments.
+/// and token counts, without conversation, metadata, or attachments.
 pub struct UsageEventListItem {
     /// Backend-generated event primary key.
     pub id: Uuid,
@@ -581,6 +586,9 @@ pub struct UsageEventResponse {
     /// Response whose conversation the exchange's request continues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
+    /// Conversation of the event, as the collector reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Value>,
     /// Collector metadata retained without schema expansion.
     pub metadata: Value,
     /// Ordered attachment metadata associated with the event.
@@ -623,6 +631,10 @@ mod tests {
                     },
                     "event_type": "request",
                     "token_usage": {"input_tokens": 10_i64, "output_tokens": 0_i64, "cache_read_tokens": 2_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 12_i64},
+                    "conversation": {
+                        "entries": [{"role": "user", "text": "hello"}],
+                        "completeness": "complete"
+                    },
                     "metadata": {
                         "source": "unit-test"
                     }
@@ -654,6 +666,14 @@ mod tests {
             event.metadata,
             json!({ "source": "unit-test" }),
             "metadata should preserve arbitrary JSON object content"
+        );
+        assert_eq!(
+            event.conversation,
+            Some(json!({
+                "entries": [{"role": "user", "text": "hello"}],
+                "completeness": "complete"
+            })),
+            "the conversation should be kept as received"
         );
     }
 
@@ -699,6 +719,10 @@ mod tests {
             event.metadata,
             json!({}),
             "omitted metadata should default to an empty object"
+        );
+        assert_eq!(
+            event.conversation, None,
+            "omitted conversation stays absent"
         );
     }
 

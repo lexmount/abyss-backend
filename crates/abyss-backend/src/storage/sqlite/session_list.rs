@@ -249,13 +249,13 @@ mod tests {
             "event_type": "request",
             "token_usage": {"input_tokens": 0_i64, "output_tokens": 10_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 10_i64},
             // Each event asks in words after an answer, so each opens a turn.
-            "metadata": {"conversation": {
+            "conversation": {
                 "entries": [
                     {"role": "assistant", "text": "earlier"},
                     {"role": "user", "text": format!("ask {turn}")}
                 ],
                 "completeness": "complete"
-            }}
+            }
         })
     }
 

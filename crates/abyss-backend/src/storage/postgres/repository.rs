@@ -827,7 +827,7 @@ fn stream_facts(event_pk: Uuid, event: &IngestUsageEvent) -> Result<NewStreamFac
         ..super::stream_facts::read(
             event_pk,
             event.event_type.as_str(),
-            &event.metadata,
+            event.conversation.as_ref(),
             event.previous_response_id.is_some(),
         )?
     })
@@ -899,6 +899,7 @@ fn ingest_one_event(
             stream_id: event.stream_id.clone(),
             response_id: event.response_id.clone(),
             previous_response_id: event.previous_response_id.clone(),
+            conversation: event.conversation.clone(),
         })
         .on_conflict(llm_usage_events::event_id)
         .do_nothing()
@@ -1057,8 +1058,9 @@ fn upsert_session(
         .map_err(AppError::from)
 }
 
-/// Loads matching events newest first. Without content, text and metadata are
-/// not read: they hold whole request bodies, and an event list never shows them.
+/// Loads matching events newest first. Without content, the conversation and
+/// metadata are not read: the conversation holds whole request bodies, and an
+/// event list shows neither.
 fn load_filtered_events(
     connection: &mut PgConnection,
     filters: &EventFilters<'_>,
@@ -1141,6 +1143,7 @@ fn load_filtered_events(
             llm_usage_events::stream_id,
             llm_usage_events::response_id,
             llm_usage_events::previous_response_id,
+            None::<serde_json::Value>.into_sql::<Nullable<Jsonb>>(),
         ))
         .load::<UsageEvent>(connection)
         .map_err(AppError::from)
@@ -1239,6 +1242,7 @@ fn event_response(
         stream_id: event.stream_id,
         response_id: event.response_id,
         previous_response_id: event.previous_response_id,
+        conversation: event.conversation,
         metadata: event.metadata,
         attachments,
     }
@@ -1537,7 +1541,9 @@ mod tests {
             let accumulator = accumulators.entry(key).or_default();
             accumulator.sessions.insert(event.session_pk);
             // Ingest stores the same fact for every request it reads.
-            if event.event_type == "request" && RequestFacts::read(&event.metadata).starts_turn {
+            if event.event_type == "request"
+                && RequestFacts::read(event.conversation.as_ref()).starts_turn
+            {
                 accumulator.turns.insert(event.id);
             }
             if event.event_type == "request" {
@@ -1801,10 +1807,10 @@ mod tests {
             ),
         ];
         // The request asks in words, so it opens a turn.
-        events[0].metadata = json!({"conversation": {
+        events[0].conversation = Some(json!({
             "entries": [{"role": "user", "text": "ask"}],
             "completeness": "complete"
-        }});
+        }));
         let device_contexts =
             HashMap::from([(device_context_id, device_context(device_context_id))]);
         let group_by = vec![
@@ -1969,6 +1975,7 @@ mod tests {
                 model: "gpt-5.5".to_owned(),
             },
             event_type: UsageEventType::Request,
+            conversation: None,
             token_usage: TokenUsagePayload {
                 input_tokens: Some(5_i64),
                 output_tokens: Some(7_i64),
@@ -2016,6 +2023,7 @@ mod tests {
             stream_id: None,
             response_id: None,
             previous_response_id: None,
+            conversation: None,
         }
     }
 

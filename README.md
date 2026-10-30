@@ -52,6 +52,11 @@ events gain text identities; client-declared ids are kept, and each session
 whose facts changed gets a new structure revision. It runs once, on the first
 startup after the upgrade, and its time is mostly spent reading metadata.
 
+`20261029140000_event_conversation` adds the nullable JSON event column
+`conversation`. It moves the `conversation` key of every stored event's
+metadata into the new column and removes it from metadata, so it rewrites the
+event table once.
+
 Existing databases require separate handling: an already recorded migration is
 not reapplied when its source SQL changes. A database with the old turn schema
 must have its physical schema updated, including the event columns, dependent
@@ -226,7 +231,7 @@ sending a separate location request for every row.
 ### Search
 
 In the SQLite profile, search reads the pieces of each event's
-`metadata.conversation.entries`: the `text` of every entry, whatever its
+`conversation.entries`: the `text` of every entry, whatever its
 role, and its `name`, the tool name of a tool call. Entries are never joined,
 an empty value is not a piece, and nothing else is searched. The query is one
 literal substring, matched after folding every character to its lowercase
