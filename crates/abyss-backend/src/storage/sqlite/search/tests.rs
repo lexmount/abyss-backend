@@ -774,18 +774,21 @@ fn filters_narrow_the_matching_events() {
         ),
         [("alpha".to_owned(), 2)]
     );
-    assert!(
+    assert_eq!(
         sessions(
             &mut database,
             json!({"q": "搜索", "agent_name": ["claude-cli"]})
-        )
-        .is_empty()
+        ),
+        []
     );
     assert_eq!(
         sessions(&mut database, json!({"q": "搜索", "agent_name": ["claude-cli", "codex_exec"], "llm_provider": ["openai"], "llm_model": ["gpt-5"]})).len(),
         2
     );
-    assert!(sessions(&mut database, json!({"q": "搜索", "llm_model": ["absent"]})).is_empty());
+    assert_eq!(
+        sessions(&mut database, json!({"q": "搜索", "llm_model": ["absent"]})),
+        []
+    );
 }
 
 #[test]

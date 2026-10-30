@@ -317,9 +317,9 @@ mod tests {
             Some("a"),
             "the identity before the answer, past the tool result"
         );
-        assert!(facts.trailing.is_empty());
+        assert_eq!(facts.trailing, Vec::<String>::new());
         assert!(facts.starts_turn);
-        assert!(facts.result_ids.is_empty());
+        assert_eq!(facts.result_ids, Vec::<String>::new());
         // Blank model text has no identity, so it trails the last call.
         let facts = RequestFacts::read(Some(&conversation(&json!([
             user("fix it"),
@@ -445,7 +445,7 @@ mod tests {
             Some("a"),
             "the item's other entry repeats its id and is skipped"
         );
-        assert!(facts.trailing.is_empty());
+        assert_eq!(facts.trailing, Vec::<String>::new());
         let mut request = vec![user("go")];
         request.extend(output);
         request.extend([result("a"), reasoning(), assistant("")]);
@@ -518,7 +518,7 @@ mod tests {
             user("next")
         ]))));
         assert_eq!(facts.last_identity, Some(abc));
-        assert!(facts.trailing.is_empty());
+        assert_eq!(facts.trailing, Vec::<String>::new());
     }
 
     #[test]

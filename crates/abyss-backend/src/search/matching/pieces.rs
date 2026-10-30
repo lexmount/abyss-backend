@@ -108,8 +108,8 @@ mod tests {
                 },
             ]
         );
-        assert!(pieces(None).is_empty());
-        assert!(pieces(Some(&json!({"entries": "none"}))).is_empty());
+        assert_eq!(pieces(None), []);
+        assert_eq!(pieces(Some(&json!({"entries": "none"}))), []);
     }
 
     #[test]

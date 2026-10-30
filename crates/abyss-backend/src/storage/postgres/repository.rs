@@ -111,7 +111,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
             ) AS declares_turns, \
             COUNT(DISTINCT f.turn_id)::bigint AS declared_turns, \
             COUNT(*) FILTER (WHERE f.starts_turn \
-                AND (f.continues_context OR e.id IN first_openers))::bigint AS opened_turns, \
+                AND (f.continues_context OR e.id IN (SELECT id FROM first_openers)))::bigint AS opened_turns, \
             COUNT(*) FILTER (WHERE e.event_type = 'request')::bigint AS requests, \
             COUNT(*) FILTER (WHERE e.event_type = 'response')::bigint AS responses, \
             COALESCE(SUM(e.input_tokens), 0)::bigint AS input_tokens, \
