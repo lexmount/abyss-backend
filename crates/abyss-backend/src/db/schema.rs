@@ -28,7 +28,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::{Jsonb, Nullable, Text, Timestamptz, Uuid};
+    use diesel::sql_types::{BigInt, Jsonb, Nullable, Text, Timestamptz, Uuid};
 
     agent_sessions (id) {
         id -> Uuid,
@@ -42,44 +42,25 @@ diesel::table! {
         metadata -> Jsonb,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        structure_revision -> BigInt,
     }
 }
 
 diesel::table! {
-    use diesel::sql_types::{Integer, Nullable, Text, Timestamptz, Uuid};
-
-    agent_turns (id) {
-        id -> Uuid,
-        user_id -> Uuid,
-        session_pk -> Uuid,
-        turn_index -> Integer,
-        turn_key -> Nullable<Text>,
-        started_at -> Timestamptz,
-        ended_at -> Nullable<Timestamptz>,
-        created_at -> Timestamptz,
-        updated_at -> Timestamptz,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::{BigInt, Bytea, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid};
+    use diesel::sql_types::{BigInt, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid};
 
     llm_usage_events (id) {
         id -> Uuid,
         user_id -> Uuid,
         device_context_id -> Uuid,
         session_pk -> Uuid,
-        turn_pk -> Uuid,
         event_id -> Text,
         agent_name -> Text,
         agent_version -> Nullable<Text>,
         session_id -> Text,
-        turn_index -> Integer,
         llm_provider -> Text,
         llm_model -> Text,
         event_type -> Text,
-        text -> Nullable<Text>,
-        text_sha256 -> Nullable<Bytea>,
         input_tokens -> BigInt,
         output_tokens -> BigInt,
         cache_read_tokens -> BigInt,
@@ -92,6 +73,30 @@ diesel::table! {
         stream_id -> Nullable<Text>,
         response_id -> Nullable<Text>,
         previous_response_id -> Nullable<Text>,
+        conversation -> Nullable<Jsonb>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::{Bool, Integer, Jsonb, Nullable, Text, Uuid};
+
+    llm_usage_event_stream_facts (event_pk) {
+        event_pk -> Uuid,
+        new_from -> Nullable<Integer>,
+        continues_context -> Nullable<Bool>,
+        starts_turn -> Nullable<Bool>,
+        last_identity -> Nullable<Text>,
+        previous_identity -> Nullable<Text>,
+        trailing -> Nullable<Jsonb>,
+        result_ids -> Nullable<Jsonb>,
+        emitted_ids -> Nullable<Jsonb>,
+        output_skeleton -> Nullable<Jsonb>,
+        label_index -> Nullable<Integer>,
+        label_text -> Nullable<Text>,
+        label_length -> Nullable<Integer>,
+        subagent_id -> Nullable<Text>,
+        parent_subagent_id -> Nullable<Text>,
+        turn_id -> Nullable<Text>,
     }
 }
 
@@ -173,15 +178,13 @@ diesel::table! {
 
 diesel::joinable!(agent_sessions -> app_users (user_id));
 diesel::joinable!(agent_sessions -> devices (device_context_id));
-diesel::joinable!(agent_turns -> agent_sessions (session_pk));
-diesel::joinable!(agent_turns -> app_users (user_id));
 diesel::joinable!(devices -> app_users (user_id));
 diesel::joinable!(llm_usage_events -> agent_sessions (session_pk));
-diesel::joinable!(llm_usage_events -> agent_turns (turn_pk));
 diesel::joinable!(llm_usage_events -> app_users (user_id));
 diesel::joinable!(llm_usage_events -> devices (device_context_id));
 diesel::joinable!(llm_usage_event_attachments -> app_users (user_id));
 diesel::joinable!(llm_usage_event_attachments -> llm_usage_events (event_pk));
+diesel::joinable!(llm_usage_event_stream_facts -> llm_usage_events (event_pk));
 diesel::joinable!(agent_diagnostic_capture_events -> agent_diagnostic_captures (capture_pk));
 diesel::joinable!(agent_diagnostic_capture_events -> llm_usage_events (event_pk));
 diesel::joinable!(agent_diagnostic_captures -> agent_sessions (session_pk));
@@ -193,11 +196,11 @@ diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_capture_events,
     agent_diagnostic_captures,
     agent_sessions,
-    agent_turns,
     app_users,
     devices,
     llm_usage_events,
     llm_usage_event_attachments,
+    llm_usage_event_stream_facts,
     search_outbox,
     session_titles,
 );

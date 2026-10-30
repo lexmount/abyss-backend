@@ -109,8 +109,11 @@ def event(
         "response_id": f"response-{run_id}",
         "llm": {"provider": "openai", "model": "gpt-5.5"},
         "event_type": event_type,
-        "text": text,
         "token_usage": token_usage,
+        "conversation": {
+            "entries": [{"role": "user" if event_type == "request" else "assistant", "text": text}],
+            "completeness": "complete",
+        },
         "metadata": {"test_run": run_id},
     }
     if event_type == "request":
@@ -126,7 +129,7 @@ def event(
     return value
 
 
-def run(base_url: str, token: str, run_id: str) -> None:
+def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     session_id = f"session-blackbox-{run_id}"
     request_event_id = f"event-request-{run_id}"
     response_event_id = f"event-response-{run_id}"
@@ -238,6 +241,14 @@ def run(base_url: str, token: str, run_id: str) -> None:
         ),
         "events must return the exchange identities they were ingested with",
     )
+    require(
+        all(
+            item["conversation"]["completeness"] == "complete"
+            and item["metadata"] == {"test_run": run_id}
+            for item in raw_events
+        ),
+        "events must return the conversation at the top level, outside metadata",
+    )
 
     # The list projection carries what an event list shows and no content.
     list_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
@@ -250,10 +261,10 @@ def run(base_url: str, token: str, run_id: str) -> None:
         [item["id"] for item in listed_events] == [item["id"] for item in raw_events],
         "event list must return the same events in the same order",
     )
-    content_fields = {"text", "text_sha256", "metadata", "attachments"}
+    content_fields = {"conversation", "metadata", "attachments"}
     require(
         all(content_fields.isdisjoint(item) for item in listed_events),
-        "event list items must leave out text, metadata, and attachments",
+        "event list items must leave out conversation, metadata, and attachments",
     )
     require(
         all(
@@ -369,6 +380,30 @@ def run(base_url: str, token: str, run_id: str) -> None:
         [(row["llm_model"], row["total_tokens"]) for row in any_of_rows] == [("gpt-5.5", 36)],
         "summary must aggregate every repeated filter value",
     )
+
+    # Days follow the requested time zone; both events are at 08:00 UTC.
+    def day_totals(time_zone: str | None) -> list[tuple[str, int]]:
+        params = [("group_by", "day"), ("session_id", session_id)]
+        if time_zone is not None:
+            params.append(("tz", time_zone))
+        response = request(
+            base_url, "GET", "/v1/agent-usage/summary?" + urllib.parse.urlencode(params), token=token
+        )
+        require_status(response, 200, f"usage summary by day in {time_zone or 'UTC'}")
+        return [(row["day"], row["total_tokens"]) for row in response.json()["rows"]]
+
+    require(day_totals(None) == [("2026-08-24", 36)], "summary days must default to UTC")
+    require(
+        day_totals("Pacific/Honolulu") == [("2026-08-23", 36)],
+        "summary days must follow the requested time zone",
+    )
+    invalid_zone = request(
+        base_url,
+        "GET",
+        "/v1/agent-usage/summary?" + urllib.parse.urlencode({"group_by": "day", "tz": "UTC+8"}),
+        token=token,
+    )
+    require_status(invalid_zone, 400, "usage summary with an unknown time zone")
     any_of_sessions_path = "/v1/agent-usage/sessions?" + urllib.parse.urlencode(
         [("llm_model", "absent-model"), ("llm_model", "gpt-5.5"), ("page_size", 100)]
     )
@@ -380,107 +415,28 @@ def run(base_url: str, token: str, run_id: str) -> None:
     )
 
     session_pk = raw_events[0]["session_pk"]
-    timeline = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{session_pk}",
-        token=token,
+    session_events = sorted(
+        raw_events,
+        key=lambda item: (item["observed_at"], item["event_type"], item["id"]),
     )
-    require_status(timeline, 200, "session timeline")
-    timeline_events = [
-        item
-        for turn in timeline.json()["turns"]
-        for item in turn["events"]
-    ]
-    trajectory = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{session_pk}/trajectory",
-        token=token,
-    )
-    require_status(trajectory, 200, "session trajectory")
-    usage_events = trajectory.json()["events"]
-    require(
-        [item["event_pk"] for item in usage_events]
-        == [item["id"] for item in timeline_events],
-        "trajectory usage must preserve every event in authoritative order",
-    )
-    for usage_event, timeline_event in zip(usage_events, timeline_events):
-        for field in (
-            "turn_index", "event_type", "observed_at", "llm_model",
-            "input_tokens", "output_tokens", "cache_read_tokens",
-            "cache_write_tokens", "reasoning_tokens", "total_tokens",
-        ):
-            require(
-                usage_event[field] == timeline_event[field],
-                f"trajectory usage {field} must match the authoritative event",
-            )
-        require(usage_event["token_usage_available"], "nonzero usage must be available")
-        require("text" not in usage_event and "metadata" not in usage_event,
-                "trajectory usage summaries must omit content bodies")
-    require(
-        [item["event_id"] for item in timeline_events]
-        == [request_event_id, response_event_id],
-        "session timeline must preserve request-before-response ordering",
-    )
-
-    outline = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{session_pk}/outline",
-        token=token,
-    )
-    require_status(outline, 200, "session outline")
-    outline_body = outline.json()
-    require(
-        outline_body["session"] == timeline.json()["session"],
-        "session outline must return the timeline session information",
-    )
-    outline_events = [
-        item for turn in outline_body["turns"] for item in turn["events"]
-    ]
-    require(
-        [item["id"] for item in outline_events]
-        == [item["id"] for item in timeline_events],
-        "session outline must preserve the timeline event order",
-    )
-    for outline_event, timeline_event in zip(outline_events, timeline_events):
-        require(
-            "text" not in outline_event and "metadata" not in outline_event,
-            "session outline events must omit content bodies",
-        )
-        for field in ("event_type", "llm_model", "total_tokens", "observed_at"):
-            require(
-                outline_event[field] == timeline_event[field],
-                f"session outline {field} must match the timeline event",
-            )
-        require(
-            outline_event["text_chars"] == len(timeline_event["text"] or ""),
-            "session outline text length must count characters",
-        )
-        require(
-            outline_event["attachment_count"] == len(timeline_event["attachments"]),
-            "session outline must count event attachments",
-        )
-    missing_outline = request(
-        base_url,
-        "GET",
-        f"/v1/agent-usage/sessions/{uuid.uuid4()}/outline",
-        token=token,
-    )
-    require_status(missing_outline, 404, "unknown session outline")
-
-    for timeline_event in timeline_events:
+    for session_event in session_events:
         single = request(
             base_url,
             "GET",
-            f"/v1/agent-usage/events/{timeline_event['id']}",
+            f"/v1/agent-usage/events/{session_event['id']}",
             token=token,
         )
         require_status(single, 200, "single event query")
+        # A single event also says where it currently is in its session.
+        single_event = single.json()
+        location = single_event.pop("location", None)
         require(
-            single.json() == timeline_event,
-            "single event query must match the timeline event exactly",
+            single_event == session_event,
+            "single event query must match the raw event exactly",
+        )
+        require(
+            isinstance(location, dict) and location.get("segment"),
+            "single event query must carry the event's current segment",
         )
         require(
             IMAGE_BASE64.encode() not in single.body,
@@ -496,7 +452,7 @@ def run(base_url: str, token: str, run_id: str) -> None:
     unauthenticated_event = request(
         base_url,
         "GET",
-        f"/v1/agent-usage/events/{timeline_events[0]['id']}",
+        f"/v1/agent-usage/events/{session_events[0]['id']}",
     )
     require_status(unauthenticated_event, 401, "unauthenticated single event query")
 
@@ -531,15 +487,250 @@ def run(base_url: str, token: str, run_id: str) -> None:
         any(segment["highlighted"] for segment in segments),
         "search must return structured highlights",
     )
+    found = next(item for item in search_result["items"] if item["session_pk"] == session_pk)
+    require(
+        (found["match_count"], found["new_match_count"]) == (1, 1),
+        f"the response matches once, outside any inherited context: {found}",
+    )
+    require(
+        all(
+            match["new"] is True and match["event_pk"] == session_events[1]["id"]
+            for match in found["matches"]
+        ),
+        f"each match says whether it is new: {found['matches']}",
+    )
+    run_in_session_search_contract(
+        base_url, token, session_pk, [item["id"] for item in session_events], in_session
+    )
+
+    run_sub_agent_contract(base_url, token, run_id)
 
     from session_titles_api import run_title_contract
 
     run_title_contract(base_url, token, run_id)
 
-    from turns_api import run_turn_contract
-
-    run_turn_contract(base_url, token, run_id)
     print(f"blackbox API contract passed for {session_id}")
+
+
+def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
+    """Declared sub-agent ids are stored with each event and group the turn's
+    exchanges: the sub-agent's exchanges form a segment of their own, never
+    attached to the main line. The undeclared request belongs to the main
+    agent; nothing in that group is continued, so it stays on the main line
+    beside the main request. The turn is counted once by the session list and
+    the header."""
+    session_id = f"session-subagent-{run_id}"
+
+    def declared_event(
+        name: str, event_type: str, second: int, declared: dict[str, str | None]
+    ) -> dict[str, Any]:
+        value = event(
+            f"event-{name}-{event_type}-{run_id}",
+            session_id,
+            event_type,
+            f"{name} {event_type}",
+            token_usage(input_tokens=1),
+            run_id,
+        )
+        value.pop("attachments", None)
+        value["observed_at"] = f"2026-08-24T09:00:{second:02d}Z"
+        value["response_id"] = f"{name}-{run_id}"
+        value.update(declared)
+        return value
+
+    main = {"turn_id": f"turn-{run_id}"}
+    sub = {
+        "subagent_id": f"agent-{run_id}",
+        "parent_subagent_id": None,
+        "turn_id": f"turn-{run_id}",
+    }
+    ingest = request(
+        base_url,
+        "POST",
+        "/v1/agent-usage/events",
+        token=token,
+        json_body={
+            "events": [
+                declared_event("main", "request", 1, main),
+                declared_event("main", "response", 9, main),
+                declared_event("sub", "request", 2, sub),
+                declared_event("sub", "response", 3, sub),
+                declared_event("side", "request", 4, {}),
+                declared_event("side", "response", 5, {}),
+            ]
+        },
+    )
+    require_status(ingest, 200, "sub-agent event ingest")
+    require(ingest.json()["accepted"] == 6, "sub-agent ingest must accept six events")
+    raw_path = "/v1/agent-usage/events?" + urllib.parse.urlencode(
+        {"session_id": session_id, "limit": 10}
+    )
+    raw = request(base_url, "GET", raw_path, token=token)
+    require_status(raw, 200, "sub-agent raw event query")
+    session_pk = raw.json()["events"][0]["session_pk"]
+
+    streams = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/streams", token=token
+    )
+    require_status(streams, 200, "sub-agent session streams")
+    segments = [
+        (
+            segment["head"],
+            segment.get("subagent_id"),
+            segment.get("attached_to"),
+            segment.get("attached_by"),
+        )
+        for segment in streams.json()["segments"]
+    ]
+    require(
+        segments
+        == [
+            (f"main-{run_id}", None, None, None),
+            (f"sub-{run_id}", f"agent-{run_id}", None, None),
+        ],
+        f"the main agent and the sub-agent each have one segment, unattached: {segments}",
+    )
+    turns = [(segment.get("turn_id"), segment.get("turn")) for segment in streams.json()["segments"]]
+    require(
+        turns == [(f"turn-{run_id}", 1)] * 2,
+        f"the main agent and the sub-agent share turn 1: {turns}",
+    )
+    turn_view = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/turns", token=token
+    )
+    require_status(turn_view, 200, "sub-agent session turns")
+    turn_nodes = [
+        (
+            node["turn"],
+            node["turn_id"],
+            node["new_context"],
+            [
+                (executor["subagent_id"], executor["main"], executor["side"])
+                for executor in node["executors"]
+            ],
+        )
+        for node in turn_view.json()["turns"]
+    ]
+    require(
+        turn_nodes
+        == [
+            (
+                1,
+                f"turn-{run_id}",
+                True,
+                [
+                    (None, [f"main-{run_id}"], []),
+                    (f"agent-{run_id}", [f"sub-{run_id}"], []),
+                ],
+            )
+        ],
+        f"one turn node holds the main agent and the sub-agent: {turn_nodes}",
+    )
+    header = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/header", token=token
+    )
+    require_status(header, 200, "sub-agent session header")
+    require(header.json()["turn_count"] == 1, f"the header counts one turn: {header.json()}")
+    listed = request(
+        base_url,
+        "GET",
+        "/v1/agent-usage/sessions?" + urllib.parse.urlencode({"page_size": 100}),
+        token=token,
+    )
+    require_status(listed, 200, "sub-agent session list")
+    listed_turns = [
+        item["turns"] for item in listed.json()["items"] if item["session_id"] == session_id
+    ]
+    require(listed_turns == [1], f"the session list counts one turn: {listed_turns}")
+    side_request = next(
+        item for item in raw.json()["events"] if item["event_id"] == f"event-side-request-{run_id}"
+    )
+    location = request(
+        base_url, "GET", f"/v1/agent-usage/events/{side_request['id']}/location", token=token
+    )
+    require_status(location, 200, "side request location")
+    require(
+        location.json().get("turn") == 1 and "segment_index" not in location.json(),
+        f"the side request is located in turn 1: {location.json()}",
+    )
+    segment = request(
+        base_url,
+        "GET",
+        f"/v1/agent-usage/sessions/{session_pk}/segments/sub-{run_id}",
+        token=token,
+    )
+    require_status(segment, 200, "sub-agent segment")
+    exchange = segment.json()["exchanges"][0]
+    declared = (
+        exchange.get("subagent_id"),
+        exchange.get("parent_subagent_id"),
+        exchange.get("turn_id"),
+        exchange.get("turn"),
+    )
+    require(
+        declared == (f"agent-{run_id}", None, f"turn-{run_id}", 1),
+        f"the exchange carries its declared ids: {declared}",
+    )
+
+
+def in_session_search_path(session_pk: str, query: str) -> str:
+    return (
+        f"/v1/agent-usage/sessions/{session_pk}/search?"
+        + urllib.parse.urlencode([("q", query)])
+    )
+
+
+def run_in_session_search_contract(
+    base_url: str, token: str, session_pk: str, event_pks: list[str], supported: bool
+) -> None:
+    """Every hit of a query in one session, with UTF-16 occurrence ranges and
+    the segment of each hit's event."""
+    path = in_session_search_path(session_pk, "BLACKBOX")
+    if not supported:
+        response = request(base_url, "GET", path, token=token)
+        require_status(response, 503, "search within a session is not supported")
+        return
+    response = request(base_url, "GET", path, token=token)
+    require_status(response, 200, "search within a session")
+    found = response.json()
+    require(
+        set(found) == {"query", "texts", "hits", "truncated"} and found["truncated"] is False,
+        f"in-session search response shape: {found}",
+    )
+    streams = request(
+        base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/streams", token=token
+    )
+    require_status(streams, 200, "session streams")
+    heads = [segment["head"] for segment in streams.json()["segments"]]
+    require(len(heads) == 1, f"the session is one segment: {heads}")
+    hits = [
+        (hit["event_pk"], hit["entry_index"], hit["field"], hit["new"], hit["segment"])
+        for hit in found["hits"]
+    ]
+    require(
+        hits
+        == [
+            (event_pks[0], 0, "text", True, heads[0]),
+            (event_pks[1], 0, "text", True, heads[0]),
+        ],
+        f"hits of every piece in session order, in their segment: {hits}",
+    )
+    texts = {text["id"]: text["ranges"] for text in found["texts"]}
+    require(
+        set(texts) == {hit["text_id"] for hit in found["hits"]} and len(texts) == 2,
+        f"each distinct text once: {found['texts']}",
+    )
+    require(
+        all(ranges == [[0, len("blackbox")]] for ranges in texts.values()),
+        f"ranges are UTF-16 offsets of the original text: {texts}",
+    )
+    missing = request(
+        base_url, "GET", in_session_search_path(str(uuid.uuid4()), "blackbox"), token=token
+    )
+    require_status(missing, 404, "search within an unknown session")
+    empty = request(base_url, "GET", in_session_search_path(session_pk, " "), token=token)
+    require_status(empty, 400, "search within a session without a query")
+    require_status(request(base_url, "GET", path), 401, "unauthenticated in-session search")
 
 
 def main() -> None:
@@ -547,8 +738,13 @@ def main() -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--in-session-search",
+        action="store_true",
+        help="the storage profile supports search within a session",
+    )
     args = parser.parse_args()
-    run(args.base_url.rstrip("/"), args.token, args.run_id)
+    run(args.base_url.rstrip("/"), args.token, args.run_id, args.in_session_search)
     from comparison_api import run as run_comparison
     run_comparison(args.base_url.rstrip("/"), args.token)
 

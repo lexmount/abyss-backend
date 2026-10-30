@@ -11,8 +11,6 @@ results:
 python3 scripts/bench/search_bench.py --base-url http://127.0.0.1:PORT \
     --token-file TOKEN --out before.json
 python3 scripts/bench/search_bench.py --compare before.json after.json
-python3 scripts/bench/search_bench.py --phases DB.sqlite --term entry
 ```
 
-`--phases` times the original three SQL phases directly against a database
-copy. Run benchmarks against a copy, never a live database.
+Run benchmarks against a copy, never a live database.

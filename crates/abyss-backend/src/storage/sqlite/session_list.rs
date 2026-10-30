@@ -2,13 +2,16 @@
 
 use diesel::{
     QueryableByName, RunQueryDsl, SqliteConnection, sql_query,
-    sql_types::{BigInt, Bool, Nullable, Text},
+    sql_types::{BigInt, Bool, Integer, Nullable, Text},
 };
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    usage::session_list::{SessionListItem, SessionListResponse, ValidatedSessionListQuery},
+    usage::{
+        session_list::{SessionListItem, SessionListResponse, ValidatedSessionListQuery},
+        streams::EntryLabel,
+    },
 };
 
 use super::{
@@ -34,14 +37,29 @@ const ACTIVITY_CTE: &str = "\
             s.started_at AS started_at, \
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
-            (SELECT COUNT(*) FROM agent_turns t WHERE t.session_pk = s.id) AS turns, \
+            (SELECT CASE WHEN COUNT(tf.turn_id) > 0 THEN COUNT(DISTINCT tf.turn_id) \
+                    ELSE COUNT(*) FILTER (WHERE tf.starts_turn = 1 AND tf.continues_context = 1) \
+                    + COALESCE((SELECT 1 - ff.continues_context \
+                        FROM llm_usage_events fe \
+                        JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
+                        WHERE fe.session_pk = s.id AND ff.starts_turn = 1 \
+                        ORDER BY fe.observed_at, fe.id LIMIT 1), 0) END \
+             FROM llm_usage_events te \
+             JOIN llm_usage_event_stream_facts tf ON tf.event_pk = te.id \
+             WHERE te.session_pk = s.id) AS turns, \
             COUNT(e.session_pk) AS events, \
             COALESCE(SUM(e.total_tokens), 0) AS total_tokens, \
-            st.title AS title, \
+            title_event.id AS title_event_pk, \
+            title_facts.label_index AS title_index, \
+            title_facts.label_text AS title_text, \
+            title_facts.label_length AS title_length, \
             st.purpose AS purpose \
         FROM agent_sessions s \
         JOIN devices d ON d.id = s.device_context_id \
-        LEFT JOIN session_titles st ON st.session_pk = s.id \
+        LEFT JOIN session_titles st ON st.session_pk = s.id AND st.user_id = s.user_id \
+        LEFT JOIN llm_usage_events title_event ON title_event.id = st.title_event_pk \
+            AND title_event.session_pk = s.id AND title_event.event_type = 'request' \
+        LEFT JOIN llm_usage_event_stream_facts title_facts ON title_facts.event_pk = title_event.id \
         LEFT JOIN llm_usage_events e ON e.session_pk = s.id \
         WHERE s.user_id = ?1 \
             AND (?2 = 0 OR s.agent_name IN (SELECT value FROM json_each(?3))) \
@@ -88,7 +106,13 @@ struct SessionListRow {
     #[diesel(sql_type = BigInt)]
     total_tokens: i64,
     #[diesel(sql_type = Nullable<Text>)]
-    title: Option<String>,
+    title_event_pk: Option<String>,
+    #[diesel(sql_type = Nullable<Integer>)]
+    title_index: Option<i32>,
+    #[diesel(sql_type = Nullable<Text>)]
+    title_text: Option<String>,
+    #[diesel(sql_type = Nullable<Integer>)]
+    title_length: Option<i32>,
     #[diesel(sql_type = Nullable<Text>)]
     purpose: Option<String>,
 }
@@ -163,7 +187,15 @@ pub(super) fn list_sessions(
                 turns: row.turns,
                 events: row.events,
                 total_tokens: row.total_tokens,
-                title: row.title,
+                title: EntryLabel::from_columns(
+                    row.title_event_pk
+                        .as_deref()
+                        .map(|pk| parse_uuid(pk, "title event id"))
+                        .transpose()?,
+                    row.title_index,
+                    row.title_text,
+                    row.title_length,
+                ),
                 purpose: row.purpose,
             })
         })
@@ -213,12 +245,17 @@ mod tests {
             "device": {"host_name": "alice-mbp", "platform": "macos"},
             "agent": {"name": agent},
             "session_id": session,
-            "turn_id": format!("{session}-{turn}"),
             "llm": {"provider": "OpenAI", "model": model},
-            "event_type": "response",
-            "text": "reply",
+            "event_type": "request",
             "token_usage": {"input_tokens": 0_i64, "output_tokens": 10_i64, "cache_read_tokens": 0_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 10_i64},
-            "metadata": {}
+            // Each event asks in words after an answer, so each opens a turn.
+            "conversation": {
+                "entries": [
+                    {"role": "assistant", "text": "earlier"},
+                    {"role": "user", "text": format!("ask {turn}")}
+                ],
+                "completeness": "complete"
+            }
         })
     }
 

@@ -105,11 +105,12 @@ pub struct SessionListItem {
     pub ended_at: Option<DateTime<Utc>>,
     /// Latest event observation, or the session start when it has no events.
     pub last_activity_at: DateTime<Utc>,
+    /// Requests whose stream facts say they open a turn.
     pub turns: i64,
     pub events: i64,
     pub total_tokens: i64,
-    /// Agent-generated title, or a first-user-input preview for other Agents.
-    pub title: Option<String>,
+    /// The earliest request's new-part label, without display formatting.
+    pub title: Option<super::streams::EntryLabel>,
     /// Why the session exists when it only serves the Agent, such as
     /// `title_generation`; `None` for ordinary sessions.
     pub purpose: Option<String>,

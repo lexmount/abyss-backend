@@ -1,7 +1,7 @@
 //! API contracts and shared transformations for Agent usage collection.
 //!
 //! Ingest types preserve collector-provided observations, while response types
-//! expose the normalized device/session/turn hierarchy returned by every storage
+//! expose the normalized device/session hierarchy returned by every storage
 //! backend. Deterministic validation and metadata transformations live here;
 //! backend-specific persistence stays behind the storage compatibility layer.
 
@@ -12,17 +12,26 @@ pub mod comparison;
 mod conversation;
 /// Opaque diagnostic-capture ingest contracts.
 pub mod diagnostics;
-pub mod event_order;
 pub mod persistence;
+/// Previews of an event's conversation entries.
+pub mod preview;
+/// One segment's exchanges for the session page.
+pub mod segments;
+/// The header of the session page.
+pub mod session_header;
 /// Owner-scoped session index contracts.
 pub mod session_list;
-pub mod session_title;
-pub mod trajectory;
+/// Streams of a session: stream facts, bases, and segments.
+pub mod streams;
+/// Local calendar days for summaries grouped by day.
+pub mod time_zone;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use self::streams::EventLocation;
 
 #[derive(Deserialize)]
 /// Atomic batch accepted by the event-ingestion endpoint.
@@ -47,33 +56,37 @@ pub struct IngestUsageEvent {
     pub agent: AgentPayload,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// The user turn this request works for, unique within its session;
-    /// absent when the collector cannot identify a particular turn.
-    pub turn_id: Option<String>,
-    /// Whether the request comes from a thread the Agent opened only to name
-    /// another session.
-    #[serde(default)]
-    pub naming_thread: bool,
     /// The thread that sent this exchange's request, as the Agent declares
     /// it; requests with the same value continue one conversation.
     pub stream_id: Option<String>,
     /// Provider identity of the response this exchange produced; both events
-    /// of the exchange carry it. Used to group a fallback turn when `turn_id`
-    /// is absent; one user turn can contain several such model calls.
+    /// of the exchange carry it.
     pub response_id: Option<String>,
     /// The response this exchange's request continues after; the request then
     /// carries only the messages added since.
     pub previous_response_id: Option<String>,
+    /// Id of the sub-agent this exchange belongs to, as the client declares
+    /// it; absent on the main line and its side requests.
+    pub subagent_id: Option<String>,
+    /// Id of the sub-agent that started this one, as the client declares it;
+    /// absent when the main line started it.
+    pub parent_subagent_id: Option<String>,
+    /// The turn this exchange works for: the user input that started it, as
+    /// the client declares it. A sub-agent and a side request carry the value
+    /// of the turn they work for.
+    pub turn_id: Option<String>,
     /// LLM provider and model labels.
     pub llm: LlmPayload,
     /// Whether the event represents the request or response side of a call.
     pub event_type: UsageEventType,
-    /// Optional prompt or response text.
-    pub text: Option<String>,
+    /// Conversation of the `AgentEvent`, stored exactly as received.
+    #[serde(default)]
+    pub conversation: Option<Value>,
     /// Token counters of the `AgentEvent`; absent counters are stored as zero.
     #[serde(default)]
     pub token_usage: TokenUsagePayload,
-    /// Collector metadata retained with the raw event.
+    /// Collector metadata retained with the raw event; the conversation is
+    /// not part of it.
     #[serde(default = "empty_metadata")]
     pub metadata: Value,
     /// Optional image metadata and content ordered within the event.
@@ -180,6 +193,9 @@ pub struct SummaryQuery {
     pub to: Option<DateTime<Utc>>,
     /// Comma-separated grouping dimensions.
     pub group_by: Option<String>,
+    /// IANA time zone whose calendar days the `day` dimension follows; UTC
+    /// when absent.
+    pub tz: Option<String>,
     /// Selects the full or token-only response shape.
     pub fields: Option<SummaryFields>,
     /// User UUID, name, or email filter retained for the summary contract.
@@ -265,7 +281,7 @@ pub struct SummaryRow {
     pub event_type: Option<String>,
     /// Distinct sessions in this bucket.
     pub sessions: usize,
-    /// Distinct turns in this bucket.
+    /// Requests in this bucket whose stream facts say they open a turn.
     pub turns: usize,
     /// Request events in this bucket.
     pub requests: i64,
@@ -363,8 +379,6 @@ pub struct RawEventsQuery {
     pub session_id: Vec<String>,
     /// Backend session primary-key filter.
     pub session_pk: Option<Uuid>,
-    /// Normalized turn-number filter.
-    pub turn_index: Option<i32>,
     /// LLM provider filter; repeat the key to match any of several providers.
     #[serde(default)]
     pub llm_provider: Vec<String>,
@@ -379,10 +393,13 @@ pub struct RawEventsQuery {
     pub offset: Option<i64>,
     /// Selects complete events or the content-free list projection.
     pub fields: Option<RawEventFields>,
+    /// Includes each event's current segment and exchange when requested.
+    #[serde(default)]
+    pub locate: bool,
 }
 
 impl RawEventsQuery {
-    /// Whether events carry their text, metadata, and attachments.
+    /// Whether events carry their conversation, metadata, and attachments.
     pub fn includes_content(&self) -> bool {
         self.fields.unwrap_or_default() == RawEventFields::Full
     }
@@ -392,11 +409,12 @@ impl RawEventsQuery {
 #[serde(rename_all = "snake_case")]
 /// Response projection requested from the raw-event endpoint.
 pub enum RawEventFields {
-    /// Return every event field, including text, metadata, and attachments.
+    /// Return every event field, including conversation, metadata, and attachments.
     #[default]
     Full,
-    /// Return what an event list shows. Text and metadata hold whole request
-    /// bodies, so storage does not read them and attachments are not loaded.
+    /// Return what an event list shows. Conversations hold whole request
+    /// bodies, so storage reads neither them nor metadata, and attachments are
+    /// not loaded.
     List,
 }
 
@@ -434,7 +452,7 @@ impl RawEventListResponse {
 
 #[derive(Debug, Serialize)]
 /// One usage event as an event list shows it: identity, model, Agent, device,
-/// and token counts, without text, metadata, or attachments.
+/// and token counts, without conversation, metadata, or attachments.
 pub struct UsageEventListItem {
     /// Backend-generated event primary key.
     pub id: Uuid,
@@ -452,16 +470,15 @@ pub struct UsageEventListItem {
     pub platform: Option<String>,
     /// Backend session primary key.
     pub session_pk: Uuid,
-    /// Backend turn primary key.
-    pub turn_pk: Uuid,
+    /// Current stream position, when the request asks for event locations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<EventLocation>,
     /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Agent version observed on this event.
     pub agent_version: Option<String>,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// Backend-normalized turn number.
-    pub turn_index: i32,
     /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
@@ -494,11 +511,10 @@ impl From<UsageEventResponse> for UsageEventListItem {
             host_name: event.host_name,
             platform: event.platform,
             session_pk: event.session_pk,
-            turn_pk: event.turn_pk,
+            location: event.location,
             agent_name: event.agent_name,
             agent_version: event.agent_version,
             session_id: event.session_id,
-            turn_index: event.turn_index,
             llm_provider: event.llm_provider,
             llm_model: event.llm_model,
             event_type: event.event_type,
@@ -532,26 +548,21 @@ pub struct UsageEventResponse {
     pub platform: Option<String>,
     /// Backend session primary key.
     pub session_pk: Uuid,
-    /// Backend turn primary key.
-    pub turn_pk: Uuid,
+    /// Current stream position, when the request asks for event locations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<EventLocation>,
     /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Agent version observed on this event.
     pub agent_version: Option<String>,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// Backend-normalized turn number.
-    pub turn_index: i32,
     /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
     /// Canonical request or response value.
     pub event_type: String,
-    /// Optional prompt or response text.
-    pub text: Option<String>,
-    /// Lowercase SHA-256 of text when text is present.
-    pub text_sha256: Option<String>,
     /// Normalized input-token count.
     pub input_tokens: i64,
     /// Normalized output-token count.
@@ -575,116 +586,13 @@ pub struct UsageEventResponse {
     /// Response whose conversation the exchange's request continues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
+    /// Conversation of the event, as the collector reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Value>,
     /// Collector metadata retained without schema expansion.
     pub metadata: Value,
     /// Ordered attachment metadata associated with the event.
     pub attachments: Vec<attachments::UsageEventAttachmentResponse>,
-}
-
-#[derive(Debug, Serialize)]
-/// Session metadata and its ordered turn timelines.
-///
-/// `E` is the per-event representation: complete events for the full
-/// timeline, or [`UsageEventOutline`] for the content-free outline.
-pub struct SessionTimelineResponse<E = UsageEventResponse> {
-    /// Authoritative session information.
-    pub session: SessionInfo,
-    /// Turns ordered by normalized turn index.
-    pub turns: Vec<TurnTimeline<E>>,
-}
-
-/// Session timeline whose events omit text and metadata bodies.
-pub type SessionOutlineResponse = SessionTimelineResponse<UsageEventOutline>;
-
-/// Maximum number of characters returned in an outline event preview.
-pub const OUTLINE_PREVIEW_CHARS: i64 = 200;
-
-#[derive(Debug, Serialize)]
-/// Content-free representation of one event, sized independently of its text.
-///
-/// Full content is loaded separately by event primary key.
-pub struct UsageEventOutline {
-    /// Backend-generated event primary key.
-    pub id: Uuid,
-    /// Collector-generated idempotency key.
-    pub event_id: String,
-    /// Owning turn, used only to group events.
-    #[serde(skip)]
-    pub turn_pk: Uuid,
-    /// Backend-normalized turn number.
-    pub turn_index: i32,
-    /// LLM provider as reported by the collector.
-    pub llm_provider: String,
-    /// Provider-specific model identifier.
-    pub llm_model: String,
-    /// Canonical request or response value.
-    pub event_type: String,
-    /// Normalized input-token count.
-    pub input_tokens: i64,
-    /// Normalized output-token count.
-    pub output_tokens: i64,
-    /// Normalized cache-read-token count.
-    pub cache_read_tokens: i64,
-    /// Normalized cache-write-token count.
-    pub cache_write_tokens: i64,
-    /// Normalized reasoning-token count.
-    pub reasoning_tokens: i64,
-    /// Provider-reported or derived total-token count.
-    pub total_tokens: i64,
-    /// Collector observation timestamp.
-    pub observed_at: DateTime<Utc>,
-    /// Text length in characters; zero when text is absent.
-    pub text_chars: i64,
-    /// Up to [`OUTLINE_PREVIEW_CHARS`] characters of text: the tail of a
-    /// request, where the newest prompt is, or the head of a response.
-    pub preview: Option<String>,
-    /// Number of image attachments on the event.
-    pub attachment_count: i64,
-}
-
-#[derive(Debug, Serialize)]
-/// API representation of an Agent session.
-pub struct SessionInfo {
-    /// Backend session primary key.
-    pub session_pk: Uuid,
-    /// Authenticated owner identifier.
-    pub user_id: Uuid,
-    /// Most recently associated device context.
-    pub device_context_id: Uuid,
-    /// Agent name as reported by the collector.
-    pub agent_name: String,
-    /// Most recently known Agent version.
-    pub agent_version: Option<String>,
-    /// Agent-native session identifier.
-    pub session_id: String,
-    /// Earliest event observation time in the session.
-    pub started_at: DateTime<Utc>,
-    /// Latest event observation time in the session.
-    pub ended_at: Option<DateTime<Utc>>,
-    /// Stable, allowlisted session metadata.
-    pub metadata: Value,
-    /// Agent-generated title, or a first-user-input preview for other Agents.
-    pub title: Option<String>,
-    /// Why the session exists when it only serves the Agent, such as
-    /// `title_generation`; `None` for ordinary sessions.
-    pub purpose: Option<String>,
-    /// For a naming thread, the task session its title was matched to.
-    pub parent_session_pk: Option<Uuid>,
-}
-
-#[derive(Debug, Serialize)]
-/// One normalized turn and its deterministically ordered events.
-pub struct TurnTimeline<E = UsageEventResponse> {
-    /// Backend turn primary key.
-    pub turn_pk: Uuid,
-    /// Backend-normalized turn number.
-    pub turn_index: i32,
-    /// Earliest event observation time in the turn.
-    pub started_at: DateTime<Utc>,
-    /// Latest event observation time in the turn.
-    pub ended_at: Option<DateTime<Utc>>,
-    /// Request and response events in authoritative timeline order.
-    pub events: Vec<E>,
 }
 
 /// Returns the JSON object used when optional metadata is absent.
@@ -717,14 +625,16 @@ mod tests {
                         "version": "1.2.3"
                     },
                     "session_id": "session-001",
-                    "turn_index": 1_i32,
                     "llm": {
                         "provider": "OpenAI",
                         "model": "gpt-5.5"
                     },
                     "event_type": "request",
-                    "text": "Explain this repository.",
                     "token_usage": {"input_tokens": 10_i64, "output_tokens": 0_i64, "cache_read_tokens": 2_i64, "cache_write_tokens": 0_i64, "reasoning_tokens": 0_i64, "total_tokens": 12_i64},
+                    "conversation": {
+                        "entries": [{"role": "user", "text": "hello"}],
+                        "completeness": "complete"
+                    },
                     "metadata": {
                         "source": "unit-test"
                     }
@@ -756,6 +666,14 @@ mod tests {
             event.metadata,
             json!({ "source": "unit-test" }),
             "metadata should preserve arbitrary JSON object content"
+        );
+        assert_eq!(
+            event.conversation,
+            Some(json!({
+                "entries": [{"role": "user", "text": "hello"}],
+                "completeness": "complete"
+            })),
+            "the conversation should be kept as received"
         );
     }
 
@@ -797,15 +715,14 @@ mod tests {
             event.token_usage.total_tokens, None,
             "omitted token_usage should leave every counter absent"
         );
-        assert_eq!(event.turn_id, None, "an omitted turn names no turn");
-        assert!(
-            !event.naming_thread,
-            "an omitted flag is not a naming thread"
-        );
         assert_eq!(
             event.metadata,
             json!({}),
             "omitted metadata should default to an empty object"
+        );
+        assert_eq!(
+            event.conversation, None,
+            "omitted conversation stays absent"
         );
     }
 

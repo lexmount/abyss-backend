@@ -2,37 +2,45 @@
 
 `abyss-backend` is the open-source, self-hostable Agent event store for Abyss.
 It accepts normalized Agent events and exposes APIs for event history,
-summaries, session timelines, attachments, and full-text session search.
+summaries, session streams, attachments, and session search.
 
 This repository is intentionally focused on standalone event storage, queries,
-and optional full-text search.
+and search.
 
 ## Capabilities
 
 - Idempotent Agent event ingestion and raw event queries.
-- Token-usage summaries and ordered session timelines.
+- Token-usage summaries and derived session streams.
 - Validated image attachment storage and authorized download.
-- Full-text session search through Elasticsearch or embedded SQLite FTS5.
+- Session search through Elasticsearch or an embedded SQLite trigram index,
+  and, with SQLite, search within one session.
 - Health and storage-readiness probes.
 - Embedded migrations for both supported storage profiles.
 
-A session is titled by the `session_title` the collector reports for a call in
-which the Agent names its own session (Claude Code); otherwise by its first
-nonempty user input, collapsed to one line and truncated to 80 characters with
-an ellipsis. An Agent title is never replaced by a default title. Requests whose
-`purpose` marks them as naming calls are not user input. Codex names tasks from
-separate threads that do not say which session they name; those threads are
-marked `title_generation` from their `thread_source` and are not linked to a
-task. Naming calls retain their own events and usage. Existing sessions receive
-default titles through a one-time backfill.
+Every session view uses the same title: the label of the session's earliest
+request, ordered by observation time and event primary key, even when that
+request has no label. A request's label is the last `user` entry with text in
+the request's new part, as `{"event_pk", "entry_index", "text", "length"}`:
+`text` is the entry's text cut to its first 50 UTF-16 code units, unformatted,
+and `length` is the whole text's length in UTF-16 code units. A session whose
+earliest request has no label has a `null` title, and later delivery of an
+earlier request corrects it. A segment label is the label of the segment's first
+request; it does not name the session.
+
+`20261014150000_initial_schema` creates the owner, device, session, event,
+attachment, diagnostic, and session title tables, and in PostgreSQL the search
+outbox. `20261030130000_event_conversation_and_stream_facts` adds the event
+`conversation` column and the stream facts table, and in SQLite the search text
+tables. Neither migration moves or rebuilds stored data: databases created by
+earlier releases are not upgraded and must be recreated.
 
 Exactly one storage profile is compiled into a binary:
 
 - `postgres-es` uses PostgreSQL as the source of truth and optionally projects
   search documents to Elasticsearch. It is the default profile.
-- `sqlite-fts` stores both authoritative data and its transactional FTS5 index
-  in one local SQLite file through Diesel, with FTS5 operations expressed as
-  SQL. It does not compile PostgreSQL, reqwest, or Elasticsearch worker code
+- `sqlite-fts` stores both authoritative data and its search index, written in
+  the same transactions, in one local SQLite file through Diesel, with FTS5
+  operations expressed as SQL. It does not compile PostgreSQL, reqwest, or Elasticsearch worker code
   into the binary.
 
 ## Authentication
@@ -59,8 +67,8 @@ cargo run --locked --package abyss-backend \
   --no-default-features --features sqlite-fts
 ```
 
-The backend creates the parent directory, database, schema, and FTS5 index on
-startup. A `sqlite://` prefix is also accepted, for example
+The backend creates the parent directory, database, schema, and search index
+on startup. A `sqlite://` prefix is also accepted, for example
 `sqlite://./data/abyss.sqlite`.
 
 ## Run with PostgreSQL
@@ -96,11 +104,26 @@ curl \
 | `GET` | `/readyz` | Selected storage readiness. |
 | `POST` | `/v1/agent-usage/events` | Ingest events and correlated diagnostic captures. |
 | `GET` | `/v1/agent-usage/events` | Query raw events. |
+| `GET` | `/v1/agent-usage/events/{event_pk}` | Read one event. |
+| `GET` | `/v1/agent-usage/events/{event_pk}/conversation` | Read one event's conversation, all of it or the asked entries. |
+| `GET` | `/v1/agent-usage/events/{event_pk}/location` | Resolve an event to its current session, segment, and exchange. |
 | `GET` | `/v1/agent-usage/attachments/{id}` | Download stored image content. |
 | `GET` | `/v1/agent-usage/summary` | Aggregate event and token usage. |
+| `GET` | `/v1/agent-usage/sessions` | List sessions with their titles, counts, and token totals. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/header` | Session title, counts, and token totals. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/streams` | Read the session’s derived segments. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/turns` | One node per turn: its executors' main-line and side segments. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/segments/{head}` | Read one segment’s exchanges. |
 | `POST` | `/v1/agent-usage/comparison` | Compare token totals and daily activity across dimensions. |
-| `GET` | `/v1/agent-usage/sessions/{id}` | Read an ordered session timeline. |
-| `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite FTS5. |
+| `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite. |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session (SQLite). |
+
+A turn is one user input and all the work it causes; the backend reads only
+the `turn_id` an event declares. Turn counts (session list, summary `turns`,
+header `turn_count`) are, per session, the number of distinct `turn_id` values
+when the session declares any, else the number of requests whose persisted
+`starts_turn` fact is true; a summary row applies the same rule to the events
+of its group.
 
 Every `/v1/agent-usage/*` endpoint requires the bearer token. Health and
 readiness endpoints are unauthenticated for orchestrator probes.
@@ -118,6 +141,84 @@ Comparison joins, filters, aggregates, and facet queries use Diesel's typed quer
 builder for both storage backends. A small `QueryFragment` extension supplies the
 bound `VALUES` CTE for time buckets, which Diesel does not provide as a built-in
 query source. Bucket values remain bound and result types remain checked.
+
+### Session structure and event links
+
+The header, streams, turns, segment details, in-session search, and event location
+share one immutable derived structure for an owner/session/revision. The
+process retains up to 128 idle revisions with LRU eviction. Concurrent reads
+of the same revision share the load and derivation; a cache hit reads the
+session revision without loading stream facts again. Event bodies are not
+stored in this cache.
+
+Ingestion advances `agent_sessions.structure_revision` within its existing
+session update and event transaction. Structure readers load the revision and
+facts from the same database snapshot (a read transaction in SQLite, read-only
+repeatable read in PostgreSQL). On a new revision or after eviction/restart,
+the first read derives the full structure again. This is a shared query cache,
+not an incremental derivation at ingest time.
+
+A request's base is the exchange that emitted the last identity in its
+history, when exactly one other exchange did and the model output after that
+identity was all said by it. Identities come from the conversation entries:
+an entry's `item_id` (`item:<id>`), a `tool_call` entry's `call_id`, and for an
+`assistant` or `reasoning` entry with neither and non-blank text, a digest of
+that exact text (`text:<role>:<sha256 hex>`). Text identities let a reply that
+the protocol gives no id, such as a Chat Completions answer or an Anthropic text
+block without thinking, link the next turn; rewritten text links nothing, and
+text emitted by more than one exchange is ambiguous.
+
+Stable links retain `event_pk`. The location endpoint returns
+`{"session_pk", "event_pk", "segment", "turn", "segment_kind", "exchange"}` using the current structure,
+and returns 404 for an event outside the authenticated owner's data. A later
+fork can change an event's segment, so links resolve the event when opened.
+Segment IDs remain their first exchange IDs; a segment is not a turn number.
+
+`GET /events?locate=true` includes a `location` object on each returned event;
+the list projection also preserves it. Session-search matches and the single
+event endpoint include the same object: `{segment, turn, segment_kind,
+exchange}`. `turn` is the one-based number of the turn of the event's exchange,
+in the order the session's turns first appear, or null when the exchange belongs
+to no turn; it is for display only. A response page looks up each session structure
+once, sharing the cache with the detail view. The dashboard uses these values
+in its segment column, search-hit labels, and inspector properties without
+sending a separate location request for every row.
+
+### Search
+
+In the SQLite profile, search reads the pieces of each event's
+`conversation.entries`: the `text` of every entry, whatever its
+role, and its `name`, the tool name of a tool call. Entries are never joined,
+an empty value is not a piece, and nothing else is searched. The query is one
+literal substring, matched after folding every character to its lowercase
+form when that is exactly one character. A hit is a piece of an event whose
+folded text holds the folded query, so each event that replays history hits
+again. A hit is new when its event is a response, or when its entry index is
+at least the request's `new_from`; otherwise it is in the inherited context.
+
+`GET /v1/agent-usage/search?q=…` also takes `from`, `to`, `agent_name`,
+`llm_provider`, `llm_model`, `event_type`, `page` (from 1), and `page_size`
+(at most 50). Sessions are ordered by their latest matching event, newest
+first. Each item carries `match_count`, its matching events,
+`new_match_count`, those with a new hit, and up to three `matches`: the events
+with a new hit, earliest first, then the earliest events whose hits are all
+inherited. A match says whether it is `new` and carries up to two `fragments`
+of distinct matching texts, new hits first, each about 240 characters around
+the first occurrence, `…` on a cut side, as `{"text", "highlighted"}`
+segments.
+
+`GET /v1/agent-usage/sessions/{session_pk}/search?q=…` returns every hit in
+one session as `hits`, each `{"event_pk", "entry_index", "field", "new",
+"text_id", "segment"}` with `field` `text` or `name` and `segment` the head of
+the segment holding the event's exchange, as `/streams` gives it, or null. Hits
+are in observation order, then by event, entry, and `name` before `text`.
+`texts` lists each named text once as `{"id", "ranges"}`, the non-overlapping
+occurrences as half-open ranges of the original text's UTF-16 code units. At
+most 100,000 hits are returned; `truncated` says whether more were left out.
+
+The PostgreSQL profile searches through Elasticsearch, requires every
+whitespace-separated term to match, counts every match as new, and does not
+support search within a session.
 
 ## Configuration
 
@@ -143,7 +244,7 @@ query source. Bucket values remain bound and result types remain checked.
 Elasticsearch settings exist only in `postgres-es` builds. Username and
 password must be provided together. Search remains disabled in that profile
 when no URL is configured; event storage and queries continue to work. The
-`sqlite-fts` profile always provides search through the local FTS5 index.
+`sqlite-fts` profile always provides search through its local index.
 
 ## Native releases
 
@@ -289,4 +390,4 @@ make k8s-render
 The PostgreSQL case starts an ephemeral container and an Elasticsearch contract
 double; the SQLite case uses only a temporary local database file. Both verify
 schema creation, authentication, event ingestion, attachment retrieval, raw
-diagnostic retention, summary, timeline, and search behavior.
+diagnostic retention, summary, streams, and search behavior.

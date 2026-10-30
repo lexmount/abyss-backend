@@ -1,7 +1,7 @@
 //! Diesel row and insert models owned by the Agent event service.
 //!
-//! Query models mirror complete table rows because Diesel uses them for typed
-//! selection. Insert models make server-assigned fields explicit and prevent
+//! Query models select the fields each consumer needs through Diesel.
+//! Insert models make server-assigned fields explicit and prevent
 //! HTTP payloads from being written directly without normalization.
 
 use chrono::{DateTime, Utc};
@@ -10,8 +10,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::schema::{
-    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-    devices, llm_usage_event_attachments, llm_usage_events, search_outbox,
+    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, devices,
+    llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events, search_outbox,
 };
 
 #[derive(Clone, Debug, Queryable, Selectable)]
@@ -66,14 +66,10 @@ pub struct NewDevice {
 #[derive(Clone, Debug, Queryable, Selectable)]
 #[diesel(table_name = agent_sessions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-/// Persisted Agent session containing many normalized turns.
+/// Persisted Agent session containing request and response events.
 pub struct AgentSession {
     /// Server-generated session primary key.
     pub id: Uuid,
-    /// Owning user identifier.
-    pub user_id: Uuid,
-    /// Most recently associated device-context key.
-    pub device_context_id: Uuid,
     /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Most recently observed Agent version.
@@ -84,12 +80,6 @@ pub struct AgentSession {
     pub started_at: DateTime<Utc>,
     /// Latest event observation in the session.
     pub ended_at: Option<DateTime<Utc>>,
-    /// Stable allowlisted session metadata.
-    pub metadata: Value,
-    /// Row creation time.
-    pub created_at: DateTime<Utc>,
-    /// Last session metadata update time.
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Insertable)]
@@ -118,57 +108,8 @@ pub struct NewAgentSession {
     pub created_at: DateTime<Utc>,
     /// Initial metadata update time.
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Debug, Queryable, Selectable)]
-#[diesel(table_name = agent_turns)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-/// Persisted logical turn within one Agent session.
-pub struct AgentTurn {
-    /// Server-generated turn primary key.
-    pub id: Uuid,
-    /// Owning user identifier.
-    pub user_id: Uuid,
-    /// Parent session primary key.
-    pub session_pk: Uuid,
-    /// Position of the turn in its session by start time.
-    pub turn_index: i32,
-    /// Turn the Agent named for its requests; `None` for the turn opened by
-    /// requests naming none.
-    pub turn_key: Option<String>,
-    /// Earliest event observation in the turn.
-    pub started_at: DateTime<Utc>,
-    /// Latest event observation in the turn.
-    pub ended_at: Option<DateTime<Utc>>,
-    /// Row creation time.
-    pub created_at: DateTime<Utc>,
-    /// Last turn-boundary update time.
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Insertable)]
-#[diesel(table_name = agent_turns)]
-/// Values used to create a logical Agent turn.
-pub struct NewAgentTurn {
-    /// Server-generated turn primary key.
-    pub id: Uuid,
-    /// Owning user identifier.
-    pub user_id: Uuid,
-    /// Parent session primary key.
-    pub session_pk: Uuid,
-    /// Position of the turn in its session by start time.
-    pub turn_index: i32,
-    /// Turn the Agent named for its requests; `None` for the turn opened by
-    /// requests naming none.
-    pub turn_key: Option<String>,
-    /// Initial earliest observation time.
-    pub started_at: DateTime<Utc>,
-    /// Initial latest observation time.
-    pub ended_at: Option<DateTime<Utc>>,
-    /// Row creation time.
-    pub created_at: DateTime<Utc>,
-    /// Initial boundary update time.
-    pub updated_at: DateTime<Utc>,
+    /// Changes whenever ingestion adds an event to the session.
+    pub structure_revision: i64,
 }
 
 #[derive(Clone, Debug, Queryable, Selectable)]
@@ -184,8 +125,6 @@ pub struct UsageEvent {
     pub device_context_id: Uuid,
     /// Parent session primary key.
     pub session_pk: Uuid,
-    /// Parent normalized-turn primary key.
-    pub turn_pk: Uuid,
     /// Collector-generated idempotency key.
     pub event_id: String,
     /// Agent name as reported by the collector.
@@ -194,18 +133,12 @@ pub struct UsageEvent {
     pub agent_version: Option<String>,
     /// Agent-native session identifier copied for direct filtering.
     pub session_id: String,
-    /// Normalized turn number copied for direct filtering.
-    pub turn_index: i32,
     /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
     /// Canonical request or response value.
     pub event_type: String,
-    /// Optional prompt or response text.
-    pub text: Option<String>,
-    /// Binary SHA-256 digest of text when present.
-    pub text_sha256: Option<Vec<u8>>,
     /// Normalized input-token count.
     pub input_tokens: i64,
     /// Normalized output-token count.
@@ -230,6 +163,8 @@ pub struct UsageEvent {
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
     pub previous_response_id: Option<String>,
+    /// Conversation of the event, as the collector reported it.
+    pub conversation: Option<Value>,
 }
 
 #[derive(Queryable, Selectable)]
@@ -305,8 +240,6 @@ pub struct NewUsageEvent {
     pub device_context_id: Uuid,
     /// Parent session primary key.
     pub session_pk: Uuid,
-    /// Parent normalized-turn primary key.
-    pub turn_pk: Uuid,
     /// Collector-generated idempotency key.
     pub event_id: String,
     /// Agent name as reported by the collector.
@@ -315,18 +248,12 @@ pub struct NewUsageEvent {
     pub agent_version: Option<String>,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// Backend-normalized turn number.
-    pub turn_index: i32,
     /// LLM provider as reported by the collector.
     pub llm_provider: String,
     /// Provider-specific model identifier.
     pub llm_model: String,
     /// Canonical request or response value.
     pub event_type: String,
-    /// Optional prompt or response text.
-    pub text: Option<String>,
-    /// Optional binary SHA-256 of text.
-    pub text_sha256: Option<Vec<u8>>,
     /// Normalized input-token count.
     pub input_tokens: i64,
     /// Normalized output-token count.
@@ -351,6 +278,93 @@ pub struct NewUsageEvent {
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
     pub previous_response_id: Option<String>,
+    /// Conversation of the event, as the collector reported it.
+    pub conversation: Option<Value>,
+}
+
+#[derive(Queryable)]
+/// The columns of one session event that its streams read; the facts are
+/// NULL for an event stored before they were read.
+pub struct StreamEventRow {
+    /// Event primary key.
+    pub id: Uuid,
+    /// Collector-generated idempotency key.
+    pub event_id: String,
+    /// Canonical request or response value.
+    pub event_type: String,
+    /// Collector observation time.
+    pub observed_at: DateTime<Utc>,
+    /// Provider identity of the response the exchange produced.
+    pub response_id: Option<String>,
+    /// Response whose conversation the exchange's request continues.
+    pub previous_response_id: Option<String>,
+    /// Request: index where the new part begins.
+    pub new_from: Option<i32>,
+    /// Request: whether the new part opens a turn.
+    pub starts_turn: Option<bool>,
+    /// Request: last identity of the last run.
+    pub last_identity: Option<String>,
+    /// Request: the identity before the last one.
+    pub previous_identity: Option<String>,
+    /// Request: roles of the model-side entries after it.
+    pub trailing: Option<Value>,
+    /// Request without model output: call ids of its tool results.
+    pub result_ids: Option<Value>,
+    /// Response: identities of its entries.
+    pub emitted_ids: Option<Value>,
+    /// Response: skeleton of its entries.
+    pub output_skeleton: Option<Value>,
+    /// Request: index of its label entry.
+    pub label_index: Option<i32>,
+    /// Request: start of its label entry's text.
+    pub label_text: Option<String>,
+    /// Request: length of its label entry's text in UTF-16 code units.
+    pub label_length: Option<i32>,
+    /// Sub-agent id the client declared for the event.
+    pub subagent_id: Option<String>,
+    /// Id of the sub-agent the client declared as this one's parent.
+    pub parent_subagent_id: Option<String>,
+    /// Turn the client declared the event works for.
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Default, Insertable)]
+#[diesel(table_name = llm_usage_event_stream_facts)]
+/// Stream facts of a new event; the other side's columns stay NULL.
+pub struct NewStreamFacts {
+    /// Event the facts were read from.
+    pub event_pk: Uuid,
+    /// Request: index where the new part begins.
+    pub new_from: Option<i32>,
+    /// Request: whether the new part opens a turn.
+    pub starts_turn: Option<bool>,
+    /// Request: last identity of the last run.
+    pub last_identity: Option<String>,
+    /// Request: the identity before the last one.
+    pub previous_identity: Option<String>,
+    /// Request: roles of the model-side entries after it.
+    pub trailing: Option<Value>,
+    /// Request without model output: call ids of its tool results.
+    pub result_ids: Option<Value>,
+    /// Response: identities of its entries.
+    pub emitted_ids: Option<Value>,
+    /// Response: skeleton of its entries.
+    pub output_skeleton: Option<Value>,
+    /// Request: index of its label entry.
+    pub label_index: Option<i32>,
+    /// Request: start of its label entry's text.
+    pub label_text: Option<String>,
+    /// Request: length of its label entry's text in UTF-16 code units.
+    pub label_length: Option<i32>,
+    /// Sub-agent id the client declared for the event.
+    pub subagent_id: Option<String>,
+    /// Id of the sub-agent the client declared as this one's parent.
+    pub parent_subagent_id: Option<String>,
+    /// Turn the client declared the event works for.
+    pub turn_id: Option<String>,
+    /// Request: whether it holds model output or names the response it
+    /// continues.
+    pub continues_context: Option<bool>,
 }
 
 #[derive(Insertable)]

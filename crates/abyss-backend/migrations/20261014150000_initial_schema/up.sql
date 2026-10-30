@@ -47,31 +47,13 @@ CREATE TABLE agent_sessions (
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
+    -- Advances on event ingestion so derived stream caches share one revision.
+    structure_revision bigint NOT NULL DEFAULT 0,
     UNIQUE (user_id, agent_name, session_id)
 );
 
 CREATE INDEX agent_sessions_user_time_idx
     ON agent_sessions (user_id, started_at DESC);
-
--- turn_key is the turn the Agent named for its requests, unique within the
--- session; it is NULL for the turn opened by requests naming none. turn_index
--- is the turn's position in the session by start time.
-CREATE TABLE agent_turns (
-    id uuid PRIMARY KEY,
-    user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
-    session_pk uuid NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
-    turn_index integer NOT NULL CHECK (turn_index >= 1),
-    turn_key text,
-    started_at timestamptz NOT NULL,
-    ended_at timestamptz,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (session_pk, turn_index),
-    UNIQUE (session_pk, turn_key)
-);
-
-CREATE INDEX agent_turns_user_session_idx
-    ON agent_turns (user_id, session_pk, turn_index);
 
 -- Usage events are immutable source records. event_id provides global ingest
 -- idempotency, while denormalized labels keep filters and aggregation direct.
@@ -80,17 +62,13 @@ CREATE TABLE llm_usage_events (
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
     device_context_id uuid NOT NULL REFERENCES devices(id),
     session_pk uuid NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
-    turn_pk uuid NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE,
     event_id text NOT NULL UNIQUE,
     agent_name text NOT NULL,
     agent_version text,
     session_id text NOT NULL,
-    turn_index integer NOT NULL CHECK (turn_index >= 1),
     llm_provider text NOT NULL,
     llm_model text NOT NULL,
     event_type text NOT NULL CHECK (event_type IN ('request', 'response')),
-    text text,
-    text_sha256 bytea,
     input_tokens bigint NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
     output_tokens bigint NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
     cache_read_tokens bigint NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
@@ -114,8 +92,8 @@ CREATE INDEX llm_usage_events_user_time_idx
 CREATE INDEX llm_usage_events_observed_at_idx
     ON llm_usage_events (observed_at DESC);
 
-CREATE INDEX llm_usage_events_session_turn_idx
-    ON llm_usage_events (session_pk, turn_index, observed_at);
+CREATE INDEX llm_usage_events_session_order_idx
+    ON llm_usage_events (session_pk, observed_at, event_type, id);
 
 CREATE INDEX llm_usage_events_agent_model_time_idx
     ON llm_usage_events (agent_name, llm_provider, llm_model, observed_at DESC);
@@ -196,11 +174,10 @@ CREATE INDEX search_outbox_pending_idx
     ON search_outbox (available_at, id)
     WHERE processed_at IS NULL AND dead_lettered_at IS NULL;
 
-
--- Session names read back from the Agents' own title-generation calls, kept
--- apart from agent_sessions so session rows keep their shape. purpose marks
--- sessions that exist only to generate a title, such as Codex naming threads,
--- and parent_session_pk the task session such a thread was matched to.
+-- Session titles register the earliest request by observation time and event
+-- primary key, including requests without a label. Readers join that event's
+-- stream facts for its label rather than the title column. purpose and
+-- parent_session_pk are separate session metadata.
 CREATE TABLE session_titles (
     session_pk uuid PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
     user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,

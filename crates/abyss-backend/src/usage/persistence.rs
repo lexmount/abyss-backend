@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 #[cfg(feature = "postgres-es")]
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 
@@ -143,10 +142,6 @@ pub fn escape_like_pattern(value: &str) -> String {
 
 pub fn normalize_limit(limit: Option<i64>, fallback: i64, maximum: i64) -> i64 {
     limit.unwrap_or(fallback).clamp(1_i64, maximum)
-}
-
-pub fn sha256_bytes(value: &str) -> Vec<u8> {
-    Sha256::digest(value.as_bytes()).to_vec()
 }
 
 #[cfg(test)]

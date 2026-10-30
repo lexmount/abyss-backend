@@ -2,14 +2,22 @@
 
 use chrono::{DateTime, Utc};
 use diesel::{Insertable, Queryable, Selectable};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{error::AppError, usage::event_order::TimelineEvent};
+use crate::{
+    error::AppError,
+    usage::{
+        UsageEventType,
+        streams::{EventFacts, Label, RequestFacts, ResponseFacts, StreamEvent},
+    },
+};
 
 use super::schema::{
-    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, agent_turns,
-    devices, llm_usage_event_attachments, llm_usage_events,
+    agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, devices,
+    llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events, search_refs,
+    search_texts,
 };
 
 #[derive(Queryable, Selectable)]
@@ -46,16 +54,9 @@ pub(super) struct NewDevice {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 pub(super) struct SessionRow {
     pub(super) id: String,
-    pub(super) user_id: String,
-    pub(super) device_context_id: String,
-    pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
-    pub(super) session_id: String,
     pub(super) started_at: i64,
     pub(super) ended_at: Option<i64>,
-    pub(super) metadata: String,
-    pub(super) created_at: i64,
-    pub(super) updated_at: i64,
 }
 
 #[derive(Insertable)]
@@ -72,35 +73,8 @@ pub(super) struct NewSession {
     pub(super) metadata: String,
     pub(super) created_at: i64,
     pub(super) updated_at: i64,
-}
-
-#[derive(Queryable, Selectable)]
-#[diesel(table_name = agent_turns)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub(super) struct TurnRow {
-    pub(super) id: String,
-    pub(super) user_id: String,
-    pub(super) session_pk: String,
-    pub(super) turn_index: i32,
-    pub(super) turn_key: Option<String>,
-    pub(super) started_at: i64,
-    pub(super) ended_at: Option<i64>,
-    pub(super) created_at: i64,
-    pub(super) updated_at: i64,
-}
-
-#[derive(Insertable)]
-#[diesel(table_name = agent_turns)]
-pub(super) struct NewTurn {
-    pub(super) id: String,
-    pub(super) user_id: String,
-    pub(super) session_pk: String,
-    pub(super) turn_index: i32,
-    pub(super) turn_key: Option<String>,
-    pub(super) started_at: i64,
-    pub(super) ended_at: Option<i64>,
-    pub(super) created_at: i64,
-    pub(super) updated_at: i64,
+    /// Changes whenever ingestion adds an event to the session.
+    pub(super) structure_revision: i64,
 }
 
 #[derive(Clone, Queryable, Selectable)]
@@ -111,17 +85,13 @@ pub(super) struct EventRow {
     pub(super) user_id: String,
     pub(super) device_context_id: String,
     pub(super) session_pk: String,
-    pub(super) turn_pk: String,
     pub(super) event_id: String,
     pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
     pub(super) session_id: String,
-    pub(super) turn_index: i32,
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
-    pub(super) text: Option<String>,
-    pub(super) text_sha256: Option<Vec<u8>>,
     pub(super) input_tokens: i64,
     pub(super) output_tokens: i64,
     pub(super) cache_read_tokens: i64,
@@ -134,6 +104,7 @@ pub(super) struct EventRow {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
+    pub(super) conversation: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -143,17 +114,13 @@ pub(super) struct NewEvent {
     pub(super) user_id: String,
     pub(super) device_context_id: String,
     pub(super) session_pk: String,
-    pub(super) turn_pk: String,
     pub(super) event_id: String,
     pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
     pub(super) session_id: String,
-    pub(super) turn_index: i32,
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
-    pub(super) text: Option<String>,
-    pub(super) text_sha256: Option<Vec<u8>>,
     pub(super) input_tokens: i64,
     pub(super) output_tokens: i64,
     pub(super) cache_read_tokens: i64,
@@ -166,6 +133,156 @@ pub(super) struct NewEvent {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
+    pub(super) conversation: Option<String>,
+}
+
+/// Stream facts of a new event; the other side's columns stay NULL.
+#[derive(Default, Insertable)]
+#[diesel(table_name = llm_usage_event_stream_facts)]
+pub(super) struct NewStreamFacts {
+    pub(super) event_pk: String,
+    pub(super) new_from: Option<i32>,
+    pub(super) starts_turn: Option<bool>,
+    pub(super) last_identity: Option<String>,
+    pub(super) trailing: Option<String>,
+    pub(super) result_ids: Option<String>,
+    pub(super) emitted_ids: Option<String>,
+    pub(super) output_skeleton: Option<String>,
+    pub(super) label_index: Option<i32>,
+    pub(super) label_text: Option<String>,
+    pub(super) label_length: Option<i32>,
+    pub(super) subagent_id: Option<String>,
+    pub(super) parent_subagent_id: Option<String>,
+    pub(super) turn_id: Option<String>,
+    pub(super) continues_context: Option<bool>,
+    pub(super) previous_identity: Option<String>,
+}
+
+impl NewStreamFacts {
+    /// Columns of the facts read from an event's conversation, by its type,
+    /// and whether the event names the response it continues; without the
+    /// ids the client declared.
+    pub(super) fn read(
+        event_pk: String,
+        event_type: &str,
+        conversation: Option<&Value>,
+        names_previous: bool,
+    ) -> Result<Self, AppError> {
+        if event_type == UsageEventType::Request.as_str() {
+            Self::request(event_pk, &RequestFacts::read(conversation), names_previous)
+        } else {
+            Self::response(event_pk, &ResponseFacts::read(conversation))
+        }
+    }
+
+    /// Columns of a request's facts.
+    pub(super) fn request(
+        event_pk: String,
+        facts: &RequestFacts,
+        names_previous: bool,
+    ) -> Result<Self, AppError> {
+        Ok(Self {
+            event_pk,
+            new_from: Some(facts.new_from),
+            continues_context: Some(facts.new_from > 0_i32 || names_previous),
+            starts_turn: Some(facts.starts_turn),
+            last_identity: facts.last_identity.clone(),
+            previous_identity: facts.previous_identity.clone(),
+            trailing: Some(json_text(&facts.trailing, "trailing roles")?),
+            result_ids: Some(json_text(&facts.result_ids, "result ids")?),
+            label_index: facts.label.as_ref().map(|label| label.index),
+            label_text: facts.label.as_ref().map(|label| label.text.clone()),
+            label_length: facts.label.as_ref().map(|label| label.length),
+            ..Self::default()
+        })
+    }
+
+    /// Columns of a response's facts.
+    pub(super) fn response(event_pk: String, facts: &ResponseFacts) -> Result<Self, AppError> {
+        Ok(Self {
+            event_pk,
+            emitted_ids: Some(json_text(&facts.emitted_ids, "emitted ids")?),
+            output_skeleton: Some(json_text(&facts.output_skeleton, "output skeleton")?),
+            ..Self::default()
+        })
+    }
+}
+
+/// The columns of one session event that its streams read; the facts are
+/// NULL for an event stored before they were read.
+#[derive(Queryable)]
+pub(super) struct StreamEventRow {
+    pub(super) id: String,
+    pub(super) event_id: String,
+    pub(super) event_type: String,
+    pub(super) observed_at: i64,
+    pub(super) response_id: Option<String>,
+    pub(super) previous_response_id: Option<String>,
+    pub(super) new_from: Option<i32>,
+    pub(super) starts_turn: Option<bool>,
+    pub(super) last_identity: Option<String>,
+    pub(super) previous_identity: Option<String>,
+    pub(super) trailing: Option<String>,
+    pub(super) result_ids: Option<String>,
+    pub(super) emitted_ids: Option<String>,
+    pub(super) output_skeleton: Option<String>,
+    pub(super) label_index: Option<i32>,
+    pub(super) label_text: Option<String>,
+    pub(super) label_length: Option<i32>,
+    pub(super) subagent_id: Option<String>,
+    pub(super) parent_subagent_id: Option<String>,
+    pub(super) turn_id: Option<String>,
+}
+
+impl StreamEventRow {
+    pub(super) fn into_stream_event(self) -> Result<StreamEvent, AppError> {
+        let facts = if self.event_type == "request" {
+            EventFacts::Request(RequestFacts {
+                new_from: self.new_from.unwrap_or_default(),
+                starts_turn: self.starts_turn.unwrap_or_default(),
+                last_identity: self.last_identity,
+                previous_identity: self.previous_identity,
+                trailing: json_list(self.trailing.as_deref(), "trailing roles")?,
+                result_ids: json_list(self.result_ids.as_deref(), "result ids")?,
+                label: Label::from_columns(self.label_index, self.label_text, self.label_length),
+            })
+        } else {
+            EventFacts::Response(ResponseFacts {
+                emitted_ids: json_list(self.emitted_ids.as_deref(), "emitted ids")?,
+                output_skeleton: json_list(self.output_skeleton.as_deref(), "output skeleton")?,
+            })
+        };
+        Ok(StreamEvent {
+            pk: parse_uuid(&self.id, "event id")?,
+            event_id: self.event_id,
+            observed_at: timestamp_from_micros(self.observed_at)?,
+            response_id: self.response_id,
+            previous_response_id: self.previous_response_id,
+            subagent_id: self.subagent_id,
+            parent_subagent_id: self.parent_subagent_id,
+            turn_id: self.turn_id,
+            facts,
+        })
+    }
+}
+
+/// A stored JSON list; absent reads as empty.
+fn json_list<T: DeserializeOwned + Default>(
+    text: Option<&str>,
+    field: &str,
+) -> Result<T, AppError> {
+    text.map_or_else(
+        || Ok(T::default()),
+        |text| {
+            serde_json::from_str(text)
+                .map_err(|error| AppError::internal(format!("stored {field} are invalid: {error}")))
+        },
+    )
+}
+
+fn json_text<T: Serialize>(value: &T, field: &str) -> Result<String, AppError> {
+    serde_json::to_string(value)
+        .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
 }
 
 #[derive(Queryable, Selectable)]
@@ -219,48 +336,43 @@ pub(super) struct NewDiagnosticCaptureEvent {
     pub(super) event_pk: String,
 }
 
+/// A distinct text of one owner.
+#[derive(Insertable)]
+#[diesel(table_name = search_texts)]
+pub(super) struct NewSearchText<'a> {
+    pub(super) user_id: &'a str,
+    pub(super) sha256: &'a [u8],
+    pub(super) text: &'a str,
+}
+
+/// One piece of one event, referring to its text.
+#[derive(Insertable)]
+#[diesel(table_name = search_refs)]
+pub(super) struct NewSearchRef<'a> {
+    pub(super) event_pk: &'a str,
+    pub(super) entry_index: i32,
+    pub(super) field: &'static str,
+    pub(super) text_id: i64,
+}
+
 pub(super) struct DeviceRecord {
     pub(super) id: Uuid,
     pub(super) host_name: String,
     pub(super) platform: String,
 }
 
-pub(super) struct SessionRecord {
-    pub(super) id: Uuid,
-    pub(super) user_id: Uuid,
-    pub(super) device_context_id: Uuid,
-    pub(super) agent_name: String,
-    pub(super) agent_version: Option<String>,
-    pub(super) session_id: String,
-    pub(super) started_at: DateTime<Utc>,
-    pub(super) ended_at: Option<DateTime<Utc>>,
-    pub(super) metadata: Value,
-}
-
-pub(super) struct TurnRecord {
-    pub(super) id: Uuid,
-    pub(super) turn_index: i32,
-    pub(super) started_at: DateTime<Utc>,
-    pub(super) ended_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Clone)]
 pub(super) struct EventRecord {
     pub(super) id: Uuid,
     pub(super) user_id: Uuid,
     pub(super) device_context_id: Uuid,
     pub(super) session_pk: Uuid,
-    pub(super) turn_pk: Uuid,
     pub(super) event_id: String,
     pub(super) agent_name: String,
     pub(super) agent_version: Option<String>,
     pub(super) session_id: String,
-    pub(super) turn_index: i32,
     pub(super) llm_provider: String,
     pub(super) llm_model: String,
     pub(super) event_type: String,
-    pub(super) text: Option<String>,
-    pub(super) text_sha256: Option<Vec<u8>>,
     pub(super) input_tokens: i64,
     pub(super) output_tokens: i64,
     pub(super) cache_read_tokens: i64,
@@ -272,24 +384,7 @@ pub(super) struct EventRecord {
     pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
-}
-
-impl TimelineEvent for EventRecord {
-    fn turn_index(&self) -> i32 {
-        self.turn_index
-    }
-
-    fn observed_at(&self) -> DateTime<Utc> {
-        self.observed_at
-    }
-
-    fn event_type(&self) -> &str {
-        &self.event_type
-    }
-
-    fn event_id(&self) -> &str {
-        &self.event_id
-    }
+    pub(super) conversation: Option<Value>,
 }
 
 pub(super) struct AttachmentRecord {
@@ -318,40 +413,6 @@ impl DeviceRow {
     }
 }
 
-impl SessionRow {
-    pub(super) fn into_record(self) -> Result<SessionRecord, AppError> {
-        let _ = (self.created_at, self.updated_at);
-        Ok(SessionRecord {
-            id: parse_uuid(&self.id, "session id")?,
-            user_id: parse_uuid(&self.user_id, "session user id")?,
-            device_context_id: parse_uuid(&self.device_context_id, "session device id")?,
-            agent_name: self.agent_name,
-            agent_version: self.agent_version,
-            session_id: self.session_id,
-            started_at: timestamp_from_micros(self.started_at)?,
-            ended_at: self.ended_at.map(timestamp_from_micros).transpose()?,
-            metadata: parse_json(&self.metadata, "session metadata")?,
-        })
-    }
-}
-
-impl TurnRow {
-    pub(super) fn into_record(self) -> Result<TurnRecord, AppError> {
-        let _ = (
-            &self.user_id,
-            &self.session_pk,
-            self.created_at,
-            self.updated_at,
-        );
-        Ok(TurnRecord {
-            id: parse_uuid(&self.id, "turn id")?,
-            turn_index: self.turn_index,
-            started_at: timestamp_from_micros(self.started_at)?,
-            ended_at: self.ended_at.map(timestamp_from_micros).transpose()?,
-        })
-    }
-}
-
 impl EventRow {
     pub(super) fn into_record(self) -> Result<EventRecord, AppError> {
         let _ = self.created_at;
@@ -360,17 +421,13 @@ impl EventRow {
             user_id: parse_uuid(&self.user_id, "event user id")?,
             device_context_id: parse_uuid(&self.device_context_id, "event device id")?,
             session_pk: parse_uuid(&self.session_pk, "event session id")?,
-            turn_pk: parse_uuid(&self.turn_pk, "event turn id")?,
             event_id: self.event_id,
             agent_name: self.agent_name,
             agent_version: self.agent_version,
             session_id: self.session_id,
-            turn_index: self.turn_index,
             llm_provider: self.llm_provider,
             llm_model: self.llm_model,
             event_type: self.event_type,
-            text: self.text,
-            text_sha256: self.text_sha256,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cache_read_tokens: self.cache_read_tokens,
@@ -382,6 +439,11 @@ impl EventRow {
             stream_id: self.stream_id,
             response_id: self.response_id,
             previous_response_id: self.previous_response_id,
+            conversation: self
+                .conversation
+                .as_deref()
+                .map(|conversation| parse_json(conversation, "event conversation"))
+                .transpose()?,
         })
     }
 }

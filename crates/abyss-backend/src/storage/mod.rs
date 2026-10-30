@@ -1,4 +1,4 @@
-//! Compile-time-selected persistence and full-text search compatibility boundary.
+//! Compile-time-selected persistence and search compatibility boundary.
 //!
 //! HTTP handlers depend only on [`StorageBackend`]. Exactly one concrete
 //! implementation is compiled into a binary, while dynamic dispatch keeps
@@ -6,11 +6,12 @@
 //! of the API layer.
 
 mod comparison_buckets;
-
+mod event_locations;
 #[cfg(feature = "postgres-es")]
 mod postgres;
 #[cfg(feature = "sqlite-fts")]
 mod sqlite;
+mod stream_cache;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -19,14 +20,19 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::AppError,
-    search::{SessionSearchQuery, SessionSearchResponse},
+    search::{
+        InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
+    },
     usage::{
-        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        UsageEventResponse,
+        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse, SummaryQuery,
+        SummaryResponse, UsageEventResponse,
         attachments::StoredImageAttachment,
         comparison::{ComparisonQuery, ComparisonResponse},
+        preview::{ConversationPreview, Window},
+        segments::{SegmentResponse, ValidatedSegmentQuery},
+        session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
+        streams::{EventLocationResponse, SessionStreamsResponse, SessionTurnsResponse},
     },
 };
 
@@ -61,6 +67,13 @@ pub trait StorageBackend: Send + Sync {
         event_pk: Uuid,
     ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>>;
 
+    /// Resolves a stable event identifier to its current session segment and exchange.
+    fn event_location(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<EventLocationResponse, AppError>>;
+
     /// Aggregates owner-scoped event and token usage.
     fn usage_summary(
         &self,
@@ -76,19 +89,48 @@ pub trait StorageBackend: Send + Sync {
         query: ComparisonQuery,
     ) -> BoxedFuture<'_, Result<ComparisonResponse, AppError>>;
 
-    /// Loads one owner-scoped session timeline.
-    fn session_timeline(
+    /// The header of an owner-scoped session; not found when the owner has
+    /// no event in it.
+    fn session_header(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>>;
+    ) -> BoxedFuture<'_, Result<SessionHeaderResponse, AppError>>;
 
-    /// Loads one owner-scoped session timeline without event content bodies.
-    fn session_outline(
+    /// Derives the segments of an owner-scoped session; not found when the
+    /// owner has no event in it.
+    fn session_streams(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>>;
+    ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>>;
+
+    /// Derives the turn view of an owner-scoped session; not found when the
+    /// owner has no event in it.
+    fn session_turns(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionTurnsResponse, AppError>>;
+
+    /// The exchanges of the segment holding exchange `head` in
+    /// an owner-scoped session, from `head` to the segment end; not found when the session
+    /// has no such exchange.
+    fn session_segment(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        head: String,
+        query: ValidatedSegmentQuery,
+    ) -> BoxedFuture<'_, Result<SegmentResponse, AppError>>;
+
+    /// The conversation of one owner-scoped event through `window`.
+    fn event_conversation(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+        window: Window,
+    ) -> BoxedFuture<'_, Result<ConversationPreview, AppError>>;
 
     /// Lists one page of owner-scoped sessions, most recently active first.
     fn list_sessions(
@@ -104,12 +146,21 @@ pub trait StorageBackend: Send + Sync {
         attachment_id: Uuid,
     ) -> BoxedFuture<'_, Result<StoredImageAttachment, AppError>>;
 
-    /// Executes one owner-scoped full-text session search.
+    /// Executes one owner-scoped session search.
     fn session_search(
         &self,
         user_id: Uuid,
         query: SessionSearchQuery,
     ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>>;
+
+    /// Finds every hit of a query in one owner-scoped session, with the
+    /// segment of each; not found when the owner has no such session.
+    fn search_in_session(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: InSessionSearchQuery,
+    ) -> BoxedFuture<'_, Result<InSessionSearchResponse, AppError>>;
 
     /// Stops backend-owned background work and releases lifecycle resources.
     fn shutdown(&self) -> BoxedFuture<'_, ()>;
