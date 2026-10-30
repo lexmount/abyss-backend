@@ -559,7 +559,7 @@ pub fn session_structure(
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
     cache.get_or_load(user_id, session_pk, revision, || {
-        let events = stream_events(connection, user_id, session_pk)?;
+        let events = stream_events(connection, session_pk)?;
         if events.is_empty() {
             return Err(AppError::not_found(format!(
                 "session not found: {session_pk}"
@@ -611,8 +611,20 @@ pub fn session_header(
     session_pk: Uuid,
     cache: &StreamCache,
 ) -> Result<SessionHeaderResponse, AppError> {
+    let owned = agent_sessions::table
+        .filter(agent_sessions::user_id.eq(user_id))
+        .filter(agent_sessions::id.eq(session_pk))
+        .select(agent_sessions::id)
+        .first::<Uuid>(connection)
+        .optional()?;
+    if owned.is_none() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    // The owner is checked on the session row, so events are read by session
+    // alone, the same way as the SQLite header.
     let events = llm_usage_events::table
-        .filter(llm_usage_events::user_id.eq(user_id))
         .filter(llm_usage_events::session_pk.eq(session_pk))
         .select((
             llm_usage_events::session_id,
@@ -733,15 +745,14 @@ fn usage_events(
 }
 
 /// The events of one session in session order, with their stream facts and
-/// without any request body.
+/// without any request body. The caller has checked the session's owner on
+/// its row, so events are read by session alone.
 fn stream_events(
     connection: &mut PgConnection,
-    user_id: Uuid,
     session_pk: Uuid,
 ) -> Result<Vec<StreamEvent>, AppError> {
     llm_usage_events::table
         .left_join(llm_usage_event_stream_facts::table)
-        .filter(llm_usage_events::user_id.eq(user_id))
         .filter(llm_usage_events::session_pk.eq(session_pk))
         .order((
             llm_usage_events::observed_at.asc(),

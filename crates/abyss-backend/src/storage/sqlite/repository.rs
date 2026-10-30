@@ -383,7 +383,7 @@ pub(super) fn session_structure(
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
     cache.get_or_load(user_id, session_pk, revision, || {
-        let events = stream_events(connection, user_id, session_pk)?;
+        let events = stream_events(connection, session_pk)?;
         if events.is_empty() {
             return Err(AppError::not_found(format!(
                 "session not found: {session_pk}"
@@ -436,8 +436,21 @@ pub(super) fn session_header(
     session_pk: Uuid,
     cache: &StreamCache,
 ) -> Result<SessionHeaderResponse, AppError> {
+    let owned = agent_sessions::table
+        .filter(agent_sessions::user_id.eq(user_id.to_string()))
+        .filter(agent_sessions::id.eq(session_pk.to_string()))
+        .select(agent_sessions::id)
+        .first::<String>(connection)
+        .optional()?;
+    if owned.is_none() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    // The owner is checked on the session row. Filtering events by the owner
+    // as well lets SQLite pick the owner's time index and read every event
+    // the owner has; the session alone uses the session index.
     let events = llm_usage_events::table
-        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
         .filter(llm_usage_events::session_pk.eq(session_pk.to_string()))
         .select((
             llm_usage_events::session_id,
@@ -562,15 +575,14 @@ fn usage_events(
 }
 
 /// The events of one session in session order, with their stream facts and
-/// without any request body.
+/// without any request body. The caller has checked the session's owner on
+/// its row, so events are read by session alone and use the session index.
 pub(super) fn stream_events(
     connection: &mut SqliteConnection,
-    user_id: Uuid,
     session_pk: Uuid,
 ) -> Result<Vec<StreamEvent>, AppError> {
     llm_usage_events::table
         .left_join(llm_usage_event_stream_facts::table)
-        .filter(llm_usage_events::user_id.eq(user_id.to_string()))
         .filter(llm_usage_events::session_pk.eq(session_pk.to_string()))
         .order_by((
             llm_usage_events::observed_at.asc(),
@@ -2126,6 +2138,16 @@ mod tests {
                 &StreamCache::default()
             )
             .is_err()
+        );
+        assert!(
+            session_header(
+                &mut database,
+                Uuid::from_u128(2),
+                session_pk,
+                &StreamCache::default()
+            )
+            .is_err(),
+            "another owner cannot read the session"
         );
     }
 
