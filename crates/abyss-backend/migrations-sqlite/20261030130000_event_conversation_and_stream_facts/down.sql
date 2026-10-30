@@ -15,4 +15,6 @@ CREATE VIRTUAL TABLE usage_events_fts USING fts5(
     tokenize = 'unicode61'
 );
 
-DROP TABLE IF EXISTS llm_usage_event_stream_facts;
+DROP TABLE llm_usage_event_stream_facts;
+
+ALTER TABLE llm_usage_events DROP COLUMN conversation;

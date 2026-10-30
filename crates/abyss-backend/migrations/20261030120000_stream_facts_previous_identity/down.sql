@@ -1,1 +1,0 @@
-ALTER TABLE llm_usage_event_stream_facts DROP COLUMN previous_identity;

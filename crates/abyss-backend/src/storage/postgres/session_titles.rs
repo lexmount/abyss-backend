@@ -49,32 +49,6 @@ pub(super) fn capture(
     Ok(changed == 1)
 }
 
-/// Rebuilds only first-request anchors within the caller's transaction. The
-/// indexed request lookup stops at its first row regardless of label presence.
-/// Existing labels remain facts of their events; old bodies are never decoded.
-pub(super) fn rebuild(connection: &mut PgConnection) -> Result<(), AppError> {
-    sql_query(
-        "UPDATE session_titles SET title = NULL, title_event_pk = NULL, \
-         title_observed_at = NULL, updated_at = CURRENT_TIMESTAMP",
-    )
-    .execute(connection)?;
-    sql_query(
-        "INSERT INTO session_titles \
-         (session_pk, user_id, title, title_event_pk, title_observed_at, updated_at) \
-         SELECT s.id, s.user_id, NULL, first_request.id, first_request.observed_at, CURRENT_TIMESTAMP \
-         FROM agent_sessions s CROSS JOIN LATERAL ( \
-             SELECT e.id, e.observed_at FROM llm_usage_events e \
-             WHERE e.session_pk = s.id AND e.event_type = 'request' \
-             ORDER BY e.observed_at, e.id LIMIT 1 \
-         ) first_request \
-         ON CONFLICT (session_pk) DO UPDATE SET \
-         title = NULL, title_event_pk = EXCLUDED.title_event_pk, \
-         title_observed_at = EXCLUDED.title_observed_at, updated_at = EXCLUDED.updated_at",
-    )
-    .execute(connection)?;
-    Ok(())
-}
-
 #[derive(QueryableByName)]
 struct StoredLabel {
     #[diesel(sql_type = SqlUuid)]

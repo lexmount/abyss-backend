@@ -85,8 +85,10 @@ diesel::table! {
     llm_usage_event_stream_facts (event_pk) {
         event_pk -> Uuid,
         new_from -> Nullable<Integer>,
+        continues_context -> Nullable<Bool>,
         starts_turn -> Nullable<Bool>,
         last_identity -> Nullable<Text>,
+        previous_identity -> Nullable<Text>,
         trailing -> Nullable<Jsonb>,
         result_ids -> Nullable<Jsonb>,
         emitted_ids -> Nullable<Jsonb>,
@@ -97,8 +99,6 @@ diesel::table! {
         subagent_id -> Nullable<Text>,
         parent_subagent_id -> Nullable<Text>,
         turn_id -> Nullable<Text>,
-        continues_context -> Nullable<Bool>,
-        previous_identity -> Nullable<Text>,
     }
 }
 

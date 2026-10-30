@@ -10,10 +10,7 @@ use diesel::{
 };
 use uuid::Uuid;
 
-use super::{
-    models::parse_uuid,
-    schema::{agent_sessions, llm_usage_events, session_titles},
-};
+use super::{models::parse_uuid, schema::session_titles};
 use crate::{error::AppError, usage::streams::EntryLabel};
 
 /// First-request label, purpose, and matched task session.
@@ -71,46 +68,6 @@ pub(super) fn capture(
         ))
         .execute(connection)?;
     Ok(true)
-}
-
-/// Rebuilds first-request registrations inside the caller's write transaction.
-/// No event body is read, and missing historical facts remain missing.
-pub(super) fn rebuild(connection: &mut SqliteConnection) -> Result<(), AppError> {
-    diesel::update(session_titles::table)
-        .set((
-            session_titles::title.eq(None::<String>),
-            session_titles::title_event_pk.eq(None::<String>),
-            session_titles::title_observed_at.eq(None::<i64>),
-        ))
-        .execute(connection)?;
-    let sessions = agent_sessions::table
-        .select((agent_sessions::id, agent_sessions::user_id))
-        .load::<(String, String)>(connection)?;
-    for (session, owner) in sessions {
-        let first = llm_usage_events::table
-            .filter(llm_usage_events::session_pk.eq(&session))
-            .filter(llm_usage_events::event_type.eq("request"))
-            .order((
-                llm_usage_events::observed_at.asc(),
-                llm_usage_events::id.asc(),
-            ))
-            .select((llm_usage_events::id, llm_usage_events::observed_at))
-            .first::<(String, i64)>(connection)
-            .optional()?;
-        if let Some((pk, observed_at)) = first {
-            capture(
-                connection,
-                &CapturedEvent {
-                    user_id: parse_uuid(&owner, "user id")?,
-                    session_pk: parse_uuid(&session, "session id")?,
-                    event_pk: parse_uuid(&pk, "event id")?,
-                    event_type: "request",
-                    observed_at,
-                },
-            )?;
-        }
-    }
-    Ok(())
 }
 
 const TITLE_SELECT: &str = "\
@@ -207,22 +164,16 @@ fn load(connection: &mut SqliteConnection, session_pk: Uuid) -> Result<StoredTit
 #[cfg(test)]
 mod tests {
     use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
-    use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
     use serde_json::{Value, json};
     use uuid::Uuid;
 
     use super::{
-        super::{
-            migrations,
-            repository::{ingest_events, session_header, session_streams},
-            schema::{agent_sessions, session_titles},
-        },
+        super::{migrations, repository::ingest_events, schema::agent_sessions},
         load,
     };
-    use crate::{storage::stream_cache::StreamCache, usage::IngestEventsRequest};
+    use crate::usage::IngestEventsRequest;
 
     const OWNER_ID: Uuid = Uuid::from_u128(1);
-    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations-sqlite");
 
     fn database() -> SqliteConnection {
         let mut database = SqliteConnection::establish(":memory:").expect("SQLite should open");
@@ -482,108 +433,5 @@ mod tests {
                 None
             )
         );
-    }
-
-    #[test]
-    fn title_registration_rebuild_preserves_missing_facts_and_runs_only_once() {
-        let mut database = database();
-        let mut legacy = request("codex", "legacy", "old", "2026-09-30T00:00:00Z", "");
-        legacy["conversation"] = json!({
-            "messages": [{"role": "user", "text": "Old format"}],
-            "completeness": "complete"
-        });
-        let mut input = request("codex", "task", "r1", "2026-09-30T00:00:01Z", "unused");
-        input["conversation"]["entries"] = json!([
-            {"role": "user", "text": "  "},
-            {"role": "user", "text": "First\n  input"},
-            {"role": "assistant", "text": "Previous reply"},
-            {"role": "user", "text": "Latest input"}
-        ]);
-        ingest(
-            &mut database,
-            &[
-                request("codex", "task", "r0", "2026-09-30T00:00:00Z", ""),
-                input,
-                titled_response("task", "s1", "2026-09-30T00:00:02Z", "Old agent title"),
-                legacy,
-            ],
-        );
-        let pk = agent_sessions::table
-            .filter(agent_sessions::session_id.eq("task"))
-            .select(agent_sessions::id)
-            .first::<String>(&mut database)
-            .expect("session");
-        let session_pk = Uuid::parse_str(&pk).expect("uuid");
-
-        let streams = session_streams(&mut database, OWNER_ID, session_pk, &StreamCache::default())
-            .expect("streams");
-        assert!(
-            streams.segments.iter().any(|segment| segment
-                .label
-                .as_ref()
-                .is_some_and(|label| label.text == "Latest input")),
-            "segment labels keep their own meaning"
-        );
-
-        // Return to the initial schema, including the previous search tables.
-        // Reapplying facts must run its SQL and title rebuild in one transaction.
-        for version in [
-            "20261030120000",
-            "20261029140000",
-            "20261029130000",
-            "20261029120000",
-            "20261019120000",
-        ] {
-            let reverted = database
-                .revert_last_migration(MIGRATIONS)
-                .expect("revert the facts migrations");
-            assert_eq!(reverted.to_string(), version);
-        }
-        // Simulate the previous version's cache and migration history.
-        for statement in [
-            "UPDATE session_titles SET title = 'Old agent title', purpose = 'title_generation'",
-            "CREATE TRIGGER fail_title_rebuild BEFORE INSERT ON session_titles BEGIN SELECT RAISE(ABORT, 'test failure'); END",
-        ] {
-            diesel::sql_query(statement)
-                .execute(&mut database)
-                .expect("fixture");
-        }
-        assert!(
-            migrations::run(&mut database).is_err(),
-            "failed rebuild aborts upgrade"
-        );
-        assert_eq!(
-            session_titles::table
-                .find(session_pk.to_string())
-                .select(session_titles::title)
-                .first::<Option<String>>(&mut database)
-                .expect("failed rebuild preserves the legacy string")
-                .as_deref(),
-            Some("Old agent title")
-        );
-        diesel::sql_query("DROP TRIGGER fail_title_rebuild")
-            .execute(&mut database)
-            .expect("drop failure trigger");
-
-        migrations::run(&mut database).expect("retry rebuild");
-        assert_eq!(
-            session_title(&mut database, "task"),
-            (None, Some("title_generation".to_owned()))
-        );
-        assert_eq!(
-            session_title(&mut database, "legacy"),
-            (None, Some("title_generation".to_owned()))
-        );
-        let header = session_header(&mut database, OWNER_ID, session_pk, &StreamCache::default())
-            .expect("header");
-        assert!(
-            header.title.is_none(),
-            "the earliest request has no user words to label the session"
-        );
-
-        // A second startup must not change the registration.
-        diesel::sql_query("CREATE TRIGGER fail_title_rebuild BEFORE UPDATE ON session_titles BEGIN SELECT RAISE(ABORT, 'unexpected rebuild'); END")
-            .execute(&mut database).expect("guard cache");
-        migrations::run(&mut database).expect("already migrated: no rebuild");
     }
 }

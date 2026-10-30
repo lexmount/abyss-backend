@@ -1,1 +1,0 @@
--- Reverting keeps the rebuilt stream facts.

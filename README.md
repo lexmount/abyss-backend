@@ -29,56 +29,12 @@ user text of that segment; they do not name sessions.
 The session header's `title` is a string or `null`, just like the session list
 and legacy session APIs. Upgrade the dashboard alongside the backend.
 
-The schema changes are consolidated into the existing migrations:
 `20261014150000_initial_schema` defines sessions with `structure_revision` and
-omits the retired turn hierarchy; `20261019120000_event_stream_facts` still
-creates stream facts and the search projection. There are no separate title or
-turn-removal migration versions.
-
-When the backend first applies `20261019120000_event_stream_facts`, its Rust
-migration runner also rebuilds the title cache with the same function as ingest.
-Run this migration through the backend; applying its SQL alone does not rebuild
-titles. The facts migration marker, its SQL, and the title rebuild share a
-transaction, so failure preserves the previous cache and schema and retries on
-next startup. Only one event body is read at a time, stopping at the first
-readable user input in each session. Existing titles and naming classifications
-are replaced; sessions without complete `conversation.entries` remain untitled.
-Subsequent startup and page reads do not rescan event bodies for titles.
-
-`20261029120000_stream_facts_text_identity` changes no schema. When the backend
-applies it, the same transaction reads the stream facts of every stored event
-again from its metadata with the ingest functions, page by page, so stored
-events gain text identities; client-declared ids are kept, and each session
-whose facts changed gets a new structure revision. It runs once, on the first
-startup after the upgrade, and its time is mostly spent reading metadata.
-
-`20261029140000_event_conversation` adds the nullable JSON event column
-`conversation`. It moves the `conversation` key of every stored event's
-metadata into the new column and removes it from metadata, so it rewrites the
-event table once.
-
-`20261030120000_stream_facts_previous_identity` adds the request fact
-`previous_identity`: the identity before a request's last one, which tells
-apart the responses that emitted the same last identity, such as an answer
-given word for word in every round. Only an event's conversation holds it, so
-applying this migration reads the stream facts of every stored event again in
-the same way, once; when both versions are pending, the facts are read once.
-
-Existing databases require separate handling: an already recorded migration is
-not reapplied when its source SQL changes. A database with the old turn schema
-must have its physical schema updated, including the event columns, dependent
-indexes and foreign keys, the retired turn table, and the session revision
-column. Its stored titles must also be explicitly rebuilt if the facts
-migration is already recorded. Changing migration-history rows alone performs
-neither operation; deleting the facts record while its tables still exist makes
-its table-creation SQL fail. Shared databases using the old schema are not
-upgraded by this consolidation and must not be pointed at the new backend until
-that schema and title maintenance is complete.
-
-For databases already upgraded to the final schema with their titles rebuilt,
-removing the obsolete `20261022130000` and `20261022140000` history rows is only
-bookkeeping. Confirm those physical changes first and retain the initial-schema
-and facts migration records.
+omits the retired turn hierarchy. `20261030130000_event_conversation_and_stream_facts`
+adds the event `conversation` column and the stream facts table, and in SQLite
+replaces the FTS5 projection with the search text tables. Neither migration
+moves or rebuilds stored data: databases created by earlier releases are not
+upgraded and must be recreated.
 
 Exactly one storage profile is compiled into a binary:
 

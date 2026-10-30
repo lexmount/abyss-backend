@@ -1,7 +1,6 @@
 //! PostgreSQL source-of-truth and Elasticsearch projection implementation.
 
 mod comparison;
-mod migrations;
 mod repository;
 mod search;
 mod session_list;
@@ -58,8 +57,9 @@ impl PostgresEsBackend {
     pub(super) fn new(config: &Config) -> Result<Self, AppError> {
         let pool = db::create_pool(config)?;
         if config.run_migrations {
-            let mut connection = pool.get()?;
-            migrations::run(&mut connection)?;
+            db::run_migrations(&pool).map_err(|error| {
+                AppError::internal(format!("run PostgreSQL migrations: {error}"))
+            })?;
         }
 
         let search = config.search.as_ref().map(SearchService::new).transpose()?;
