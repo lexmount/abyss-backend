@@ -92,12 +92,12 @@ impl TokenCounts {
 
     const fn of(event: &UsageEventResponse) -> Self {
         Self {
-            input: event.input_tokens,
-            output: event.output_tokens,
-            cache_read: event.cache_read_tokens,
-            cache_write: event.cache_write_tokens,
-            reasoning: event.reasoning_tokens,
-            total: event.total_tokens,
+            input: event.token_usage.input_tokens,
+            output: event.token_usage.output_tokens,
+            cache_read: event.token_usage.cache_read_tokens,
+            cache_write: event.token_usage.cache_write_tokens,
+            reasoning: event.token_usage.reasoning_tokens,
+            total: event.token_usage.total_tokens,
         }
     }
 }
@@ -130,7 +130,7 @@ pub fn segment_response(
                 model: request
                     .as_ref()
                     .or(response.as_ref())
-                    .map(|event| event.llm_model.clone()),
+                    .map(|event| event.llm.model.clone()),
                 request_tokens: request.as_ref().map(TokenCounts::of),
                 response_tokens: response.as_ref().map(TokenCounts::of),
                 request: request.map(|event| preview(event, window)),

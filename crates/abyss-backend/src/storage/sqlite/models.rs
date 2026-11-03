@@ -101,7 +101,6 @@ pub(super) struct EventRow {
     pub(super) observed_at: i64,
     pub(super) metadata: String,
     pub(super) created_at: i64,
-    pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
     pub(super) conversation: Option<String>,
@@ -130,7 +129,6 @@ pub(super) struct NewEvent {
     pub(super) observed_at: i64,
     pub(super) metadata: String,
     pub(super) created_at: i64,
-    pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
     pub(super) conversation: Option<String>,
@@ -359,6 +357,7 @@ pub(super) struct DeviceRecord {
     pub(super) id: Uuid,
     pub(super) host_name: String,
     pub(super) platform: String,
+    pub(super) os_version: Option<String>,
 }
 
 pub(super) struct EventRecord {
@@ -381,7 +380,6 @@ pub(super) struct EventRecord {
     pub(super) total_tokens: i64,
     pub(super) observed_at: DateTime<Utc>,
     pub(super) metadata: Value,
-    pub(super) stream_id: Option<String>,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
     pub(super) conversation: Option<Value>,
@@ -399,16 +397,12 @@ pub(super) struct AttachmentRecord {
 
 impl DeviceRow {
     pub(super) fn into_record(self) -> Result<DeviceRecord, AppError> {
-        let _ = (
-            &self.user_id,
-            &self.os_version,
-            self.created_at,
-            self.updated_at,
-        );
+        let _ = (&self.user_id, self.created_at, self.updated_at);
         Ok(DeviceRecord {
             id: parse_uuid(&self.id, "device id")?,
             host_name: self.host_name,
             platform: self.platform,
+            os_version: self.os_version,
         })
     }
 }
@@ -436,7 +430,6 @@ impl EventRow {
             total_tokens: self.total_tokens,
             observed_at: timestamp_from_micros(self.observed_at)?,
             metadata: parse_json(&self.metadata, "event metadata")?,
-            stream_id: self.stream_id,
             response_id: self.response_id,
             previous_response_id: self.previous_response_id,
             conversation: self

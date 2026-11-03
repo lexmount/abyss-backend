@@ -69,7 +69,6 @@ CREATE TABLE llm_usage_events (
     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
     observed_at INTEGER NOT NULL,
     -- Agent-declared thread of the exchange; equal values continue one conversation.
-    stream_id TEXT,
     -- Provider identity of the response the exchange produced.
     response_id TEXT,
     -- Response whose conversation the exchange's request continues.

@@ -168,7 +168,6 @@ mod tests {
             observed_at: Utc::now(),
             metadata: json!({}),
             created_at: Utc::now(),
-            stream_id: None,
             response_id: None,
             previous_response_id: None,
             conversation: None,

@@ -105,7 +105,6 @@ def event(
         },
         "agent": {"name": "codex", "version": "blackbox"},
         "session_id": session_id,
-        "stream_id": f"stream-{run_id}",
         "response_id": f"response-{run_id}",
         "llm": {"provider": "openai", "model": "gpt-5.5"},
         "event_type": event_type,
@@ -114,7 +113,11 @@ def event(
             "entries": [{"role": "user" if event_type == "request" else "assistant", "text": text}],
             "completeness": "complete",
         },
-        "metadata": {"test_run": run_id},
+        "metadata": {
+            "test_run": run_id,
+            "path": "/v1/responses",
+            "headers": [{"name": "x-test-run", "value": run_id}],
+        },
     }
     if event_type == "request":
         value["attachments"] = [
@@ -224,9 +227,10 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         set(by_event_id) == {request_event_id, response_event_id},
         "raw event query returned unexpected events",
     )
+    removed_fields = {"user_id", "device_context_id", "metadata"}
     require(
-        all(item["user_id"] == OWNER_ID for item in raw_events),
-        "events must belong to the standalone owner",
+        all(removed_fields.isdisjoint(item) for item in raw_events),
+        "events must not expose the owner, device key, stream id, or raw metadata",
     )
     require(
         IMAGE_BASE64.encode() not in raw_response.body,
@@ -234,20 +238,43 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     )
     require(
         all(
-            item.get("stream_id") == f"stream-{run_id}"
-            and item.get("response_id") == f"response-{run_id}"
-            and item.get("previous_response_id") is None
+            item["response_id"] == f"response-{run_id}"
+            and item["previous_response_id"] is None
             for item in raw_events
         ),
         "events must return the exchange identities they were ingested with",
     )
     require(
+        all(item["conversation"]["completeness"] == "complete" for item in raw_events),
+        "events must return the conversation at the top level",
+    )
+    require(
         all(
-            item["conversation"]["completeness"] == "complete"
-            and item["metadata"] == {"test_run": run_id}
+            item["agent"] == {"name": "codex", "version": "blackbox"}
+            and item["device"]
+            == {"host_name": "blackbox-host", "platform": "linux", "os_version": "blackbox"}
+            and item["llm"] == {"provider": "openai", "model": "gpt-5.5"}
+            and item["purpose"] is None
+            and item["omitted"] == []
+            and item["declared"]
+            == {"subagent_id": None, "parent_subagent_id": None, "turn_id": None}
+            and item["http"]
+            == {"path": "/v1/responses", "headers": [{"name": "x-test-run", "value": run_id}]}
             for item in raw_events
         ),
-        "events must return the conversation at the top level, outside metadata",
+        "events must group their Agent, device, model, declared ids, and HTTP fields",
+    )
+    require(
+        by_event_id[request_event_id]["token_usage"]
+        == {
+            "input_tokens": 12,
+            "output_tokens": 0,
+            "cache_read_tokens": 3,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 15,
+        },
+        "events must return their token counters as ingested",
     )
 
     # The list projection carries what an event list shows and no content.
@@ -261,18 +288,29 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         [item["id"] for item in listed_events] == [item["id"] for item in raw_events],
         "event list must return the same events in the same order",
     )
-    content_fields = {"conversation", "metadata", "attachments"}
+    list_fields = {
+        "id",
+        "event_id",
+        "session_pk",
+        "session_id",
+        "observed_at",
+        "event_type",
+        "agent",
+        "device",
+        "llm",
+        "token_usage",
+    }
     require(
-        all(content_fields.isdisjoint(item) for item in listed_events),
-        "event list items must leave out conversation, metadata, and attachments",
+        all(set(item) == list_fields for item in listed_events),
+        "event list items must carry only what an event list shows",
     )
     require(
         all(
-            item["total_tokens"] == by_event_id[item["event_id"]]["total_tokens"]
-            and item["host_name"] == by_event_id[item["event_id"]]["host_name"]
+            item[field] == by_event_id[item["event_id"]][field]
             for item in listed_events
+            for field in list_fields
         ),
-        "event list items must keep token counts and device labels",
+        "event list items must match the complete events",
     )
 
     attachments = by_event_id[request_event_id]["attachments"]
@@ -568,6 +606,15 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
     raw = request(base_url, "GET", raw_path, token=token)
     require_status(raw, 200, "sub-agent raw event query")
     session_pk = raw.json()["events"][0]["session_pk"]
+    declared_by_event = {item["event_id"]: item["declared"] for item in raw.json()["events"]}
+    require(
+        declared_by_event[f"event-sub-request-{run_id}"] == sub
+        and declared_by_event[f"event-main-response-{run_id}"]
+        == {"subagent_id": None, "parent_subagent_id": None, **main}
+        and declared_by_event[f"event-side-request-{run_id}"]
+        == {"subagent_id": None, "parent_subagent_id": None, "turn_id": None},
+        f"events must return the ids their client declared: {declared_by_event}",
+    )
 
     streams = request(
         base_url, "GET", f"/v1/agent-usage/sessions/{session_pk}/streams", token=token

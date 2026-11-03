@@ -142,6 +142,24 @@ builder for both storage backends. A small `QueryFragment` extension supplies th
 bound `VALUES` CTE for time buckets, which Diesel does not provide as a built-in
 query source. Bucket values remain bound and result types remain checked.
 
+### Event objects
+
+`GET /events` and `GET /events/{event_pk}` return each event grouped the way
+the collector's `AgentEvent` groups it: `id`, `event_id`, `session_pk`,
+`session_id`, `observed_at`, `event_type`, `agent {name, version}`,
+`device {host_name, platform, os_version}`, `llm {provider, model}`,
+`purpose`, `declared {subagent_id, parent_subagent_id, turn_id}`,
+`response_id`, `previous_response_id`, `http {path, headers}`, `token_usage`
+with its six counters, `omitted`, `conversation` (omitted when the event has
+none), and `attachments`. `purpose`, `omitted`, `http.path`, and
+`http.headers` are the keys the collector uploads inside `metadata`; headers
+keep its `{name, value}` / `{name, value_base64}` shape. The declared ids are
+the ones stored with the event's stream facts. Stored `metadata` itself, the
+owner, and the device key are not returned.
+`fields=list` returns only `id`, `event_id`, `session_pk`, `session_id`,
+`location`, `observed_at`, `event_type`, `agent`, `device`, `llm`, and
+`token_usage`, without reading content.
+
 ### Session structure and event links
 
 The header, streams, turns, segment details, in-session search, and event location

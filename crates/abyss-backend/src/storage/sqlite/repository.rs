@@ -21,8 +21,9 @@ use crate::{
     error::AppError,
     storage::stream_cache::StreamCache,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
-        RawEventsResponse, SummaryQuery, SummaryResponse, SummaryRow, UsageEventResponse,
+        DeclaredIds, EventAgent, EventDevice, EventLlm, EventTokenUsage, IngestEventsRequest,
+        IngestEventsResponse, IngestUsageEvent, RawEventsQuery, RawEventsResponse,
+        RecordedMetadata, SummaryQuery, SummaryResponse, SummaryRow, UsageEventResponse,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
             ValidatedImageAttachment,
@@ -167,7 +168,6 @@ fn ingest_one_event(
             observed_at,
             metadata,
             created_at: now,
-            stream_id: event.stream_id.clone(),
             response_id: event.response_id.clone(),
             previous_response_id: event.previous_response_id.clone(),
             conversation,
@@ -559,18 +559,9 @@ fn usage_events(
         .into_iter()
         .map(EventRow::into_record)
         .collect::<Result<Vec<_>, _>>()?;
-    let devices = load_device_contexts(connection, &events)?;
-    let mut attachments = load_attachments(connection, &events)?;
-    Ok(events
+    Ok(event_responses(connection, events, true)?
         .into_iter()
-        .map(|event| {
-            let (event_pk, device_id) = (event.id, event.device_context_id);
-            let attachments = attachments.remove(&event_pk).unwrap_or_default();
-            (
-                event_pk,
-                event_response(event, devices.get(&device_id), attachments),
-            )
-        })
+        .map(|event| (event.id, event))
         .collect())
 }
 
@@ -740,26 +731,8 @@ pub(super) fn raw_events(
     if has_next_page {
         events.truncate(page_size_usize);
     }
-    let devices = load_device_contexts(connection, &events)?;
-    let mut attachments = if query.includes_content() {
-        load_attachments(connection, &events)?
-    } else {
-        HashMap::new()
-    };
-    let responses = events
-        .into_iter()
-        .map(|event| {
-            let event_pk = event.id;
-            let device_id = event.device_context_id;
-            event_response(
-                event,
-                devices.get(&device_id),
-                attachments.remove(&event_pk).unwrap_or_default(),
-            )
-        })
-        .collect();
     Ok(RawEventsResponse {
-        events: responses,
+        events: event_responses(connection, events, query.includes_content())?,
         next_page_token: has_next_page.then(|| offset.saturating_add(page_size).to_string()),
     })
 }
@@ -853,7 +826,6 @@ fn load_filtered_events(
                 llm_usage_events::observed_at,
                 "{}".into_sql::<Text>(),
                 llm_usage_events::created_at,
-                llm_usage_events::stream_id,
                 llm_usage_events::response_id,
                 llm_usage_events::previous_response_id,
                 None::<String>.into_sql::<Nullable<Text>>(),
@@ -876,17 +848,9 @@ pub(super) fn usage_event(
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("usage event not found: {event_pk}")))?
         .into_record()?;
-    let events = [event];
-    let devices = load_device_contexts(connection, &events)?;
-    let mut attachments = load_attachments(connection, &events)?;
-    let [event] = events;
-    let event_pk = event.id;
-    let device_id = event.device_context_id;
-    Ok(event_response(
-        event,
-        devices.get(&device_id),
-        attachments.remove(&event_pk).unwrap_or_default(),
-    ))
+    event_responses(connection, vec![event], true)?
+        .pop()
+        .ok_or_else(|| AppError::internal("loaded event has no response".to_owned()))
 }
 
 pub(super) fn image_attachment(
@@ -1336,38 +1300,115 @@ fn load_attachments(
     Ok(by_event)
 }
 
+/// Builds the responses of loaded events with their devices and, when content
+/// is included, their declared ids and attachments.
+fn event_responses(
+    connection: &mut SqliteConnection,
+    events: Vec<EventRecord>,
+    include_content: bool,
+) -> Result<Vec<UsageEventResponse>, AppError> {
+    let devices = load_device_contexts(connection, &events)?;
+    let (mut declared, mut attachments) = if include_content {
+        (
+            load_declared_ids(connection, &events)?,
+            load_attachments(connection, &events)?,
+        )
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
+    Ok(events
+        .into_iter()
+        .map(|event| {
+            let event_pk = event.id;
+            let device = devices.get(&event.device_context_id);
+            event_response(
+                event,
+                device,
+                declared.remove(&event_pk).unwrap_or_default(),
+                attachments.remove(&event_pk).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// The ids each event's client declared, from its stream facts.
+fn load_declared_ids(
+    connection: &mut SqliteConnection,
+    events: &[EventRecord],
+) -> Result<HashMap<Uuid, DeclaredIds>, AppError> {
+    if events.is_empty() {
+        return Ok(HashMap::new());
+    }
+    llm_usage_event_stream_facts::table
+        .filter(
+            llm_usage_event_stream_facts::event_pk
+                .eq_any(events.iter().map(|event| event.id.to_string())),
+        )
+        .select((
+            llm_usage_event_stream_facts::event_pk,
+            llm_usage_event_stream_facts::subagent_id,
+            llm_usage_event_stream_facts::parent_subagent_id,
+            llm_usage_event_stream_facts::turn_id,
+        ))
+        .load::<(String, Option<String>, Option<String>, Option<String>)>(connection)?
+        .into_iter()
+        .map(|(event_pk, subagent_id, parent_subagent_id, turn_id)| {
+            Ok((
+                parse_uuid(&event_pk, "stream facts event id")?,
+                DeclaredIds {
+                    subagent_id,
+                    parent_subagent_id,
+                    turn_id,
+                },
+            ))
+        })
+        .collect()
+}
+
 fn event_response(
     event: EventRecord,
     device: Option<&DeviceRecord>,
+    declared: DeclaredIds,
     attachments: Vec<UsageEventAttachmentResponse>,
 ) -> UsageEventResponse {
+    let _ = event.user_id;
+    let recorded = RecordedMetadata::read(&event.metadata);
     UsageEventResponse {
         id: event.id,
         event_id: event.event_id,
-        user_id: event.user_id,
-        device_context_id: event.device_context_id,
-        host_name: device.map(|value| value.host_name.clone()),
-        platform: device.map(|value| value.platform.clone()),
         session_pk: event.session_pk,
-        location: None,
-        agent_name: event.agent_name,
-        agent_version: event.agent_version,
         session_id: event.session_id,
-        llm_provider: event.llm_provider,
-        llm_model: event.llm_model,
-        event_type: event.event_type,
-        input_tokens: event.input_tokens,
-        output_tokens: event.output_tokens,
-        cache_read_tokens: event.cache_read_tokens,
-        cache_write_tokens: event.cache_write_tokens,
-        reasoning_tokens: event.reasoning_tokens,
-        total_tokens: event.total_tokens,
+        location: None,
         observed_at: event.observed_at,
-        stream_id: event.stream_id,
+        event_type: event.event_type,
+        agent: EventAgent {
+            name: event.agent_name,
+            version: event.agent_version,
+        },
+        device: device.map_or_else(EventDevice::default, |device| EventDevice {
+            host_name: Some(device.host_name.clone()),
+            platform: Some(device.platform.clone()),
+            os_version: device.os_version.clone(),
+        }),
+        llm: EventLlm {
+            provider: event.llm_provider,
+            model: event.llm_model,
+        },
+        purpose: recorded.purpose,
+        declared,
         response_id: event.response_id,
         previous_response_id: event.previous_response_id,
+        http: recorded.http,
+        token_usage: EventTokenUsage {
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_write_tokens,
+            reasoning_tokens: event.reasoning_tokens,
+            total_tokens: event.total_tokens,
+        },
+        omitted: recorded.omitted,
         conversation: event.conversation,
-        metadata: event.metadata,
         attachments,
     }
 }
@@ -1516,8 +1557,15 @@ mod tests {
             .first::<String>(&mut database)
             .unwrap();
         let event_pk = Uuid::parse_str(&event_pk).unwrap();
+        let stored_metadata = |database: &mut SqliteConnection| {
+            let metadata = llm_usage_events::table
+                .select(llm_usage_events::metadata)
+                .first::<String>(database)
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&metadata).unwrap()
+        };
         let event = super::usage_event(&mut database, OWNER_ID, event_pk).unwrap();
-        let stored = &event.metadata;
+        let stored = &stored_metadata(&mut database);
         assert_eq!(*stored, expected);
         assert_eq!(event.conversation, request.events[0].conversation);
         assert_eq!(
@@ -1533,8 +1581,8 @@ mod tests {
         let preview =
             event_conversation(&mut database, OWNER_ID, event_pk, &Window::default()).unwrap();
         assert_eq!(preview.chunks[0].entries[0]["text"].as_str(), Some("hello"));
-        let after = super::usage_event(&mut database, OWNER_ID, event_pk).unwrap();
-        assert_eq!(after.metadata, expected);
+        super::usage_event(&mut database, OWNER_ID, event_pk).unwrap();
+        assert_eq!(stored_metadata(&mut database), expected);
     }
 
     #[test]
@@ -1557,9 +1605,9 @@ mod tests {
             .find(|event| event.event_id == "sqlite-event")
             .expect("the first event should be stored");
         assert_eq!(stored.session_id, " Session ");
-        assert_eq!(stored.llm_provider, "Gateway_Host");
-        assert_eq!(stored.llm_model, " Model ");
-        assert_eq!(stored.platform.as_deref(), Some("macOS"));
+        assert_eq!(stored.llm.provider, "Gateway_Host");
+        assert_eq!(stored.llm.model, " Model ");
+        assert_eq!(stored.device.platform.as_deref(), Some("macOS"));
         assert_eq!(
             stored.conversation.as_ref().expect("conversation")["entries"][0]["text"],
             json!("  hello \n")
@@ -1788,6 +1836,82 @@ mod tests {
                 ("s", Some("a1"), None, None),
                 ("o", Some("a2"), None, None),
             ]
+        );
+    }
+
+    #[test]
+    fn event_detail_groups_the_event_like_the_agent_event() {
+        let mut database = database();
+        let request: IngestEventsRequest = serde_json::from_value(json!({"events": [{
+            "event_id": "grouped",
+            "observed_at": "2026-10-20T00:00:01Z",
+            "device": {"host_name": "local", "platform": "macos", "os_version": "15.1"},
+            "agent": {"name": "claude-code", "version": "2.1.0"},
+            "session_id": "grouped-session",
+            "response_id": "resp-1",
+            "subagent_id": "a1",
+            "parent_subagent_id": "a0",
+            "turn_id": "p1",
+            "llm": {"provider": "anthropic", "model": "claude"},
+            "event_type": "request",
+            "token_usage": {"input_tokens": 3_i64, "cache_read_tokens": 2_i64, "total_tokens": 5_i64},
+            "metadata": {
+                "purpose": "session_title",
+                "omitted": ["images"],
+                "path": "/v1/messages",
+                "headers": [
+                    {"name": "content-type", "value": "application/json"},
+                    {"name": "x-raw", "value_base64": "/w=="}
+                ]
+            }
+        }]}))
+        .expect("test ingest request should deserialize");
+        ingest_events(&mut database, &request, OWNER_ID, 100).expect("ingest should succeed");
+        let event_pk = llm_usage_events::table
+            .select(llm_usage_events::id)
+            .first::<String>(&mut database)
+            .expect("the event is stored");
+        let event_pk = Uuid::parse_str(&event_pk).expect("a UUID");
+
+        let mut event = serde_json::to_value(
+            super::usage_event(&mut database, OWNER_ID, event_pk).expect("the event loads"),
+        )
+        .expect("the event serializes");
+        let object = event.as_object_mut().expect("an object");
+        for key in ["id", "session_pk", "observed_at"] {
+            assert!(object.remove(key).is_some(), "{key}");
+        }
+        assert_eq!(
+            event,
+            json!({
+                "event_id": "grouped",
+                "session_id": "grouped-session",
+                "event_type": "request",
+                "agent": {"name": "claude-code", "version": "2.1.0"},
+                "device": {"host_name": "local", "platform": "macos", "os_version": "15.1"},
+                "llm": {"provider": "anthropic", "model": "claude"},
+                "purpose": "session_title",
+                "declared": {"subagent_id": "a1", "parent_subagent_id": "a0", "turn_id": "p1"},
+                "response_id": "resp-1",
+                "previous_response_id": null,
+                "http": {
+                    "path": "/v1/messages",
+                    "headers": [
+                        {"name": "content-type", "value": "application/json"},
+                        {"name": "x-raw", "value_base64": "/w=="}
+                    ]
+                },
+                "token_usage": {
+                    "input_tokens": 3_i64,
+                    "output_tokens": 0_i64,
+                    "cache_read_tokens": 2_i64,
+                    "cache_write_tokens": 0_i64,
+                    "reasoning_tokens": 0_i64,
+                    "total_tokens": 5_i64
+                },
+                "omitted": ["images"],
+                "attachments": []
+            })
         );
     }
 
@@ -2167,12 +2291,16 @@ mod tests {
         assert_eq!(list.events.len(), 2);
         for (listed, complete) in list.events.iter().zip(&full.events) {
             assert_eq!(listed.id, complete.id);
-            assert_eq!(listed.total_tokens, complete.total_tokens);
-            assert_eq!(listed.host_name.as_deref(), Some("alice-mbp"));
-            assert_eq!(listed.metadata, json!({}));
+            assert_eq!(
+                listed.token_usage.total_tokens,
+                complete.token_usage.total_tokens
+            );
+            assert_eq!(listed.device.host_name.as_deref(), Some("alice-mbp"));
+            assert_eq!(listed.device.os_version.as_deref(), Some("15.1"));
+            assert_eq!(listed.http.path, None);
             assert!(listed.conversation.is_none());
             assert!(listed.attachments.is_empty());
-            assert_eq!(complete.metadata["archive"], json!("large"));
+            assert_eq!(complete.http.path.as_deref(), Some("/v1/responses"));
         }
     }
 
@@ -2206,7 +2334,7 @@ mod tests {
                     ],
                     "completeness": "complete"
                 })),
-                "metadata": {"archive": "large"}
+                "metadata": {"archive": "large", "path": "/v1/responses"}
             })
         };
         let request: IngestEventsRequest = serde_json::from_value(json!({

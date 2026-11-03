@@ -43,8 +43,9 @@ use crate::{
     error::AppError,
     storage::stream_cache::StreamCache,
     usage::{
-        IngestEventsRequest, IngestEventsResponse, IngestUsageEvent, RawEventsQuery,
-        RawEventsResponse, SummaryQuery, SummaryResponse, SummaryRow, UsageEventResponse,
+        DeclaredIds, EventAgent, EventDevice, EventLlm, EventTokenUsage, IngestEventsRequest,
+        IngestEventsResponse, IngestUsageEvent, RawEventsQuery, RawEventsResponse,
+        RecordedMetadata, SummaryQuery, SummaryResponse, SummaryRow, UsageEventResponse,
         UsageEventType,
         attachments::{
             ImageMediaType, StoredImageAttachment, UsageEventAttachmentResponse,
@@ -427,26 +428,8 @@ pub fn raw_events(
     if has_next_page {
         events.truncate(page_size_usize);
     }
-    let device_contexts = load_device_contexts_for_events(connection, &events)?;
-    let mut attachments_by_event = if query.includes_content() {
-        load_attachments_for_events(connection, &events)?
-    } else {
-        HashMap::new()
-    };
-
     Ok(RawEventsResponse {
-        events: events
-            .into_iter()
-            .map(|event| {
-                let event_pk = event.id;
-                let device_context_id = event.device_context_id;
-                event_response(
-                    event,
-                    device_contexts.get(&device_context_id),
-                    attachments_by_event.remove(&event_pk).unwrap_or_default(),
-                )
-            })
-            .collect(),
+        events: event_responses(connection, events, query.includes_content())?,
         next_page_token: has_next_page.then(|| offset.saturating_add(page_size).to_string()),
     })
 }
@@ -465,17 +448,9 @@ pub fn usage_event(
         .first::<UsageEvent>(connection)
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("usage event not found: {event_pk}")))?;
-    let events = [event];
-    let device_contexts = load_device_contexts_for_events(connection, &events)?;
-    let mut attachments_by_event = load_attachments_for_events(connection, &events)?;
-    let [event] = events;
-    let event_pk = event.id;
-    let device_context_id = event.device_context_id;
-    Ok(event_response(
-        event,
-        device_contexts.get(&device_context_id),
-        attachments_by_event.remove(&event_pk).unwrap_or_default(),
-    ))
+    event_responses(connection, vec![event], true)?
+        .pop()
+        .ok_or_else(|| AppError::internal("loaded event has no response".to_owned()))
 }
 
 /// Loads authorized attachment bytes and verifies persisted size metadata.
@@ -728,18 +703,9 @@ fn usage_events(
         .filter(llm_usage_events::id.eq_any(pks))
         .filter(llm_usage_events::user_id.eq(user_id))
         .load::<UsageEvent>(connection)?;
-    let devices = load_device_contexts_for_events(connection, &events)?;
-    let mut attachments = load_attachments_for_events(connection, &events)?;
-    Ok(events
+    Ok(event_responses(connection, events, true)?
         .into_iter()
-        .map(|event| {
-            let (event_pk, device_id) = (event.id, event.device_context_id);
-            let attachments = attachments.remove(&event_pk).unwrap_or_default();
-            (
-                event_pk,
-                event_response(event, devices.get(&device_id), attachments),
-            )
-        })
+        .map(|event| (event.id, event))
         .collect())
 }
 
@@ -908,7 +874,6 @@ fn ingest_one_event(
             observed_at,
             metadata: event.metadata.clone(),
             created_at: now,
-            stream_id: event.stream_id.clone(),
             response_id: event.response_id.clone(),
             previous_response_id: event.previous_response_id.clone(),
             conversation: event.conversation.clone(),
@@ -1150,7 +1115,6 @@ fn load_filtered_events(
             llm_usage_events::observed_at,
             serde_json::json!({}).into_sql::<Jsonb>(),
             llm_usage_events::created_at,
-            llm_usage_events::stream_id,
             llm_usage_events::response_id,
             llm_usage_events::previous_response_id,
             None::<serde_json::Value>.into_sql::<Nullable<Jsonb>>(),
@@ -1219,41 +1183,116 @@ fn load_attachments_for_events(
     Ok(by_event)
 }
 
+/// Builds the responses of loaded events with their devices and, when content
+/// is included, their declared ids and attachments.
+fn event_responses(
+    connection: &mut PgConnection,
+    events: Vec<UsageEvent>,
+    include_content: bool,
+) -> Result<Vec<UsageEventResponse>, AppError> {
+    let devices = load_device_contexts_for_events(connection, &events)?;
+    let (mut declared, mut attachments) = if include_content {
+        (
+            load_declared_ids_for_events(connection, &events)?,
+            load_attachments_for_events(connection, &events)?,
+        )
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
+    Ok(events
+        .into_iter()
+        .map(|event| {
+            let event_pk = event.id;
+            let device = devices.get(&event.device_context_id);
+            event_response(
+                event,
+                device,
+                declared.remove(&event_pk).unwrap_or_default(),
+                attachments.remove(&event_pk).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// The ids each event's client declared, from its stream facts.
+fn load_declared_ids_for_events(
+    connection: &mut PgConnection,
+    events: &[UsageEvent],
+) -> Result<HashMap<Uuid, DeclaredIds>, AppError> {
+    let event_pks = events.iter().map(|event| event.id).collect::<Vec<_>>();
+    if event_pks.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(llm_usage_event_stream_facts::table
+        .filter(llm_usage_event_stream_facts::event_pk.eq_any(event_pks))
+        .select((
+            llm_usage_event_stream_facts::event_pk,
+            llm_usage_event_stream_facts::subagent_id,
+            llm_usage_event_stream_facts::parent_subagent_id,
+            llm_usage_event_stream_facts::turn_id,
+        ))
+        .load::<(Uuid, Option<String>, Option<String>, Option<String>)>(connection)?
+        .into_iter()
+        .map(|(event_pk, subagent_id, parent_subagent_id, turn_id)| {
+            (
+                event_pk,
+                DeclaredIds {
+                    subagent_id,
+                    parent_subagent_id,
+                    turn_id,
+                },
+            )
+        })
+        .collect())
+}
+
 fn event_response(
     event: UsageEvent,
     device: Option<&Device>,
+    declared: DeclaredIds,
     attachments: Vec<UsageEventAttachmentResponse>,
 ) -> UsageEventResponse {
     // created_at is an internal ingestion timestamp; APIs expose observed_at as
     // the user-facing event time while still selecting a complete Diesel row.
-    std::hint::black_box(event.created_at);
+    // The owner is not part of the response.
+    std::hint::black_box((event.created_at, event.user_id));
+    let recorded = RecordedMetadata::read(&event.metadata);
     UsageEventResponse {
         id: event.id,
         event_id: event.event_id,
-        user_id: event.user_id,
-        device_context_id: event.device_context_id,
-        host_name: device.map(|value| value.host_name.clone()),
-        platform: device.map(|value| value.platform.clone()),
         session_pk: event.session_pk,
-        location: None,
-        agent_name: event.agent_name,
-        agent_version: event.agent_version,
         session_id: event.session_id,
-        llm_provider: event.llm_provider,
-        llm_model: event.llm_model,
-        event_type: event.event_type,
-        input_tokens: event.input_tokens,
-        output_tokens: event.output_tokens,
-        cache_read_tokens: event.cache_read_tokens,
-        cache_write_tokens: event.cache_write_tokens,
-        reasoning_tokens: event.reasoning_tokens,
-        total_tokens: event.total_tokens,
+        location: None,
         observed_at: event.observed_at,
-        stream_id: event.stream_id,
+        event_type: event.event_type,
+        agent: EventAgent {
+            name: event.agent_name,
+            version: event.agent_version,
+        },
+        device: device.map_or_else(EventDevice::default, |device| EventDevice {
+            host_name: Some(device.host_name.clone()),
+            platform: Some(device.platform.clone()),
+            os_version: device.os_version.clone(),
+        }),
+        llm: EventLlm {
+            provider: event.llm_provider,
+            model: event.llm_model,
+        },
+        purpose: recorded.purpose,
+        declared,
         response_id: event.response_id,
         previous_response_id: event.previous_response_id,
+        http: recorded.http,
+        token_usage: EventTokenUsage {
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_write_tokens,
+            reasoning_tokens: event.reasoning_tokens,
+            total_tokens: event.total_tokens,
+        },
+        omitted: recorded.omitted,
         conversation: event.conversation,
-        metadata: event.metadata,
         attachments,
     }
 }
@@ -1489,8 +1528,8 @@ mod tests {
         db::models::{Device, UsageEvent},
         error::AppError,
         usage::{
-            AgentPayload, DevicePayload, IngestEventsRequest, IngestUsageEvent, LlmPayload,
-            SummaryRow, TokenUsagePayload, UsageEventType, streams::RequestFacts,
+            AgentPayload, DeclaredIds, DevicePayload, IngestEventsRequest, IngestUsageEvent,
+            LlmPayload, SummaryRow, TokenUsagePayload, UsageEventType, streams::RequestFacts,
         },
     };
 
@@ -1940,11 +1979,13 @@ mod tests {
                 12_i64,
             ),
             Some(&device),
+            DeclaredIds::default(),
             Vec::new(),
         );
 
-        assert_eq!(response.host_name.as_deref(), Some("alice-mbp"));
-        assert_eq!(response.platform.as_deref(), Some("macos"));
+        assert_eq!(response.device.host_name.as_deref(), Some("alice-mbp"));
+        assert_eq!(response.device.platform.as_deref(), Some("macos"));
+        assert_eq!(response.device.os_version.as_deref(), Some("15.5"));
     }
 
     fn assert_summary_dimensions(row: &SummaryRow) {
@@ -1974,7 +2015,6 @@ mod tests {
                 version: Some("1.0.0".to_owned()),
             },
             session_id: "session-001".to_owned(),
-            stream_id: None,
             response_id: None,
             previous_response_id: None,
             subagent_id: None,
@@ -2028,7 +2068,6 @@ mod tests {
             observed_at: timestamp(1_u32, 0_u32, 0_u32),
             metadata: json!({}),
             created_at: timestamp(1_u32, 0_u32, 1_u32),
-            stream_id: None,
             response_id: None,
             previous_response_id: None,
             conversation: None,

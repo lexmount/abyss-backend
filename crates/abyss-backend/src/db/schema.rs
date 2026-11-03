@@ -70,7 +70,6 @@ diesel::table! {
         observed_at -> Timestamptz,
         metadata -> Jsonb,
         created_at -> Timestamptz,
-        stream_id -> Nullable<Text>,
         response_id -> Nullable<Text>,
         previous_response_id -> Nullable<Text>,
         conversation -> Nullable<Jsonb>,

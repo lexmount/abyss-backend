@@ -157,8 +157,6 @@ pub struct UsageEvent {
     pub metadata: Value,
     /// Server insertion time.
     pub created_at: DateTime<Utc>,
-    /// Agent-declared thread of the exchange.
-    pub stream_id: Option<String>,
     /// Provider identity of the response the exchange produced.
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
@@ -272,8 +270,6 @@ pub struct NewUsageEvent {
     pub metadata: Value,
     /// Server insertion time.
     pub created_at: DateTime<Utc>,
-    /// Agent-declared thread of the exchange.
-    pub stream_id: Option<String>,
     /// Provider identity of the response the exchange produced.
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.

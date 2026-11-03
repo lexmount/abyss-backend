@@ -12,6 +12,7 @@ pub mod comparison;
 mod conversation;
 /// Opaque diagnostic-capture ingest contracts.
 pub mod diagnostics;
+mod event;
 pub mod persistence;
 /// Previews of an event's conversation entries.
 pub mod preview;
@@ -31,7 +32,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use self::streams::EventLocation;
+pub use self::event::{
+    DeclaredIds, EventAgent, EventDevice, EventLlm, EventTokenUsage, RecordedMetadata,
+    UsageEventListItem, UsageEventResponse,
+};
 
 #[derive(Deserialize)]
 /// Atomic batch accepted by the event-ingestion endpoint.
@@ -56,9 +60,6 @@ pub struct IngestUsageEvent {
     pub agent: AgentPayload,
     /// Agent-native session identifier.
     pub session_id: String,
-    /// The thread that sent this exchange's request, as the Agent declares
-    /// it; requests with the same value continue one conversation.
-    pub stream_id: Option<String>,
     /// Provider identity of the response this exchange produced; both events
     /// of the exchange carry it.
     pub response_id: Option<String>,
@@ -448,151 +449,6 @@ impl RawEventListResponse {
             next_page_token: response.next_page_token,
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-/// One usage event as an event list shows it: identity, model, Agent, device,
-/// and token counts, without conversation, metadata, or attachments.
-pub struct UsageEventListItem {
-    /// Backend-generated event primary key.
-    pub id: Uuid,
-    /// Collector-generated idempotency key.
-    pub event_id: String,
-    /// Authenticated owner identifier.
-    pub user_id: Uuid,
-    /// Backend device-context primary key.
-    pub device_context_id: Uuid,
-    /// Device host name, when the referenced device still exists.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_name: Option<String>,
-    /// Device platform, when the referenced device still exists.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform: Option<String>,
-    /// Backend session primary key.
-    pub session_pk: Uuid,
-    /// Current stream position, when the request asks for event locations.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<EventLocation>,
-    /// Agent name as reported by the collector.
-    pub agent_name: String,
-    /// Agent version observed on this event.
-    pub agent_version: Option<String>,
-    /// Agent-native session identifier.
-    pub session_id: String,
-    /// LLM provider as reported by the collector.
-    pub llm_provider: String,
-    /// Provider-specific model identifier.
-    pub llm_model: String,
-    /// Canonical request or response value.
-    pub event_type: String,
-    /// Normalized input-token count.
-    pub input_tokens: i64,
-    /// Normalized output-token count.
-    pub output_tokens: i64,
-    /// Normalized cache-read-token count.
-    pub cache_read_tokens: i64,
-    /// Normalized cache-write-token count.
-    pub cache_write_tokens: i64,
-    /// Normalized reasoning-token count.
-    pub reasoning_tokens: i64,
-    /// Provider-reported or derived total-token count.
-    pub total_tokens: i64,
-    /// Collector observation timestamp.
-    pub observed_at: DateTime<Utc>,
-}
-
-impl From<UsageEventResponse> for UsageEventListItem {
-    fn from(event: UsageEventResponse) -> Self {
-        Self {
-            id: event.id,
-            event_id: event.event_id,
-            user_id: event.user_id,
-            device_context_id: event.device_context_id,
-            host_name: event.host_name,
-            platform: event.platform,
-            session_pk: event.session_pk,
-            location: event.location,
-            agent_name: event.agent_name,
-            agent_version: event.agent_version,
-            session_id: event.session_id,
-            llm_provider: event.llm_provider,
-            llm_model: event.llm_model,
-            event_type: event.event_type,
-            input_tokens: event.input_tokens,
-            output_tokens: event.output_tokens,
-            cache_read_tokens: event.cache_read_tokens,
-            cache_write_tokens: event.cache_write_tokens,
-            reasoning_tokens: event.reasoning_tokens,
-            total_tokens: event.total_tokens,
-            observed_at: event.observed_at,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-/// API representation of one persisted usage event.
-pub struct UsageEventResponse {
-    /// Backend-generated event primary key.
-    pub id: Uuid,
-    /// Collector-generated idempotency key.
-    pub event_id: String,
-    /// Authenticated owner identifier.
-    pub user_id: Uuid,
-    /// Backend device-context primary key.
-    pub device_context_id: Uuid,
-    /// Device host name, when the referenced device still exists.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_name: Option<String>,
-    /// Device platform, when the referenced device still exists.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform: Option<String>,
-    /// Backend session primary key.
-    pub session_pk: Uuid,
-    /// Current stream position, when the request asks for event locations.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<EventLocation>,
-    /// Agent name as reported by the collector.
-    pub agent_name: String,
-    /// Agent version observed on this event.
-    pub agent_version: Option<String>,
-    /// Agent-native session identifier.
-    pub session_id: String,
-    /// LLM provider as reported by the collector.
-    pub llm_provider: String,
-    /// Provider-specific model identifier.
-    pub llm_model: String,
-    /// Canonical request or response value.
-    pub event_type: String,
-    /// Normalized input-token count.
-    pub input_tokens: i64,
-    /// Normalized output-token count.
-    pub output_tokens: i64,
-    /// Normalized cache-read-token count.
-    pub cache_read_tokens: i64,
-    /// Normalized cache-write-token count.
-    pub cache_write_tokens: i64,
-    /// Normalized reasoning-token count.
-    pub reasoning_tokens: i64,
-    /// Provider-reported or derived total-token count.
-    pub total_tokens: i64,
-    /// Collector observation timestamp.
-    pub observed_at: DateTime<Utc>,
-    /// Agent-declared thread of the exchange.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream_id: Option<String>,
-    /// Provider identity of the response the exchange produced.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_id: Option<String>,
-    /// Response whose conversation the exchange's request continues.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
-    /// Conversation of the event, as the collector reported it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conversation: Option<Value>,
-    /// Collector metadata retained without schema expansion.
-    pub metadata: Value,
-    /// Ordered attachment metadata associated with the event.
-    pub attachments: Vec<attachments::UsageEventAttachmentResponse>,
 }
 
 /// Returns the JSON object used when optional metadata is absent.

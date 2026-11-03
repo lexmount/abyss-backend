@@ -71,7 +71,6 @@ diesel::table! {
         observed_at -> BigInt,
         metadata -> Text,
         created_at -> BigInt,
-        stream_id -> Nullable<Text>,
         response_id -> Nullable<Text>,
         previous_response_id -> Nullable<Text>,
         conversation -> Nullable<Text>,
