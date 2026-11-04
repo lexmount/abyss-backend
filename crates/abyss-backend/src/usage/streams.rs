@@ -104,29 +104,6 @@ pub struct StreamSegment {
     pub turn: Option<i64>,
     /// Sub-agent the first exchange declares.
     pub subagent_id: Option<String>,
-    /// Always `None`: sub-agent segments are no longer attached to their
-    /// parent; the field stays for the response shape.
-    pub attached_to: Option<String>,
-    /// Always `None`, as `attached_to`.
-    pub attached_by: Option<AttachedBy>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[expect(
-    dead_code,
-    reason = "attachment is gone; the type stays for `attached_by` in the response shape"
-)]
-/// How a sub-agent's root segment was attached to a segment of its parent
-/// stream. Attachment only decides where the segment shows; it changes no
-/// base and no segment.
-pub enum AttachedBy {
-    /// The first parent segment holding a request with the sub-agent's
-    /// declared turn.
-    Declared,
-    /// The earliest parent segment whose time range holds the sub-agent's
-    /// start.
-    Time,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -358,8 +335,6 @@ impl SessionStructure {
             turn_id,
             turn,
             subagent_id: self.exchanges[first].subagent_id.clone(),
-            attached_to: None,
-            attached_by: None,
         }
     }
 }
@@ -506,8 +481,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        AttachedBy, BaseRule, EventFacts, SegmentKind, SessionStreamsResponse, SessionStructure,
-        StreamEvent, event_segments, segment_run, session_streams,
+        BaseRule, EventFacts, SegmentKind, SessionStreamsResponse, SessionStructure, StreamEvent,
+        event_segments, segment_run, session_streams,
     };
     use crate::usage::streams::fixtures::{Session, assistant, call, item, result, user};
 
@@ -517,31 +492,8 @@ mod tests {
         session_streams(Uuid::nil(), events)
     }
 
-    /// `(head, subagent_id, attached_to, attached_by)` of one segment.
-    type Attachment<'a> = (
-        &'a str,
-        Option<&'a str>,
-        Option<&'a str>,
-        Option<AttachedBy>,
-    );
-
-    fn attachments(streams: &SessionStreamsResponse) -> Vec<Attachment<'_>> {
-        streams
-            .segments
-            .iter()
-            .map(|segment| {
-                (
-                    segment.head.as_str(),
-                    segment.subagent_id.as_deref(),
-                    segment.attached_to.as_deref(),
-                    segment.attached_by,
-                )
-            })
-            .collect()
-    }
-
     #[test]
-    fn sub_agent_segments_are_grouped_by_their_declaration_and_never_attached() {
+    fn sub_agent_segments_are_grouped_by_their_declaration() {
         let mut session = Session::new();
         let main = (None, None, Some("p1"));
         let a1 = (Some("a1"), None, Some("p1"));
@@ -574,10 +526,12 @@ mod tests {
             main,
         );
         let streams = sorted_streams(&session);
-        assert_eq!(
-            attachments(&streams),
-            [("ask", None, None, None), ("agent", Some("a1"), None, None),]
-        );
+        let segments = streams
+            .segments
+            .iter()
+            .map(|segment| (segment.head.as_str(), segment.subagent_id.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(segments, [("ask", None), ("agent", Some("a1"))]);
     }
 
     #[test]

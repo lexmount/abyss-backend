@@ -1773,7 +1773,7 @@ mod tests {
             event("s-req", 2, "request", sub.clone()),
             event("s-res", 3, "response", sub),
             // Without a request, the response's declared ids stand for the
-            // exchange; with no turn it attaches by time.
+            // exchange.
             event("o-res", 4, "response", json!({"subagent_id": "a2", "parent_subagent_id": null})),
         ]}))
         .expect("test ingest request should deserialize");
@@ -1798,26 +1798,14 @@ mod tests {
         let session_pk = Uuid::parse_str(&session_pk).expect("a UUID");
         let streams = session_streams(&mut database, OWNER_ID, session_pk)
             .expect("the session's streams derive");
-        let attachments = streams
+        let segments = streams
             .segments
             .iter()
-            .map(|segment| {
-                (
-                    segment.head.as_str(),
-                    segment.subagent_id.as_deref(),
-                    segment.attached_to.as_deref(),
-                    segment.attached_by,
-                )
-            })
+            .map(|segment| (segment.head.as_str(), segment.subagent_id.as_deref()))
             .collect::<Vec<_>>();
         assert_eq!(
-            attachments,
-            [
-                ("m", None, None, None),
-                // Sub-agent segments are never attached.
-                ("s", Some("a1"), None, None),
-                ("o", Some("a2"), None, None),
-            ]
+            segments,
+            [("m", None), ("s", Some("a1")), ("o", Some("a2"))]
         );
     }
 

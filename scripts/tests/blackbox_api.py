@@ -621,21 +621,16 @@ def run_sub_agent_contract(base_url: str, token: str, run_id: str) -> None:
     )
     require_status(streams, 200, "sub-agent session streams")
     segments = [
-        (
-            segment["head"],
-            segment.get("subagent_id"),
-            segment.get("attached_to"),
-            segment.get("attached_by"),
-        )
+        (segment["head"], segment.get("subagent_id"))
         for segment in streams.json()["segments"]
     ]
     require(
         segments
         == [
-            (f"main-{run_id}", None, None, None),
-            (f"sub-{run_id}", f"agent-{run_id}", None, None),
+            (f"main-{run_id}", None),
+            (f"sub-{run_id}", f"agent-{run_id}"),
         ],
-        f"the main agent and the sub-agent each have one segment, unattached: {segments}",
+        f"the main agent and the sub-agent each have one segment: {segments}",
     )
     turns = [(segment.get("turn_id"), segment.get("turn")) for segment in streams.json()["segments"]]
     require(
