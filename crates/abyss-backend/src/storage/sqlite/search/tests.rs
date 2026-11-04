@@ -17,8 +17,6 @@ use crate::{
     usage::{IngestEventsRequest, segments::SegmentQuery},
 };
 
-use crate::storage::stream_cache::StreamCache;
-
 use super::{
     super::{
         migrations,
@@ -100,7 +98,6 @@ fn search_session(
         OWNER_ID,
         session_pk,
         &InSessionSearchQuery { q: q.to_owned() },
-        &StreamCache::default(),
     )
     .expect("search should succeed")
 }
@@ -109,20 +106,12 @@ fn search_session(
 /// its streams and segments as the session page reads them.
 fn segment_heads(database: &mut SqliteConnection, session: &str) -> HashMap<Uuid, String> {
     let session_pk = session_pk(database, OWNER_ID, session);
-    let streams = session_streams(database, OWNER_ID, session_pk, &StreamCache::default())
-        .expect("the session has streams");
+    let streams = session_streams(database, OWNER_ID, session_pk).expect("the session has streams");
     let query = SegmentQuery::default().validate().expect("a valid query");
     let mut heads = HashMap::new();
     for segment in streams.segments {
-        let run = session_segment(
-            database,
-            OWNER_ID,
-            session_pk,
-            &segment.head,
-            &query,
-            &StreamCache::default(),
-        )
-        .expect("the segment exists");
+        let run = session_segment(database, OWNER_ID, session_pk, &segment.head, &query)
+            .expect("the segment exists");
         for exchange in run.exchanges {
             for pk in [exchange.exchange.request_pk, exchange.exchange.response_pk]
                 .into_iter()
@@ -670,7 +659,6 @@ fn searches_are_scoped_to_the_owner() {
         &InSessionSearchQuery {
             q: "nimbus".to_owned(),
         },
-        &StreamCache::default(),
     );
     assert!(
         matches!(other, Err(crate::error::AppError::NotFound(_))),
@@ -683,7 +671,6 @@ fn searches_are_scoped_to_the_owner() {
         &InSessionSearchQuery {
             q: "nimbus".to_owned(),
         },
-        &StreamCache::default(),
     );
     assert!(matches!(unknown, Err(crate::error::AppError::NotFound(_))));
     let empty = search_session(&mut database, "empty", "nimbus");

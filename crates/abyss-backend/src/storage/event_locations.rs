@@ -1,7 +1,7 @@
 //! Attaches derived positions to a response page using one structure lookup
 //! per session. The storage caller owns the read snapshot and owner scope.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use uuid::Uuid;
 
@@ -16,7 +16,7 @@ pub(super) fn locate_events<F>(
     mut load: F,
 ) -> Result<(), AppError>
 where
-    F: FnMut(Uuid) -> Result<Arc<SessionStructure>, AppError>,
+    F: FnMut(Uuid) -> Result<SessionStructure, AppError>,
 {
     let mut structures = HashMap::new();
     for event in events {
@@ -36,7 +36,7 @@ pub(super) fn locate_search_matches<F>(
     mut load: F,
 ) -> Result<(), AppError>
 where
-    F: FnMut(Uuid) -> Result<Arc<SessionStructure>, AppError>,
+    F: FnMut(Uuid) -> Result<SessionStructure, AppError>,
 {
     for session in &mut response.items {
         if session.matches.is_empty() {

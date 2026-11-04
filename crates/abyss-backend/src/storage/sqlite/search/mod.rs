@@ -31,7 +31,6 @@ use crate::{
             ranking::{MatchedEvent, SearchHit, SessionDetails, is_new, rank_sessions},
         },
     },
-    storage::stream_cache::StreamCache,
     usage::UsageEventType,
 };
 
@@ -101,7 +100,6 @@ pub(super) fn search_in_session(
     user_id: Uuid,
     session_pk: Uuid,
     query: &InSessionSearchQuery,
-    cache: &StreamCache,
 ) -> Result<InSessionSearchResponse, AppError> {
     let text = query.validate()?;
     let pattern = Pattern::new(&text);
@@ -133,7 +131,7 @@ pub(super) fn search_in_session(
         let matching = ranges.keys().copied().collect::<Vec<_>>();
         let mut hits = hits_in_session(connection, &owner, &session, &matching)?;
         if !hits.is_empty() {
-            let structure = session_structure(connection, user_id, session_pk, cache)?;
+            let structure = session_structure(connection, user_id, session_pk)?;
             for hit in &mut hits {
                 hit.segment = structure.event_segment(hit.event_pk).map(str::to_owned);
             }

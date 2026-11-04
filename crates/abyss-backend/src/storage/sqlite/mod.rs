@@ -12,8 +12,6 @@ mod search;
 mod session_list;
 mod session_titles;
 
-use std::sync::Arc;
-
 use diesel::{Connection, QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
 use uuid::Uuid;
 
@@ -26,7 +24,6 @@ use crate::{
     storage::{
         BoxedFuture, StorageBackend,
         event_locations::{locate_events, locate_search_matches},
-        stream_cache::StreamCache,
     },
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse, SummaryQuery,
@@ -46,7 +43,6 @@ use self::connection::SqlitePool;
 /// SQLite event store with a search index committed beside each event.
 pub(super) struct SqliteFtsBackend {
     pool: SqlitePool,
-    structures: Arc<StreamCache>,
 }
 
 impl SqliteFtsBackend {
@@ -59,10 +55,7 @@ impl SqliteFtsBackend {
                 migrations::run(&mut database)?;
             }
         }
-        Ok(Self {
-            pool,
-            structures: Arc::new(StreamCache::default()),
-        })
+        Ok(Self { pool })
     }
 
     async fn run_db<T, F>(&self, task_fn: F) -> Result<T, AppError>
@@ -113,7 +106,6 @@ impl StorageBackend for SqliteFtsBackend {
         query: RawEventsQuery,
         default_page_size: i64,
     ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 if !query.locate {
@@ -123,7 +115,7 @@ impl StorageBackend for SqliteFtsBackend {
                     let mut response =
                         repository::raw_events(connection, &query, user_id, default_page_size)?;
                     locate_events(&mut response.events, |session_pk| {
-                        repository::session_structure(connection, user_id, session_pk, &structures)
+                        repository::session_structure(connection, user_id, session_pk)
                     })?;
                     Ok(response)
                 })
@@ -137,13 +129,12 @@ impl StorageBackend for SqliteFtsBackend {
         user_id: Uuid,
         event_pk: Uuid,
     ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 connection.transaction(|connection| {
                     let mut event = repository::usage_event(connection, user_id, event_pk)?;
                     locate_events(std::slice::from_mut(&mut event), |session_pk| {
-                        repository::session_structure(connection, user_id, session_pk, &structures)
+                        repository::session_structure(connection, user_id, session_pk)
                     })?;
                     Ok(event)
                 })
@@ -157,11 +148,10 @@ impl StorageBackend for SqliteFtsBackend {
         user_id: Uuid,
         event_pk: Uuid,
     ) -> BoxedFuture<'_, Result<EventLocationResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 connection.transaction(|connection| {
-                    repository::event_location(connection, user_id, event_pk, &structures)
+                    repository::event_location(connection, user_id, event_pk)
                 })
             })
             .await
@@ -198,11 +188,10 @@ impl StorageBackend for SqliteFtsBackend {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionHeaderResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 connection.transaction(|connection| {
-                    repository::session_header(connection, user_id, session_pk, &structures)
+                    repository::session_header(connection, user_id, session_pk)
                 })
             })
             .await
@@ -214,11 +203,10 @@ impl StorageBackend for SqliteFtsBackend {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 connection.transaction(|connection| {
-                    repository::session_streams(connection, user_id, session_pk, &structures)
+                    repository::session_streams(connection, user_id, session_pk)
                 })
             })
             .await
@@ -230,11 +218,10 @@ impl StorageBackend for SqliteFtsBackend {
         user_id: Uuid,
         session_pk: Uuid,
     ) -> BoxedFuture<'_, Result<SessionTurnsResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 connection.transaction(|connection| {
-                    repository::session_turns(connection, user_id, session_pk, &structures)
+                    repository::session_turns(connection, user_id, session_pk)
                 })
             })
             .await
@@ -248,18 +235,10 @@ impl StorageBackend for SqliteFtsBackend {
         head: String,
         query: ValidatedSegmentQuery,
     ) -> BoxedFuture<'_, Result<SegmentResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 connection.transaction(|connection| {
-                    repository::session_segment(
-                        connection,
-                        user_id,
-                        session_pk,
-                        &head,
-                        &query,
-                        &structures,
-                    )
+                    repository::session_segment(connection, user_id, session_pk, &head, &query)
                 })
             })
             .await
@@ -309,13 +288,12 @@ impl StorageBackend for SqliteFtsBackend {
         user_id: Uuid,
         query: SessionSearchQuery,
     ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
                 connection.transaction(|connection| {
                     let mut response = search::session_search(connection, user_id, query)?;
                     locate_search_matches(&mut response, |session_pk| {
-                        repository::session_structure(connection, user_id, session_pk, &structures)
+                        repository::session_structure(connection, user_id, session_pk)
                     })?;
                     Ok(response)
                 })
@@ -330,10 +308,9 @@ impl StorageBackend for SqliteFtsBackend {
         session_pk: Uuid,
         query: InSessionSearchQuery,
     ) -> BoxedFuture<'_, Result<InSessionSearchResponse, AppError>> {
-        let structures = Arc::clone(&self.structures);
         Box::pin(async move {
             self.run_db(move |connection| {
-                search::search_in_session(connection, user_id, session_pk, &query, &structures)
+                search::search_in_session(connection, user_id, session_pk, &query)
             })
             .await
         })

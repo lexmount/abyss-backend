@@ -1,9 +1,6 @@
 //! Diesel ORM implementation of SQLite usage ingest and relational queries.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -19,7 +16,6 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    storage::stream_cache::StreamCache,
     usage::{
         DeclaredIds, EventAgent, EventDevice, EventLlm, EventTokenUsage, IngestEventsRequest,
         IngestEventsResponse, IngestUsageEvent, RawEventsQuery, RawEventsResponse,
@@ -349,9 +345,8 @@ pub(super) fn session_streams(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<SessionStreamsResponse, AppError> {
-    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let structure = session_structure(connection, user_id, session_pk)?;
     Ok(structure.session_streams(session_pk))
 }
 
@@ -361,36 +356,33 @@ pub(super) fn session_turns(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<SessionTurnsResponse, AppError> {
-    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let structure = session_structure(connection, user_id, session_pk)?;
     Ok(structure.session_turns(session_pk))
 }
 
-/// Uses the caller's read transaction so the revision and facts are one snapshot.
-/// A cache hit reads only the session revision; it does not load the event facts.
+/// Derives the structure from the stream facts on every call. It uses the
+/// caller's read transaction, so the structure and the caller's other reads
+/// are one snapshot.
 pub(super) fn session_structure(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
-) -> Result<Arc<SessionStructure>, AppError> {
-    let revision = agent_sessions::table
+) -> Result<SessionStructure, AppError> {
+    agent_sessions::table
         .filter(agent_sessions::user_id.eq(user_id.to_string()))
         .filter(agent_sessions::id.eq(session_pk.to_string()))
-        .select(agent_sessions::structure_revision)
-        .first::<i64>(connection)
+        .select(agent_sessions::id)
+        .first::<String>(connection)
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
-    cache.get_or_load(user_id, session_pk, revision, || {
-        let events = stream_events(connection, session_pk)?;
-        if events.is_empty() {
-            return Err(AppError::not_found(format!(
-                "session not found: {session_pk}"
-            )));
-        }
-        Ok(events)
-    })
+    let events = stream_events(connection, session_pk)?;
+    if events.is_empty() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    Ok(SessionStructure::derive(events))
 }
 
 /// Resolves an authorized event without reading its body or attachments.
@@ -398,7 +390,6 @@ pub(super) fn event_location(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     event_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<EventLocationResponse, AppError> {
     let session_pk = llm_usage_events::table
         .filter(llm_usage_events::user_id.eq(user_id.to_string()))
@@ -408,7 +399,7 @@ pub(super) fn event_location(
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))?;
     let session_pk = parse_uuid(&session_pk, "session primary key")?;
-    session_structure(connection, user_id, session_pk, cache)?
+    session_structure(connection, user_id, session_pk)?
         .event_location(session_pk, event_pk)
         .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))
 }
@@ -434,7 +425,6 @@ pub(super) fn session_header(
     connection: &mut SqliteConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<SessionHeaderResponse, AppError> {
     let owned = agent_sessions::table
         .filter(agent_sessions::user_id.eq(user_id.to_string()))
@@ -475,7 +465,7 @@ pub(super) fn session_header(
             "session not found: {session_pk}"
         )));
     }
-    let summary = session_structure(connection, user_id, session_pk, cache)?.summary();
+    let summary = session_structure(connection, user_id, session_pk)?.summary();
     let title = session_titles::title(connection, session_pk)?;
     Ok(header_of(session_pk, events, &summary, title))
 }
@@ -522,9 +512,8 @@ pub(super) fn session_segment(
     session_pk: Uuid,
     head: &str,
     query: &ValidatedSegmentQuery,
-    cache: &StreamCache,
 ) -> Result<SegmentResponse, AppError> {
-    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let structure = session_structure(connection, user_id, session_pk)?;
     let run = structure.segment_run(head).ok_or_else(|| {
         AppError::not_found(format!(
             "exchange not found in session {session_pk}: {head}"
@@ -1424,7 +1413,6 @@ pub(super) const fn timestamp_to_micros(value: DateTime<Utc>) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::stream_cache::StreamCache;
     use diesel::{
         Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star,
         sql_query,
@@ -1732,7 +1720,7 @@ mod tests {
     #[test]
     fn session_streams_link_stored_exchanges() {
         let (mut database, session_pk) = streams_database();
-        let streams = session_streams(&mut database, OWNER_ID, session_pk, &StreamCache::default())
+        let streams = session_streams(&mut database, OWNER_ID, session_pk)
             .expect("the session's streams derive");
         let segments = streams
             .segments
@@ -1749,13 +1737,7 @@ mod tests {
             (0_i32, "fix the bug", 11_i32)
         );
         assert!(
-            session_streams(
-                &mut database,
-                OWNER_ID,
-                Uuid::nil(),
-                &StreamCache::default()
-            )
-            .is_err(),
+            session_streams(&mut database, OWNER_ID, Uuid::nil()).is_err(),
             "a session without events is not found"
         );
     }
@@ -1814,7 +1796,7 @@ mod tests {
             .first::<String>(&mut database)
             .expect("the session is stored");
         let session_pk = Uuid::parse_str(&session_pk).expect("a UUID");
-        let streams = session_streams(&mut database, OWNER_ID, session_pk, &StreamCache::default())
+        let streams = session_streams(&mut database, OWNER_ID, session_pk)
             .expect("the session's streams derive");
         let attachments = streams
             .segments
@@ -2079,12 +2061,10 @@ mod tests {
             .into_iter()
             .map(|item| (item.session_id, (item.session_pk, item.turns)))
             .collect::<std::collections::HashMap<_, _>>();
-        let cache = StreamCache::default();
         for (session, turns) in [("declared", 2_i64), ("plain", 3_i64)] {
             let (session_pk, listed_turns) = listed[session];
             assert_eq!(listed_turns, turns, "{session}: listed turns");
-            let header =
-                session_header(&mut database, OWNER_ID, session_pk, &cache).expect("the header");
+            let header = session_header(&mut database, OWNER_ID, session_pk).expect("the header");
             assert_eq!(
                 i64::try_from(header.turn_count).expect("a small count"),
                 turns,
@@ -2093,8 +2073,7 @@ mod tests {
         }
 
         let (declared_pk, _) = listed["declared"];
-        let streams =
-            session_streams(&mut database, OWNER_ID, declared_pk, &cache).expect("streams");
+        let streams = session_streams(&mut database, OWNER_ID, declared_pk).expect("streams");
         let segments = streams
             .segments
             .iter()
@@ -2130,7 +2109,7 @@ mod tests {
             ("i-request", Some(2)),
         ] {
             let pk = event_pk(&mut database, event_id);
-            let location = event_location(&mut database, OWNER_ID, pk, &cache).expect("located");
+            let location = event_location(&mut database, OWNER_ID, pk).expect("located");
             assert_eq!(location.location.turn, turn, "{event_id}");
         }
 
@@ -2171,15 +2150,8 @@ mod tests {
         }
         .validate()
         .expect("a valid query");
-        let segment = session_segment(
-            &mut database,
-            OWNER_ID,
-            session_pk,
-            "r1",
-            &query,
-            &StreamCache::default(),
-        )
-        .expect("the whole segment");
+        let segment = session_segment(&mut database, OWNER_ID, session_pk, "r1", &query)
+            .expect("the whole segment");
         assert_eq!(segment.segment, "r1");
         let r2 = &segment.exchanges[1];
         assert_eq!(
@@ -2199,17 +2171,7 @@ mod tests {
             request.chunks[0].entries[0],
             json!({"role": "user", "text": "fix", "text_length": 11_usize})
         );
-        assert!(
-            session_segment(
-                &mut database,
-                OWNER_ID,
-                session_pk,
-                "zz",
-                &query,
-                &StreamCache::default()
-            )
-            .is_err()
-        );
+        assert!(session_segment(&mut database, OWNER_ID, session_pk, "zz", &query).is_err());
 
         let window = Window::parse(&PreviewQuery {
             entries: Some("-1".to_owned()),
@@ -2230,8 +2192,7 @@ mod tests {
     #[test]
     fn the_session_header_sums_its_events() {
         let (mut database, session_pk) = streams_database();
-        let header = session_header(&mut database, OWNER_ID, session_pk, &StreamCache::default())
-            .expect("the header");
+        let header = session_header(&mut database, OWNER_ID, session_pk).expect("the header");
         assert_eq!(
             (
                 header.event_count,
@@ -2254,23 +2215,9 @@ mod tests {
             Some("fix the bug"),
             "the title is the first request label"
         );
+        assert!(session_header(&mut database, OWNER_ID, Uuid::nil()).is_err());
         assert!(
-            session_header(
-                &mut database,
-                OWNER_ID,
-                Uuid::nil(),
-                &StreamCache::default()
-            )
-            .is_err()
-        );
-        assert!(
-            session_header(
-                &mut database,
-                Uuid::from_u128(2),
-                session_pk,
-                &StreamCache::default()
-            )
-            .is_err(),
+            session_header(&mut database, Uuid::from_u128(2), session_pk).is_err(),
             "another owner cannot read the session"
         );
     }

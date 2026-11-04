@@ -11,7 +11,6 @@ mod event_locations;
 mod postgres;
 #[cfg(feature = "sqlite-fts")]
 mod sqlite;
-mod stream_cache;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 

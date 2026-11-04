@@ -6,10 +6,7 @@
 //! enqueues search projection in the same commit. Query functions always apply
 //! the authenticated owner before returning conversation or attachment data.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -41,7 +38,6 @@ use crate::{
         },
     },
     error::AppError,
-    storage::stream_cache::StreamCache,
     usage::{
         DeclaredIds, EventAgent, EventDevice, EventLlm, EventTokenUsage, IngestEventsRequest,
         IngestEventsResponse, IngestUsageEvent, RawEventsQuery, RawEventsResponse,
@@ -499,9 +495,8 @@ pub fn session_streams(
     connection: &mut PgConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<SessionStreamsResponse, AppError> {
-    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let structure = session_structure(connection, user_id, session_pk)?;
     Ok(structure.session_streams(session_pk))
 }
 
@@ -511,36 +506,33 @@ pub fn session_turns(
     connection: &mut PgConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<SessionTurnsResponse, AppError> {
-    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let structure = session_structure(connection, user_id, session_pk)?;
     Ok(structure.session_turns(session_pk))
 }
 
-/// Uses the caller's read transaction so the revision and facts are one snapshot.
-/// A cache hit reads only the session revision; it does not load the event facts.
+/// Derives the structure from the stream facts on every call. It uses the
+/// caller's read transaction, so the structure and the caller's other reads
+/// are one snapshot.
 pub fn session_structure(
     connection: &mut PgConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
-) -> Result<Arc<SessionStructure>, AppError> {
-    let revision = agent_sessions::table
+) -> Result<SessionStructure, AppError> {
+    agent_sessions::table
         .filter(agent_sessions::user_id.eq(user_id))
         .filter(agent_sessions::id.eq(session_pk))
-        .select(agent_sessions::structure_revision)
-        .first::<i64>(connection)
+        .select(agent_sessions::id)
+        .first::<Uuid>(connection)
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("session not found: {session_pk}")))?;
-    cache.get_or_load(user_id, session_pk, revision, || {
-        let events = stream_events(connection, session_pk)?;
-        if events.is_empty() {
-            return Err(AppError::not_found(format!(
-                "session not found: {session_pk}"
-            )));
-        }
-        Ok(events)
-    })
+    let events = stream_events(connection, session_pk)?;
+    if events.is_empty() {
+        return Err(AppError::not_found(format!(
+            "session not found: {session_pk}"
+        )));
+    }
+    Ok(SessionStructure::derive(events))
 }
 
 /// Resolves an authorized event without reading its body or attachments.
@@ -548,7 +540,6 @@ pub fn event_location(
     connection: &mut PgConnection,
     user_id: Uuid,
     event_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<EventLocationResponse, AppError> {
     let session_pk = llm_usage_events::table
         .filter(llm_usage_events::user_id.eq(user_id))
@@ -557,7 +548,7 @@ pub fn event_location(
         .first::<Uuid>(connection)
         .optional()?
         .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))?;
-    session_structure(connection, user_id, session_pk, cache)?
+    session_structure(connection, user_id, session_pk)?
         .event_location(session_pk, event_pk)
         .ok_or_else(|| AppError::not_found(format!("event not found: {event_pk}")))
 }
@@ -583,7 +574,6 @@ pub fn session_header(
     connection: &mut PgConnection,
     user_id: Uuid,
     session_pk: Uuid,
-    cache: &StreamCache,
 ) -> Result<SessionHeaderResponse, AppError> {
     let owned = agent_sessions::table
         .filter(agent_sessions::user_id.eq(user_id))
@@ -623,7 +613,7 @@ pub fn session_header(
             "session not found: {session_pk}"
         )));
     }
-    let summary = session_structure(connection, user_id, session_pk, cache)?.summary();
+    let summary = session_structure(connection, user_id, session_pk)?.summary();
     let title = session_titles::title(connection, session_pk)?;
     Ok(header_of(session_pk, events, &summary, title))
 }
@@ -670,9 +660,8 @@ pub fn session_segment(
     session_pk: Uuid,
     head: &str,
     query: &ValidatedSegmentQuery,
-    cache: &StreamCache,
 ) -> Result<SegmentResponse, AppError> {
-    let structure = session_structure(connection, user_id, session_pk, cache)?;
+    let structure = session_structure(connection, user_id, session_pk)?;
     let run = structure.segment_run(head).ok_or_else(|| {
         AppError::not_found(format!(
             "exchange not found in session {session_pk}: {head}"

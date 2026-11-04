@@ -163,18 +163,15 @@ owner, and the device key are not returned.
 ### Session structure and event links
 
 The header, streams, turns, segment details, in-session search, and event location
-share one immutable derived structure for an owner/session/revision. The
-process retains up to 128 idle revisions with LRU eviction. Concurrent reads
-of the same revision share the load and derivation; a cache hit reads the
-session revision without loading stream facts again. Event bodies are not
-stored in this cache.
+derive the session structure from its stream facts on each request; no derived
+structure is kept between requests. A request that locates several events or
+search hits derives each session's structure once.
 
-Ingestion advances `agent_sessions.structure_revision` within its existing
-session update and event transaction. Structure readers load the revision and
-facts from the same database snapshot (a read transaction in SQLite, read-only
-repeatable read in PostgreSQL). On a new revision or after eviction/restart,
-the first read derives the full structure again. This is a shared query cache,
-not an incremental derivation at ingest time.
+Structure readers load the facts from the same database snapshot as the
+request's other reads (a read transaction in SQLite, read-only repeatable read
+in PostgreSQL). This is a query-time derivation, not an incremental derivation
+at ingest time. Ingestion still advances `agent_sessions.structure_revision`
+within its session update; no query reads it.
 
 A request's base is the exchange that emitted the last identity in its
 history, when exactly one other exchange did and the model output after that
