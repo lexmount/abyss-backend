@@ -91,8 +91,11 @@ CREATE INDEX llm_usage_events_user_time_idx
 CREATE INDEX llm_usage_events_observed_at_idx
     ON llm_usage_events (observed_at DESC);
 
+-- A session's streams read every event of the session in this order with
+-- these columns; carrying them answers the read without the event rows.
 CREATE INDEX llm_usage_events_session_order_idx
-    ON llm_usage_events (session_pk, observed_at, event_type, id);
+    ON llm_usage_events (session_pk, observed_at, event_type, id)
+    INCLUDE (event_id, response_id, previous_response_id);
 
 CREATE INDEX llm_usage_events_agent_model_time_idx
     ON llm_usage_events (agent_name, llm_provider, llm_model, observed_at DESC);
