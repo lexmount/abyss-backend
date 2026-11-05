@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     models::{parse_uuid, timestamp_from_micros},
-    repository::timestamp_to_micros,
+    repository::{session_structure, timestamp_to_micros},
 };
 
 /// Per-session activity with the filters that apply before paging.
@@ -37,16 +37,6 @@ const ACTIVITY_CTE: &str = "\
             s.started_at AS started_at, \
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
-            (SELECT CASE WHEN COUNT(tf.turn_id) > 0 THEN COUNT(DISTINCT tf.turn_id) \
-                    ELSE COUNT(*) FILTER (WHERE tf.starts_turn = 1 AND tf.continues_context = 1) \
-                    + COALESCE((SELECT 1 - ff.continues_context \
-                        FROM llm_usage_events fe \
-                        JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
-                        WHERE fe.session_pk = s.id AND ff.starts_turn = 1 \
-                        ORDER BY fe.observed_at, fe.id LIMIT 1), 0) END \
-             FROM llm_usage_events te \
-             JOIN llm_usage_event_stream_facts tf ON tf.event_pk = te.id \
-             WHERE te.session_pk = s.id) AS turns, \
             COUNT(e.session_pk) AS events, \
             COALESCE(SUM(e.total_tokens), 0) AS total_tokens, \
             title_event.id AS title_event_pk, \
@@ -99,8 +89,6 @@ struct SessionListRow {
     ended_at: Option<i64>,
     #[diesel(sql_type = BigInt)]
     last_activity_at: i64,
-    #[diesel(sql_type = BigInt)]
-    turns: i64,
     #[diesel(sql_type = BigInt)]
     events: i64,
     #[diesel(sql_type = BigInt)]
@@ -174,8 +162,9 @@ pub(super) fn list_sessions(
     let items = rows
         .into_iter()
         .map(|row| {
+            let session_pk = parse_uuid(&row.session_pk, "session id")?;
             Ok(SessionListItem {
-                session_pk: parse_uuid(&row.session_pk, "session id")?,
+                session_pk,
                 session_id: row.session_id,
                 agent_name: row.agent_name,
                 agent_version: row.agent_version,
@@ -184,7 +173,9 @@ pub(super) fn list_sessions(
                 started_at: timestamp_from_micros(row.started_at)?,
                 ended_at: row.ended_at.map(timestamp_from_micros).transpose()?,
                 last_activity_at: timestamp_from_micros(row.last_activity_at)?,
-                turns: row.turns,
+                turns: session_structure(connection, user_id, session_pk)?
+                    .summary()
+                    .turns,
                 events: row.events,
                 total_tokens: row.total_tokens,
                 title: EntryLabel::from_columns(
@@ -274,7 +265,7 @@ mod tests {
         database
     }
 
-    fn list(database: &mut SqliteConnection, query: SessionListQuery) -> Vec<(String, i64, i64)> {
+    fn list(database: &mut SqliteConnection, query: SessionListQuery) -> Vec<(String, usize, i64)> {
         let query = query.validate().expect("query should validate");
         list_sessions(database, OWNER_ID, &query)
             .expect("sessions should list")

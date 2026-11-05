@@ -15,6 +15,8 @@ use crate::{
     },
 };
 
+use super::repository::session_structure;
+
 /// Per-session activity with the filters that apply before paging.
 ///
 /// Bind order: `$1` owner, `$2`/`$3` agent filter flag and names, `$4`/`$5`
@@ -32,16 +34,6 @@ const ACTIVITY_CTE: &str = "\
             s.started_at AS started_at, \
             s.ended_at AS ended_at, \
             COALESCE(MAX(e.observed_at), s.started_at) AS last_activity_at, \
-            (SELECT CASE WHEN COUNT(tf.turn_id) > 0 THEN COUNT(DISTINCT tf.turn_id) \
-                    ELSE COUNT(*) FILTER (WHERE tf.starts_turn AND tf.continues_context) \
-                    + COALESCE((SELECT CASE WHEN ff.continues_context THEN 0 ELSE 1 END \
-                        FROM llm_usage_events fe \
-                        JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
-                        WHERE fe.session_pk = s.id AND ff.starts_turn \
-                        ORDER BY fe.observed_at, fe.id LIMIT 1), 0) END \
-             FROM llm_usage_events te \
-             JOIN llm_usage_event_stream_facts tf ON tf.event_pk = te.id \
-             WHERE te.session_pk = s.id)::bigint AS turns, \
             COUNT(e.id)::bigint AS events, \
             COALESCE(SUM(e.total_tokens), 0)::bigint AS total_tokens, \
             st.title_event_pk AS title_event_pk, \
@@ -91,8 +83,6 @@ struct SessionListRow {
     ended_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = Timestamptz)]
     last_activity_at: DateTime<Utc>,
-    #[diesel(sql_type = BigInt)]
-    turns: i64,
     #[diesel(sql_type = BigInt)]
     events: i64,
     #[diesel(sql_type = BigInt)]
@@ -160,9 +150,18 @@ pub(super) fn list_sessions(
     .bind::<BigInt, _>(query.offset)
     .load::<SessionListRow>(connection)?;
 
+    let turns = rows
+        .iter()
+        .map(|row| {
+            Ok(session_structure(connection, user_id, row.session_pk)?
+                .summary()
+                .turns)
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
     let items = rows
         .into_iter()
-        .map(|row| SessionListItem {
+        .zip(turns)
+        .map(|(row, turns)| SessionListItem {
             session_pk: row.session_pk,
             session_id: row.session_id,
             agent_name: row.agent_name,
@@ -172,7 +171,7 @@ pub(super) fn list_sessions(
             started_at: row.started_at,
             ended_at: row.ended_at,
             last_activity_at: row.last_activity_at,
-            turns: row.turns,
+            turns,
             events: row.events,
             total_tokens: row.total_tokens,
             title: EntryLabel::from_columns(

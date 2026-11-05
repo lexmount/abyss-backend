@@ -191,7 +191,13 @@ impl StorageBackend for PostgresEsBackend {
     ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::usage_summary(connection, &query, user_id, summary_limit)
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| {
+                        repository::usage_summary(connection, &query, user_id, summary_limit)
+                    })
             })
             .await
         })
@@ -300,8 +306,14 @@ impl StorageBackend for PostgresEsBackend {
         query: ValidatedSessionListQuery,
     ) -> BoxedFuture<'_, Result<SessionListResponse, AppError>> {
         Box::pin(async move {
-            self.run_db(move |connection| session_list::list_sessions(connection, user_id, &query))
-                .await
+            self.run_db(move |connection| {
+                connection
+                    .build_transaction()
+                    .read_only()
+                    .repeatable_read()
+                    .run(|connection| session_list::list_sessions(connection, user_id, &query))
+            })
+            .await
         })
     }
 

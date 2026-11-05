@@ -166,7 +166,9 @@ impl StorageBackend for SqliteFtsBackend {
     ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::usage_summary(connection, &query, user_id, summary_limit)
+                connection.transaction(|connection| {
+                    repository::usage_summary(connection, &query, user_id, summary_limit)
+                })
             })
             .await
         })
@@ -265,8 +267,12 @@ impl StorageBackend for SqliteFtsBackend {
         query: ValidatedSessionListQuery,
     ) -> BoxedFuture<'_, Result<SessionListResponse, AppError>> {
         Box::pin(async move {
-            self.run_db(move |connection| session_list::list_sessions(connection, user_id, &query))
-                .await
+            self.run_db(move |connection| {
+                connection.transaction(|connection| {
+                    session_list::list_sessions(connection, user_id, &query)
+                })
+            })
+            .await
         })
     }
 

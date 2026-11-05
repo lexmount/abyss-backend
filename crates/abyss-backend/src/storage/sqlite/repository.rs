@@ -38,6 +38,7 @@ use crate::{
             EventLocationResponse, SessionStreamsResponse, SessionStructure, SessionTurnsResponse,
             StreamEvent,
         },
+        summary_turns,
         time_zone::parse_time_zone,
     },
 };
@@ -934,10 +935,18 @@ pub(super) fn usage_summary(
         .bind::<BigInt, _>(limit)
         .bind::<Text, _>(&day_offsets)
         .load::<SummaryAggregateRow>(connection)?;
+    let columns = rows
+        .iter()
+        .map(|row| row.session_events.as_str())
+        .collect::<Vec<_>>();
+    let turns = summary_turns(&columns, |session_pk| {
+        session_structure(connection, user_id, session_pk)
+    })?;
     let include_user = dimensions.enabled(SummaryDimension::User);
     let rows = rows
         .into_iter()
-        .map(|row| row.into_summary_row(include_user.then_some((user_id, &owner))))
+        .zip(turns)
+        .map(|(row, turns)| row.into_summary_row(turns, include_user.then_some((user_id, &owner))))
         .collect::<Result<Vec<_>, AppError>>()?;
     Ok(SummaryResponse {
         from: query.from,
@@ -976,12 +985,12 @@ fn day_offsets(
 ///
 /// Each event row holds the event's conversation, so reading event rows
 /// reads a page per event; the summary cover index carries every event column
-/// used here, `id` included for the stream facts join. The owner is the single
-/// standalone user, so the user dimension is filled in afterwards.
+/// used here, `id` included. The owner is the single standalone user, so the
+/// user dimension is filled in afterwards.
 ///
-/// Turns are counted per session within each group, then summed: the
-/// distinct declared `turn_id` values when the session declares any turn,
-/// else the requests that open a turn.
+/// Each group lists its sessions with their events in the group,
+/// `[[session_pk, [event_pk, ...]], ...]`; the turns those events fall in
+/// come from each session's structure.
 ///
 /// Bind order: `?1`..`?6` day, device, Agent, provider, model, and event-type
 /// dimensions; `?7` owner; `?8`/`?9` observation bounds in microseconds, kept
@@ -993,16 +1002,6 @@ fn day_offsets(
 const SUMMARY_AGGREGATE_SQL: &str = "\
     WITH day_offsets(start_us, offset_us) AS MATERIALIZED ( \
         SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?21) \
-    ), \
-    first_openers AS ( \
-        SELECT id FROM ( \
-            SELECT fe.id, ROW_NUMBER() OVER ( \
-                PARTITION BY fe.session_pk ORDER BY fe.observed_at, fe.id \
-            ) AS n \
-            FROM llm_usage_events fe \
-            JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
-            WHERE ff.starts_turn = 1 \
-        ) firsts WHERE n = 1 \
     ), \
     by_session AS ( \
         SELECT \
@@ -1022,14 +1021,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
             CASE WHEN ?5 THEN e.llm_model END AS llm_model, \
             CASE WHEN ?6 THEN e.event_type END AS event_type, \
             e.session_pk AS session_pk, \
-            EXISTS ( \
-                SELECT 1 FROM llm_usage_events de \
-                JOIN llm_usage_event_stream_facts df ON df.event_pk = de.id \
-                WHERE de.session_pk = e.session_pk AND df.turn_id IS NOT NULL \
-            ) AS declares_turns, \
-            COUNT(DISTINCT f.turn_id) AS declared_turns, \
-            COUNT(*) FILTER (WHERE f.starts_turn = 1 \
-                AND (f.continues_context = 1 OR e.id IN first_openers)) AS opened_turns, \
+            json_group_array(e.id) AS event_pks, \
             COUNT(*) FILTER (WHERE e.event_type = 'request') AS requests, \
             COUNT(*) FILTER (WHERE e.event_type = 'response') AS responses, \
             COALESCE(SUM(e.input_tokens), 0) AS input_tokens, \
@@ -1039,7 +1031,6 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
             COALESCE(SUM(e.reasoning_tokens), 0) AS reasoning_tokens, \
             COALESCE(SUM(e.total_tokens), 0) AS total_tokens \
         FROM llm_usage_events e \
-        LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
         LEFT JOIN devices d ON ?2 AND d.id = e.device_context_id \
         WHERE e.user_id = ?7 \
             AND e.observed_at >= ?8 \
@@ -1054,7 +1045,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
     SELECT \
         day, host_name, platform, os_version, agent_name, llm_provider, llm_model, event_type, \
         COUNT(*) AS sessions, \
-        COALESCE(SUM(CASE WHEN declares_turns THEN declared_turns ELSE opened_turns END), 0) AS turns, \
+        json_group_array(json_array(session_pk, json(event_pks))) AS session_events, \
         COALESCE(SUM(requests), 0) AS requests, \
         COALESCE(SUM(responses), 0) AS responses, \
         COALESCE(SUM(input_tokens), 0) AS input_tokens, \
@@ -1088,8 +1079,8 @@ struct SummaryAggregateRow {
     event_type: Option<String>,
     #[diesel(sql_type = BigInt)]
     sessions: i64,
-    #[diesel(sql_type = BigInt)]
-    turns: i64,
+    #[diesel(sql_type = Text)]
+    session_events: String,
     #[diesel(sql_type = BigInt)]
     requests: i64,
     #[diesel(sql_type = BigInt)]
@@ -1109,7 +1100,11 @@ struct SummaryAggregateRow {
 }
 
 impl SummaryAggregateRow {
-    fn into_summary_row(self, user: Option<(Uuid, &OwnerRecord)>) -> Result<SummaryRow, AppError> {
+    fn into_summary_row(
+        self,
+        turns: usize,
+        user: Option<(Uuid, &OwnerRecord)>,
+    ) -> Result<SummaryRow, AppError> {
         let count = |value: i64, name: &str| {
             usize::try_from(value)
                 .map_err(|error| AppError::internal(format!("invalid summary {name}: {error}")))
@@ -1127,7 +1122,7 @@ impl SummaryAggregateRow {
             llm_model: self.llm_model,
             event_type: self.event_type,
             sessions: count(self.sessions, "sessions")?,
-            turns: count(self.turns, "turns")?,
+            turns,
             requests: self.requests,
             responses: self.responses,
             input_tokens: self.input_tokens,
@@ -2049,13 +2044,12 @@ mod tests {
             .into_iter()
             .map(|item| (item.session_id, (item.session_pk, item.turns)))
             .collect::<std::collections::HashMap<_, _>>();
-        for (session, turns) in [("declared", 2_i64), ("plain", 3_i64)] {
+        for (session, turns) in [("declared", 2_usize), ("plain", 3_usize)] {
             let (session_pk, listed_turns) = listed[session];
             assert_eq!(listed_turns, turns, "{session}: listed turns");
             let header = session_header(&mut database, OWNER_ID, session_pk).expect("the header");
             assert_eq!(
-                i64::try_from(header.turn_count).expect("a small count"),
-                turns,
+                header.turn_count, turns,
                 "{session}: the header counts as the list does"
             );
         }

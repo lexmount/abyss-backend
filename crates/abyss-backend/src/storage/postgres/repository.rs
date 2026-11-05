@@ -62,6 +62,7 @@ use crate::{
             EventFacts, EventLocationResponse, Label, RequestFacts, ResponseFacts,
             SessionStreamsResponse, SessionStructure, SessionTurnsResponse, StreamEvent,
         },
+        summary_turns,
         time_zone::parse_time_zone,
     },
 };
@@ -72,21 +73,11 @@ define_sql_function!(fn coalesce<ST: SingleValue>(value: Nullable<ST>, fallback:
 define_sql_function!(fn least<ST: SingleValue>(left: ST, right: ST) -> ST);
 define_sql_function!(fn greatest<ST: SingleValue>(left: ST, right: ST) -> ST);
 
-/// Usage totals grouped in SQL. Turns are counted per session within each
-/// group, then summed: the distinct declared `turn_id` values when the
-/// session declares any turn, else the requests that open a turn.
+/// Usage totals grouped in SQL. Each group lists its sessions with their
+/// events in the group, `[[session_pk, [event_pk, ...]], ...]`; the turns
+/// those events fall in come from each session's structure.
 const SUMMARY_AGGREGATE_SQL: &str = "\
-    WITH first_openers AS ( \
-        SELECT id FROM ( \
-            SELECT fe.id, ROW_NUMBER() OVER ( \
-                PARTITION BY fe.session_pk ORDER BY fe.observed_at, fe.id \
-            ) AS n \
-            FROM llm_usage_events fe \
-            JOIN llm_usage_event_stream_facts ff ON ff.event_pk = fe.id \
-            WHERE ff.starts_turn \
-        ) firsts WHERE n = 1 \
-    ), \
-    by_session AS ( \
+    WITH by_session AS ( \
         SELECT \
             CASE WHEN $1 THEN to_char(e.observed_at AT TIME ZONE $30, 'YYYY-MM-DD') END AS day, \
             CASE WHEN $2 THEN e.user_id END AS user_id, \
@@ -100,14 +91,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
             CASE WHEN $6 THEN e.llm_model END AS llm_model, \
             CASE WHEN $7 THEN e.event_type END AS event_type, \
             e.session_pk AS session_pk, \
-            EXISTS ( \
-                SELECT 1 FROM llm_usage_events de \
-                JOIN llm_usage_event_stream_facts df ON df.event_pk = de.id \
-                WHERE de.session_pk = e.session_pk AND df.turn_id IS NOT NULL \
-            ) AS declares_turns, \
-            COUNT(DISTINCT f.turn_id)::bigint AS declared_turns, \
-            COUNT(*) FILTER (WHERE f.starts_turn \
-                AND (f.continues_context OR e.id IN (SELECT id FROM first_openers)))::bigint AS opened_turns, \
+            json_agg(e.id) AS event_pks, \
             COUNT(*) FILTER (WHERE e.event_type = 'request')::bigint AS requests, \
             COUNT(*) FILTER (WHERE e.event_type = 'response')::bigint AS responses, \
             COALESCE(SUM(e.input_tokens), 0)::bigint AS input_tokens, \
@@ -117,7 +101,6 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
             COALESCE(SUM(e.reasoning_tokens), 0)::bigint AS reasoning_tokens, \
             COALESCE(SUM(e.total_tokens), 0)::bigint AS total_tokens \
         FROM llm_usage_events e \
-        LEFT JOIN llm_usage_event_stream_facts f ON f.event_pk = e.id \
         LEFT JOIN app_users u ON u.id = e.user_id \
         LEFT JOIN devices d ON d.id = e.device_context_id \
         WHERE e.user_id = $8 \
@@ -143,7 +126,7 @@ const SUMMARY_AGGREGATE_SQL: &str = "\
         day, user_id, user_name, user_email, host_name, platform, os_version, \
         agent_name, llm_provider, llm_model, event_type, \
         COUNT(*)::bigint AS sessions, \
-        COALESCE(SUM(CASE WHEN declares_turns THEN declared_turns ELSE opened_turns END), 0)::bigint AS turns, \
+        json_agg(json_build_array(session_pk, event_pks))::text AS session_events, \
         COALESCE(SUM(requests), 0)::bigint AS requests, \
         COALESCE(SUM(responses), 0)::bigint AS responses, \
         COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens, \
@@ -308,6 +291,21 @@ pub fn usage_summary(
         &group_by,
         zone,
     )?;
+    let columns = rows
+        .iter()
+        .map(|row| row.session_events.as_str())
+        .collect::<Vec<_>>();
+    let turns = summary_turns(&columns, |session_pk| {
+        session_structure(connection, user_id, session_pk)
+    })?;
+    let rows = rows
+        .into_iter()
+        .zip(turns)
+        .map(|(row, turns)| SummaryRow {
+            turns,
+            ..row.into()
+        })
+        .collect();
 
     Ok(SummaryResponse {
         from: query.from,
@@ -323,7 +321,7 @@ fn load_filtered_summary_rows(
     filters: &EventFilters<'_>,
     group_by: &[String],
     zone: Tz,
-) -> Result<Vec<SummaryRow>, AppError> {
+) -> Result<Vec<SummaryAggregateRow>, AppError> {
     let dimensions = SummaryDimensions::from_group_by(group_by);
     let sql_filters = SummarySqlFilters::from_event_filters(filters)?;
     let user_id = sql_filters.user_id;
@@ -383,7 +381,6 @@ fn load_filtered_summary_rows(
         .bind::<BigInt, _>(filters.limit)
         .bind::<Text, _>(zone.name())
         .load::<SummaryAggregateRow>(connection)
-        .map(|rows| rows.into_iter().map(SummaryRow::from).collect())
         .map_err(AppError::from)
 }
 
@@ -1443,8 +1440,8 @@ struct SummaryAggregateRow {
     event_type: Option<String>,
     #[diesel(sql_type = BigInt)]
     sessions: i64,
-    #[diesel(sql_type = BigInt)]
-    turns: i64,
+    #[diesel(sql_type = Text)]
+    session_events: String,
     #[diesel(sql_type = BigInt)]
     requests: i64,
     #[diesel(sql_type = BigInt)]
@@ -1478,7 +1475,8 @@ impl From<SummaryAggregateRow> for SummaryRow {
             llm_model: row.llm_model,
             event_type: row.event_type,
             sessions: non_negative_count(row.sessions),
-            turns: non_negative_count(row.turns),
+            // The caller fills in the turns from the sessions' structures.
+            turns: 0,
             requests: row.requests,
             responses: row.responses,
             input_tokens: row.input_tokens,

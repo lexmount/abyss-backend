@@ -27,10 +27,14 @@ pub mod streams;
 /// Local calendar days for summaries grouped by day.
 pub mod time_zone;
 
+use std::collections::{HashMap, HashSet, hash_map::Entry};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use crate::error::AppError;
 
 pub use self::event::{
     DeclaredIds, EventAgent, EventDevice, EventLlm, EventTokenUsage, RecordedMetadata,
@@ -282,7 +286,8 @@ pub struct SummaryRow {
     pub event_type: Option<String>,
     /// Distinct sessions in this bucket.
     pub sessions: usize,
-    /// Requests in this bucket whose stream facts say they open a turn.
+    /// Per session, the distinct turns this bucket's events fall in, summed
+    /// over sessions.
     pub turns: usize,
     /// Request events in this bucket.
     pub requests: i64,
@@ -300,6 +305,38 @@ pub struct SummaryRow {
     pub reasoning_tokens: i64,
     /// Summed provider or derived total tokens.
     pub total_tokens: i64,
+}
+
+/// The turns of each summary group, from its `[[session_pk, [event_pk, ...]],
+/// ...]` column: per session, the distinct turns the group's events fall in,
+/// summed over sessions. `structure` derives a session; each is derived once.
+pub fn summary_turns<F>(groups: &[&str], mut structure: F) -> Result<Vec<usize>, AppError>
+where
+    F: FnMut(Uuid) -> Result<streams::SessionStructure, AppError>,
+{
+    let mut structures = HashMap::new();
+    groups
+        .iter()
+        .map(|column| {
+            let sessions =
+                serde_json::from_str::<Vec<(Uuid, Vec<Uuid>)>>(column).map_err(|error| {
+                    AppError::internal(format!("invalid summary session events: {error}"))
+                })?;
+            let mut turns = 0_usize;
+            for (session_pk, events) in sessions {
+                let structure = match structures.entry(session_pk) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(structure(session_pk)?),
+                };
+                let distinct = events
+                    .iter()
+                    .filter_map(|&event_pk| structure.event_position(event_pk)?.turn)
+                    .collect::<HashSet<_>>();
+                turns = turns.saturating_add(distinct.len());
+            }
+            Ok(turns)
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]

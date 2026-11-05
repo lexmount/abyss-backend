@@ -105,8 +105,8 @@ pub struct SessionListItem {
     pub ended_at: Option<DateTime<Utc>>,
     /// Latest event observation, or the session start when it has no events.
     pub last_activity_at: DateTime<Utc>,
-    /// Requests whose stream facts say they open a turn.
-    pub turns: i64,
+    /// Turns the session's structure derives, as its header counts them.
+    pub turns: usize,
     pub events: i64,
     pub total_tokens: i64,
     /// The earliest request's new-part label, without display formatting.
