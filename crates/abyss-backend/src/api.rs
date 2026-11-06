@@ -1,7 +1,7 @@
 //! HTTP boundary for standalone Agent event ingestion and queries.
 //!
 //! The health endpoints are public, while every event, attachment, summary,
-//! timeline, and search endpoint authenticates the deployment bearer token.
+//! session, and search endpoint authenticates the deployment bearer token.
 //! Storage implementation details remain behind the configured backend trait.
 
 use axum::{
@@ -22,15 +22,19 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     identity::IdentityAuthenticator,
-    search::{SessionSearchQuery, SessionSearchResponse},
+    search::{
+        InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
+    },
     storage::StorageBackend,
     usage::{
         IngestEventsRequest, IngestEventsResponse, RawEventListResponse, RawEventsQuery,
-        SessionOutlineResponse, SessionTimelineResponse, SummaryFields, SummaryQuery,
-        TokenUsageSummaryResponse, UsageEventResponse,
+        SummaryFields, SummaryQuery, TokenUsageSummaryResponse, UsageEventResponse,
         comparison::{ComparisonQuery, ComparisonResponse},
+        preview::{ConversationPreview, PreviewQuery, Window},
+        segments::{SegmentQuery, SegmentResponse},
+        session_header::SessionHeaderResponse,
         session_list::{SessionListQuery, SessionListResponse},
-        trajectory::{self, SessionTrajectoryResponse},
+        streams::{EventLocationResponse, SessionStreamsResponse, SessionTurnsResponse},
     },
 };
 
@@ -49,7 +53,7 @@ pub struct AppState {
     pub default_page_size: i64,
     /// Deployment-wide bearer-token validator.
     pub identity: IdentityAuthenticator,
-    /// Compile-time-selected event storage and full-text search implementation.
+    /// Compile-time-selected event storage and search implementation.
     pub storage: std::sync::Arc<dyn StorageBackend>,
 }
 
@@ -70,6 +74,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/agent-usage/events/{event_pk}", get(usage_event))
         .route(
+            "/v1/agent-usage/events/{event_pk}/location",
+            get(event_location),
+        )
+        .route(
             "/v1/agent-usage/attachments/{attachment_id}",
             get(image_attachment),
         )
@@ -78,16 +86,28 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/agent-usage/search", get(session_search))
         .route("/v1/agent-usage/sessions", get(list_sessions))
         .route(
-            "/v1/agent-usage/sessions/{session_pk}",
-            get(session_timeline),
+            "/v1/agent-usage/sessions/{session_pk}/header",
+            get(session_header),
         )
         .route(
-            "/v1/agent-usage/sessions/{session_pk}/outline",
-            get(session_outline),
+            "/v1/agent-usage/sessions/{session_pk}/streams",
+            get(session_streams),
         )
         .route(
-            "/v1/agent-usage/sessions/{session_pk}/trajectory",
-            get(session_trajectory),
+            "/v1/agent-usage/sessions/{session_pk}/turns",
+            get(session_turns),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/segments/{head}",
+            get(session_segment),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/search",
+            get(search_in_session),
+        )
+        .route(
+            "/v1/agent-usage/events/{event_pk}/conversation",
+            get(event_conversation),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -179,35 +199,102 @@ async fn list_sessions(
     Ok(Json(state.storage.list_sessions(user_id, query).await?))
 }
 
-async fn session_timeline(
+/// Segments of one session, without content.
+async fn session_streams(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_pk): Path<Uuid>,
-) -> Result<Json<SessionTimelineResponse>, AppError> {
-    let user_id = state.identity.authenticate(&headers)?;
-    let response = state.storage.session_timeline(user_id, session_pk).await?;
-    Ok(Json(response))
-}
-
-async fn session_outline(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(session_pk): Path<Uuid>,
-) -> Result<Json<SessionOutlineResponse>, AppError> {
+) -> Result<Json<SessionStreamsResponse>, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
     Ok(Json(
-        state.storage.session_outline(user_id, session_pk).await?,
+        state.storage.session_streams(user_id, session_pk).await?,
     ))
 }
 
-async fn session_trajectory(
+/// Turns of one session, each with its executors' segments, without content.
+async fn session_turns(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_pk): Path<Uuid>,
-) -> Result<Json<SessionTrajectoryResponse>, AppError> {
+) -> Result<Json<SessionTurnsResponse>, AppError> {
     let user_id = state.identity.authenticate(&headers)?;
-    let timeline = state.storage.session_timeline(user_id, session_pk).await?;
-    Ok(Json(trajectory::build(timeline)))
+    Ok(Json(
+        state.storage.session_turns(user_id, session_pk).await?,
+    ))
+}
+
+/// Every hit of a query in one session, each with the head of the segment
+/// holding its event.
+async fn search_in_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+    Query(query): Query<InSessionSearchQuery>,
+) -> Result<Json<InSessionSearchResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state
+            .storage
+            .search_in_session(user_id, session_pk, query)
+            .await?,
+    ))
+}
+
+/// Agents, time span, counts, and token totals of one session.
+async fn session_header(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+) -> Result<Json<SessionHeaderResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state.storage.session_header(user_id, session_pk).await?,
+    ))
+}
+
+/// A segment's exchanges from exchange `head` to the segment end, with a
+/// preview of each request and response.
+async fn session_segment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_pk, head)): Path<(Uuid, String)>,
+    Query(query): Query<SegmentQuery>,
+) -> Result<Json<SegmentResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let query = query.validate()?;
+    Ok(Json(
+        state
+            .storage
+            .session_segment(user_id, session_pk, head, query)
+            .await?,
+    ))
+}
+
+/// The conversation of one event, all of it or the asked entries.
+async fn event_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(event_pk): Path<Uuid>,
+    Query(query): Query<PreviewQuery>,
+) -> Result<Json<ConversationPreview>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    let window = Window::parse(&query)?;
+    Ok(Json(
+        state
+            .storage
+            .event_conversation(user_id, event_pk, window)
+            .await?,
+    ))
+}
+
+/// Resolves an event anchor against the current session structure.
+async fn event_location(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(event_pk): Path<Uuid>,
+) -> Result<Json<EventLocationResponse>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(state.storage.event_location(user_id, event_pk).await?))
 }
 
 async fn usage_event(

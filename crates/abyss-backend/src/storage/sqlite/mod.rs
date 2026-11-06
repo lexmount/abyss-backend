@@ -1,7 +1,9 @@
-//! Self-contained SQLite source-of-truth with transactional FTS5 projection.
+//! Self-contained SQLite source-of-truth with its search index written in
+//! the same transactions.
 
 mod comparison;
 mod connection;
+mod day_offsets;
 mod migrations;
 mod models;
 mod repository;
@@ -10,27 +12,35 @@ mod search;
 mod session_list;
 mod session_titles;
 
-use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
+use diesel::{Connection, QueryDsl, RunQueryDsl, SqliteConnection, dsl::count_star};
 use uuid::Uuid;
 
 use crate::{
     config::Config,
     error::AppError,
-    search::{SessionSearchQuery, SessionSearchResponse},
-    storage::{BoxedFuture, StorageBackend},
+    search::{
+        InSessionSearchQuery, InSessionSearchResponse, SessionSearchQuery, SessionSearchResponse,
+    },
+    storage::{
+        BoxedFuture, StorageBackend,
+        event_locations::{locate_events, locate_search_matches},
+    },
     usage::{
-        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse,
-        SessionOutlineResponse, SessionTimelineResponse, SummaryQuery, SummaryResponse,
-        UsageEventResponse,
+        IngestEventsRequest, IngestEventsResponse, RawEventsQuery, RawEventsResponse, SummaryQuery,
+        SummaryResponse, UsageEventResponse,
         attachments::StoredImageAttachment,
         comparison::{ComparisonQuery, ComparisonResponse},
+        preview::{ConversationPreview, Window},
+        segments::{SegmentResponse, ValidatedSegmentQuery},
+        session_header::SessionHeaderResponse,
         session_list::{SessionListResponse, ValidatedSessionListQuery},
+        streams::{EventLocationResponse, SessionStreamsResponse, SessionTurnsResponse},
     },
 };
 
 use self::connection::SqlitePool;
 
-/// SQLite event store with an FTS5 projection committed beside each event.
+/// SQLite event store with a search index committed beside each event.
 pub(super) struct SqliteFtsBackend {
     pool: SqlitePool,
 }
@@ -98,7 +108,17 @@ impl StorageBackend for SqliteFtsBackend {
     ) -> BoxedFuture<'_, Result<RawEventsResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::raw_events(connection, &query, user_id, default_page_size)
+                if !query.locate {
+                    return repository::raw_events(connection, &query, user_id, default_page_size);
+                }
+                connection.transaction(|connection| {
+                    let mut response =
+                        repository::raw_events(connection, &query, user_id, default_page_size)?;
+                    locate_events(&mut response.events, |session_pk| {
+                        repository::session_structure(connection, user_id, session_pk)
+                    })?;
+                    Ok(response)
+                })
             })
             .await
         })
@@ -110,8 +130,31 @@ impl StorageBackend for SqliteFtsBackend {
         event_pk: Uuid,
     ) -> BoxedFuture<'_, Result<UsageEventResponse, AppError>> {
         Box::pin(async move {
-            self.run_db(move |connection| repository::usage_event(connection, user_id, event_pk))
-                .await
+            self.run_db(move |connection| {
+                connection.transaction(|connection| {
+                    let mut event = repository::usage_event(connection, user_id, event_pk)?;
+                    locate_events(std::slice::from_mut(&mut event), |session_pk| {
+                        repository::session_structure(connection, user_id, session_pk)
+                    })?;
+                    Ok(event)
+                })
+            })
+            .await
+        })
+    }
+
+    fn event_location(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<EventLocationResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                connection.transaction(|connection| {
+                    repository::event_location(connection, user_id, event_pk)
+                })
+            })
+            .await
         })
     }
 
@@ -123,7 +166,9 @@ impl StorageBackend for SqliteFtsBackend {
     ) -> BoxedFuture<'_, Result<SummaryResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::usage_summary(connection, &query, user_id, summary_limit)
+                connection.transaction(|connection| {
+                    repository::usage_summary(connection, &query, user_id, summary_limit)
+                })
             })
             .await
         })
@@ -140,27 +185,77 @@ impl StorageBackend for SqliteFtsBackend {
         })
     }
 
-    fn session_timeline(
+    fn session_header(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionTimelineResponse, AppError>> {
+    ) -> BoxedFuture<'_, Result<SessionHeaderResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::session_timeline(connection, user_id, session_pk)
+                connection.transaction(|connection| {
+                    repository::session_header(connection, user_id, session_pk)
+                })
             })
             .await
         })
     }
 
-    fn session_outline(
+    fn session_streams(
         &self,
         user_id: Uuid,
         session_pk: Uuid,
-    ) -> BoxedFuture<'_, Result<SessionOutlineResponse, AppError>> {
+    ) -> BoxedFuture<'_, Result<SessionStreamsResponse, AppError>> {
         Box::pin(async move {
             self.run_db(move |connection| {
-                repository::session_outline(connection, user_id, session_pk)
+                connection.transaction(|connection| {
+                    repository::session_streams(connection, user_id, session_pk)
+                })
+            })
+            .await
+        })
+    }
+
+    fn session_turns(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+    ) -> BoxedFuture<'_, Result<SessionTurnsResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                connection.transaction(|connection| {
+                    repository::session_turns(connection, user_id, session_pk)
+                })
+            })
+            .await
+        })
+    }
+
+    fn session_segment(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        head: String,
+        query: ValidatedSegmentQuery,
+    ) -> BoxedFuture<'_, Result<SegmentResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                connection.transaction(|connection| {
+                    repository::session_segment(connection, user_id, session_pk, &head, &query)
+                })
+            })
+            .await
+        })
+    }
+
+    fn event_conversation(
+        &self,
+        user_id: Uuid,
+        event_pk: Uuid,
+        window: Window,
+    ) -> BoxedFuture<'_, Result<ConversationPreview, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                repository::event_conversation(connection, user_id, event_pk, &window)
             })
             .await
         })
@@ -172,8 +267,12 @@ impl StorageBackend for SqliteFtsBackend {
         query: ValidatedSessionListQuery,
     ) -> BoxedFuture<'_, Result<SessionListResponse, AppError>> {
         Box::pin(async move {
-            self.run_db(move |connection| session_list::list_sessions(connection, user_id, &query))
-                .await
+            self.run_db(move |connection| {
+                connection.transaction(|connection| {
+                    session_list::list_sessions(connection, user_id, &query)
+                })
+            })
+            .await
         })
     }
 
@@ -196,8 +295,30 @@ impl StorageBackend for SqliteFtsBackend {
         query: SessionSearchQuery,
     ) -> BoxedFuture<'_, Result<SessionSearchResponse, AppError>> {
         Box::pin(async move {
-            self.run_db(move |connection| search::session_search(connection, user_id, query))
-                .await
+            self.run_db(move |connection| {
+                connection.transaction(|connection| {
+                    let mut response = search::session_search(connection, user_id, query)?;
+                    locate_search_matches(&mut response, |session_pk| {
+                        repository::session_structure(connection, user_id, session_pk)
+                    })?;
+                    Ok(response)
+                })
+            })
+            .await
+        })
+    }
+
+    fn search_in_session(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: InSessionSearchQuery,
+    ) -> BoxedFuture<'_, Result<InSessionSearchResponse, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                search::search_in_session(connection, user_id, session_pk, &query)
+            })
+            .await
         })
     }
 

@@ -34,6 +34,7 @@ axum = "0.8"
 axum-extra = { version = "0.12", default-features = false, features = ["query"] }
 base64 = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 diesel = { version = "2.3", default-features = false, features = ["32-column-tables", "r2d2", "with-deprecated"], optional = true }
 diesel_migrations = { version = "2.2", default-features = false, optional = true }
 hex = "0.4"

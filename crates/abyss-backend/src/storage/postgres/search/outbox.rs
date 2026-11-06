@@ -24,6 +24,7 @@ use crate::{
         schema::{agent_sessions, devices, llm_usage_events, search_outbox},
     },
     error::AppError,
+    usage::streams::EntryLabel,
 };
 
 use super::{document::SearchDocument, elasticsearch::BulkOperation};
@@ -59,6 +60,8 @@ pub struct SearchSessionDetails {
     pub session: AgentSession,
     /// Device row associated with the session.
     pub device: Device,
+    /// Label of the session's earliest request, read from its existing facts.
+    pub title: Option<EntryLabel>,
 }
 
 /// Synchronous persistence boundary for search projection state.
@@ -265,9 +268,24 @@ impl SearchOutboxRepository {
             .filter(agent_sessions::id.eq_any(session_ids))
             .select((AgentSession::as_select(), Device::as_select()))
             .load::<(AgentSession, Device)>(connection)?;
+        let authorized_ids = rows
+            .iter()
+            .map(|(session, _)| session.id)
+            .collect::<Vec<_>>();
+        let mut titles = super::super::session_titles::titles(connection, &authorized_ids)?;
         Ok(rows
             .into_iter()
-            .map(|(session, device)| (session.id, SearchSessionDetails { session, device }))
+            .map(|(session, device)| {
+                let session_pk = session.id;
+                (
+                    session_pk,
+                    SearchSessionDetails {
+                        session,
+                        device,
+                        title: titles.remove(&session_pk),
+                    },
+                )
+            })
             .collect())
     }
 }

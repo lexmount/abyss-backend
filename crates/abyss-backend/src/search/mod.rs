@@ -1,21 +1,30 @@
-//! Backend-independent full-text search contracts and safe source projection.
+//! Backend-independent search contracts and the literal text matching both
+//! searches share.
 //!
-//! Concrete search engines live inside their selected storage backend. This
-//! module defines only the query, response, highlight, and bounded projection
-//! types shared by those implementations and the HTTP layer.
+//! A search reads the pieces of each event's conversation entries, each
+//! entry's `text` and its `name`, and matches the query as one literal
+//! substring after per-character case folding. Storage backends find the
+//! candidate texts and expand matching texts into events; folding, matching,
+//! occurrence ranges, fragments, and result ordering live in [`matching`], so
+//! every backend returns the same hits.
 
-pub mod projection;
+#[cfg_attr(
+    all(feature = "postgres-es", not(test)),
+    expect(
+        dead_code,
+        reason = "the PostgreSQL profile keeps its Elasticsearch search until its replacement is decided"
+    )
+)]
+pub mod matching;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::AppError;
-
-/// Sentinel inserted before text matched by either search implementation.
-pub const HIGHLIGHT_START: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_START]]]";
-/// Sentinel inserted after text matched by either search implementation.
-pub const HIGHLIGHT_END: &str = "[[[ABYSS_SEARCH_HIGHLIGHT_END]]]";
+use crate::{
+    error::AppError,
+    usage::streams::{EntryLabel, EventLocation},
+};
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const MAX_PAGE_SIZE: u32 = 50;
@@ -24,9 +33,9 @@ const MAX_FILTER_CHARACTERS: usize = 256;
 const MAX_RESULT_WINDOW: u32 = 10_000;
 
 #[derive(Debug, Deserialize)]
-/// Query-string contract for session full-text search.
+/// Query-string contract for session search.
 pub struct SessionSearchQuery {
-    /// Required full-text query.
+    /// Required query, matched as one literal substring.
     pub q: String,
     /// Inclusive lower observation-time bound.
     pub from: Option<DateTime<Utc>>,
@@ -51,7 +60,7 @@ pub struct SessionSearchQuery {
 
 impl SessionSearchQuery {
     pub(crate) fn validate(self) -> Result<ValidatedSearchQuery, AppError> {
-        let text = normalized_required(&self.q, "q", MAX_QUERY_CHARACTERS)?;
+        let text = normalized_query(&self.q)?;
         if let (Some(from), Some(to)) = (self.from, self.to)
             && from >= to
         {
@@ -109,7 +118,7 @@ impl SessionSearchQuery {
 
 /// Normalized query safe to translate into a backend-specific search request.
 pub struct ValidatedSearchQuery {
-    /// Trimmed full-text query.
+    /// Trimmed query.
     pub text: String,
     /// Inclusive lower observation-time bound.
     pub from: Option<DateTime<Utc>>,
@@ -134,9 +143,9 @@ pub struct ValidatedSearchQuery {
 #[derive(Serialize)]
 /// Paginated session search response.
 pub struct SessionSearchResponse {
-    /// Normalized full-text query.
+    /// Normalized query.
     pub query: String,
-    /// Distinct matching-session count reported by the selected backend.
+    /// Sessions with at least one matching event.
     pub total_sessions: u64,
     /// One-based current page.
     pub page: u32,
@@ -149,12 +158,14 @@ pub struct SessionSearchResponse {
 }
 
 #[derive(Serialize)]
-/// One hydrated session with its strongest matching events.
+/// One hydrated session with up to three of its matching events.
 pub struct SessionSearchResult {
     /// Backend session primary key.
     pub session_pk: Uuid,
     /// Agent-native session identifier.
     pub session_id: String,
+    /// The same earliest-request label returned by the session list and header.
+    pub title: Option<EntryLabel>,
     /// Agent name as reported by the collector.
     pub agent_name: String,
     /// Most recently observed Agent version.
@@ -171,9 +182,12 @@ pub struct SessionSearchResult {
     pub providers: Vec<String>,
     /// Sorted models represented by the returned matching events.
     pub models: Vec<String>,
-    /// Total matching events in the session.
+    /// Matching events in the session.
     pub match_count: u64,
-    /// Bounded strongest matching events with fragments.
+    /// Matching events with at least one new hit.
+    pub new_match_count: u64,
+    /// Matching events with fragments: those with a new hit first, then
+    /// those whose hits are all in the inherited context.
     pub matches: Vec<SessionSearchMatch>,
 }
 
@@ -182,10 +196,9 @@ pub struct SessionSearchResult {
 pub struct SessionSearchMatch {
     /// Backend event primary key.
     pub event_pk: Uuid,
-    /// Backend turn primary key.
-    pub turn_pk: Uuid,
-    /// Normalized turn number.
-    pub turn_index: i32,
+    /// Current position in this session's stream view, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<EventLocation>,
     /// Request or response side.
     pub event_type: String,
     /// LLM provider as reported by the collector.
@@ -194,62 +207,98 @@ pub struct SessionSearchMatch {
     pub llm_model: String,
     /// Collector observation time.
     pub observed_at: DateTime<Utc>,
-    /// Safely segmented highlighted snippets.
+    /// Whether the event has a hit outside its inherited context.
+    pub new: bool,
+    /// Highlighted fragments of the event's matching pieces.
     pub fragments: Vec<SearchFragment>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 /// One search highlight fragment split into plain and matching text.
 pub struct SearchFragment {
     /// Ordered text segments suitable for structured UI rendering.
     pub segments: Vec<SearchFragmentSegment>,
 }
 
-impl SearchFragment {
-    pub(crate) fn parse(fragment: &str) -> Self {
-        let mut segments = Vec::new();
-        let mut remainder = fragment;
-        while let Some(start) = remainder.find(HIGHLIGHT_START) {
-            let (plain, tagged) = remainder.split_at(start);
-            push_fragment_segment(&mut segments, plain, false);
-            let highlighted = tagged
-                .strip_prefix(HIGHLIGHT_START)
-                .expect("the marker position came from find");
-            // Treat malformed or truncated marker pairs as plain text. The API
-            // never emits raw HTML and therefore does not trust ES fragments.
-            let Some(end) = highlighted.find(HIGHLIGHT_END) else {
-                push_fragment_segment(&mut segments, tagged, false);
-                remainder = "";
-                break;
-            };
-            let (matched, after_match) = highlighted.split_at(end);
-            push_fragment_segment(&mut segments, matched, true);
-            remainder = after_match
-                .strip_prefix(HIGHLIGHT_END)
-                .expect("the marker position came from find");
-        }
-        push_fragment_segment(&mut segments, remainder, false);
-        Self { segments }
-    }
-}
-
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 /// Plain or highlighted portion of a search fragment.
 pub struct SearchFragmentSegment {
-    /// Fragment text with internal marker tokens removed by parsing.
+    /// Fragment text.
     pub text: String,
-    /// Whether this segment matched the full-text query.
+    /// Whether this segment is an occurrence of the query.
     pub highlighted: bool,
 }
 
-fn push_fragment_segment(segments: &mut Vec<SearchFragmentSegment>, text: &str, highlighted: bool) {
-    if text.is_empty() {
-        return;
+#[derive(Debug, Deserialize)]
+/// Query-string contract for search within one session.
+pub struct InSessionSearchQuery {
+    /// Required query, matched as one literal substring.
+    pub q: String,
+}
+
+impl InSessionSearchQuery {
+    /// The trimmed query.
+    pub(crate) fn validate(&self) -> Result<String, AppError> {
+        normalized_query(&self.q)
     }
-    segments.push(SearchFragmentSegment {
-        text: text.to_owned(),
-        highlighted,
-    });
+}
+
+#[derive(Debug, Serialize)]
+/// Every hit of the query in one session, with the occurrences in each
+/// matching text.
+pub struct InSessionSearchResponse {
+    /// Normalized query.
+    pub query: String,
+    /// The texts the hits name, by id, with their occurrences.
+    pub texts: Vec<MatchedText>,
+    /// Hits in observation order, then by event, entry, and field, `name`
+    /// before `text`.
+    pub hits: Vec<InSessionHit>,
+    /// Whether hits beyond the returned ones were left out.
+    pub truncated: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+/// One matching text and the occurrences of the query in it.
+pub struct MatchedText {
+    /// Text id the hits name.
+    pub id: i64,
+    /// Non-overlapping occurrences, left to right, as half-open ranges of the
+    /// text's UTF-16 code units.
+    pub ranges: Vec<[usize; 2]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// One piece of one event whose text holds the query.
+pub struct InSessionHit {
+    /// Event the piece belongs to.
+    pub event_pk: Uuid,
+    /// Position of the entry in the event's `conversation.entries`.
+    pub entry_index: u32,
+    /// Which value of the entry the piece is.
+    pub field: PieceField,
+    /// Whether the hit is outside the event's inherited context.
+    pub new: bool,
+    /// Text of the piece, in [`InSessionSearchResponse::texts`].
+    pub text_id: i64,
+    /// Head of the segment holding the event's exchange, as the session's
+    /// streams give it; null when the event is in no exchange.
+    pub segment: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+/// Which value of an entry a piece is. Within an entry, `name` orders
+/// before `text`.
+pub enum PieceField {
+    /// The entry's `name`, the tool name of a tool call.
+    Name,
+    /// The entry's `text`.
+    Text,
+}
+
+fn normalized_query(value: &str) -> Result<String, AppError> {
+    normalized_required(value, "q", MAX_QUERY_CHARACTERS)
 }
 
 fn normalized_required(value: &str, field: &str, maximum: usize) -> Result<String, AppError> {
@@ -284,7 +333,7 @@ fn normalized_list(values: &[String], field: &str) -> Result<Vec<String>, AppErr
 
 #[cfg(test)]
 mod tests {
-    use super::{HIGHLIGHT_END, HIGHLIGHT_START, SearchFragment, SessionSearchQuery};
+    use super::{InSessionSearchQuery, SessionSearchQuery};
 
     #[test]
     fn rejects_empty_and_invalid_pagination_queries() {
@@ -327,14 +376,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_highlights_without_rendering_html() {
-        let fragment = SearchFragment::parse(&format!(
-            "before {HIGHLIGHT_START}timeout{HIGHLIGHT_END} after"
-        ));
+    fn a_query_is_trimmed_and_bounded_by_characters() {
+        let trimmed = query("  cargo test \n").validate().expect("query is valid");
+        assert_eq!(
+            trimmed.text, "cargo test",
+            "inner spaces stay part of the query"
+        );
+        assert!(query(&"会".repeat(256)).validate().is_ok());
+        assert!(query(&"会".repeat(257)).validate().is_err());
 
-        assert_eq!(fragment.segments.len(), 3);
-        assert_eq!(fragment.segments[1].text, "timeout");
-        assert!(fragment.segments[1].highlighted);
+        let in_session = |q: &str| InSessionSearchQuery { q: q.to_owned() }.validate();
+        assert_eq!(
+            in_session(" STATUS.md ").expect("query is valid"),
+            "STATUS.md"
+        );
+        assert!(in_session(" ").is_err());
+        assert!(in_session(&"a".repeat(257)).is_err());
     }
 
     fn query(q: &str) -> SessionSearchQuery {

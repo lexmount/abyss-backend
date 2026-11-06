@@ -12,7 +12,8 @@ Keep the repository focused on these public event-service responsibilities.
 - `identity` validates the deployment bearer token and returns the stable
   standalone owner identifier.
 - `usage` owns event contracts plus backend-independent validation and ordering.
-- `search` owns shared search contracts and safe projection extraction.
+- `search` owns shared search contracts and the literal text matching both
+  storage backends share.
 - `storage` is the `dyn StorageBackend` compatibility boundary and contains the
   conditionally compiled PostgreSQL/Elasticsearch and SQLite/FTS5 backends.
 - `db` owns PostgreSQL-only pooling, migrations, and Diesel models.
