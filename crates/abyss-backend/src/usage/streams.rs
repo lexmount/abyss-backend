@@ -258,7 +258,6 @@ impl SessionStructure {
     }
 
     /// Segment of one event, without building a map for unrelated events.
-    #[cfg(feature = "sqlite-fts")]
     pub fn event_segment(&self, event_pk: Uuid) -> Option<&str> {
         let exchange = *self.event_to_exchange.get(&event_pk)?;
         Some(self.segment_head(self.segmentation.segment_of[exchange]))

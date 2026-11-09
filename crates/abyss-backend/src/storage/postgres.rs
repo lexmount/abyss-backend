@@ -1,6 +1,7 @@
 //! PostgreSQL source-of-truth and Elasticsearch projection implementation.
 
 mod comparison;
+mod in_session_search;
 mod repository;
 mod search;
 mod session_list;
@@ -363,19 +364,17 @@ impl StorageBackend for PostgresEsBackend {
         })
     }
 
-    /// Elasticsearch holds each event's text as one document without entry
-    /// positions, so this profile cannot list the hits within a session.
     fn search_in_session(
         &self,
-        _user_id: Uuid,
-        _session_pk: Uuid,
+        user_id: Uuid,
+        session_pk: Uuid,
         query: InSessionSearchQuery,
     ) -> BoxedFuture<'_, Result<InSessionSearchResponse, AppError>> {
         Box::pin(async move {
-            query.validate()?;
-            Err(AppError::unavailable(
-                "search within a session is not supported by this storage backend".to_owned(),
-            ))
+            self.run_db(move |connection| {
+                in_session_search::search_in_session(connection, user_id, session_pk, &query)
+            })
+            .await
         })
     }
 

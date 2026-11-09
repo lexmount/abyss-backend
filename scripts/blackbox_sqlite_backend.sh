@@ -109,8 +109,9 @@ PY
 python3 scripts/tests/blackbox_api.py \
   --base-url "${BASE_URL}" \
   --token "${API_TOKEN}" \
-  --run-id "${RUN_ID}" \
-  --in-session-search
+  --run-id "${RUN_ID}"
+
+python3 scripts/tests/in_session_search_api.py --base-url "${BASE_URL}" --token "${API_TOKEN}"
 
 python3 - "${DATABASE_PATH}" "capture-${RUN_ID}" <<'PY'
 import sqlite3

@@ -163,6 +163,12 @@ python3 scripts/tests/blackbox_api.py \
   --token "${API_TOKEN}" \
   --run-id "${RUN_ID}"
 
+# In-session search reads PostgreSQL even when the global search engine is down.
+kill "${ELASTICSEARCH_PID}"
+wait "${ELASTICSEARCH_PID}" 2>/dev/null || true
+ELASTICSEARCH_PID=""
+python3 scripts/tests/in_session_search_api.py --base-url "${BASE_URL}" --token "${API_TOKEN}"
+
 CAPTURE_COUNT="$(query_database "SELECT count(*) FROM agent_diagnostic_captures WHERE capture_id = 'capture-${RUN_ID}' AND payload ->> 'request_plaintext' = 'diagnostic request' AND payload ->> 'response_plaintext' = 'diagnostic response';")"
 [[ "${CAPTURE_COUNT}" == "1" ]] || fail "diagnostic capture payload was not retained"
 

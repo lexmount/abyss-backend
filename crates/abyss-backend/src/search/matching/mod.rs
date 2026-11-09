@@ -13,3 +13,5 @@ pub mod in_session;
 pub mod pattern;
 pub mod pieces;
 pub mod ranking;
+#[cfg(any(feature = "postgres-es", test))]
+pub mod scan;

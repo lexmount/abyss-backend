@@ -38,8 +38,10 @@ pub struct Piece<'a> {
 }
 
 /// The pieces of the event's `conversation.entries`, in entry order and
-/// `name` before `text` within an entry. Nothing outside the entries is read,
-/// and metadata never is, so headers are never searched; an empty value is
+/// `name` before `text` within an entry.
+///
+/// Nothing outside the entries is read, and metadata never is, so headers
+/// are never searched; an empty value is
 /// not a piece, and entries are never joined.
 #[must_use]
 pub fn pieces(conversation: Option<&Value>) -> Vec<Piece<'_>> {

@@ -132,7 +132,7 @@ def event(
     return value
 
 
-def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
+def run(base_url: str, token: str, run_id: str) -> None:
     session_id = f"session-blackbox-{run_id}"
     request_event_id = f"event-request-{run_id}"
     response_event_id = f"event-response-{run_id}"
@@ -538,7 +538,7 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         f"each match says whether it is new: {found['matches']}",
     )
     run_in_session_search_contract(
-        base_url, token, session_pk, [item["id"] for item in session_events], in_session
+        base_url, token, session_pk, [item["id"] for item in session_events]
     )
 
     run_sub_agent_contract(base_url, token, run_id)
@@ -723,15 +723,11 @@ def in_session_search_path(session_pk: str, query: str) -> str:
 
 
 def run_in_session_search_contract(
-    base_url: str, token: str, session_pk: str, event_pks: list[str], supported: bool
+    base_url: str, token: str, session_pk: str, event_pks: list[str]
 ) -> None:
     """Every hit of a query in one session, with UTF-16 occurrence ranges and
     the segment of each hit's event."""
     path = in_session_search_path(session_pk, "BLACKBOX")
-    if not supported:
-        response = request(base_url, "GET", path, token=token)
-        require_status(response, 503, "search within a session is not supported")
-        return
     response = request(base_url, "GET", path, token=token)
     require_status(response, 200, "search within a session")
     found = response.json()
@@ -780,13 +776,8 @@ def main() -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument(
-        "--in-session-search",
-        action="store_true",
-        help="the storage profile supports search within a session",
-    )
     args = parser.parse_args()
-    run(args.base_url.rstrip("/"), args.token, args.run_id, args.in_session_search)
+    run(args.base_url.rstrip("/"), args.token, args.run_id)
     from comparison_api import run as run_comparison
     run_comparison(args.base_url.rstrip("/"), args.token)
 

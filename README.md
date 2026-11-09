@@ -116,7 +116,7 @@ curl \
 | `GET` | `/v1/agent-usage/sessions/{session_pk}/segments/{head}` | Read one segment’s exchanges. |
 | `POST` | `/v1/agent-usage/comparison` | Compare token totals and daily activity across dimensions. |
 | `GET` | `/v1/agent-usage/search` | Search sessions through Elasticsearch or SQLite. |
-| `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session (SQLite). |
+| `GET` | `/v1/agent-usage/sessions/{session_pk}/search` | Every hit of a query in one session, with exact entry positions. |
 
 A turn is one user input and all the work it causes; the backend reads only
 the `turn_id` an event declares. Turn counts (session list, summary `turns`,
@@ -231,9 +231,16 @@ are in observation order, then by event, entry, and `name` before `text`.
 occurrences as half-open ranges of the original text's UTF-16 code units. At
 most 100,000 hits are returned; `truncated` says whether more were left out.
 
-The PostgreSQL profile searches through Elasticsearch, requires every
-whitespace-separated term to match, counts every match as new, and does not
-support search within a session.
+The PostgreSQL profile's global search uses Elasticsearch, requires every
+whitespace-separated term to match, and counts every match as new.
+Search within one session uses the same literal matching and response contract
+as SQLite. It streams that owner's stored conversation entries from PostgreSQL
+and reads their stream facts and segment positions in one read-only,
+repeatable-read transaction. It works without Elasticsearch or an index rebuild,
+including for already stored events and events awaiting indexing. Text ids in
+its response identify distinct original texts within that response. The scan
+reads the session's bodies until it finds an excess hit or reaches the end, so
+search latency grows with the amount of conversation content in that session.
 
 ## Configuration
 
