@@ -22,6 +22,7 @@ pub mod segments;
 pub mod session_header;
 /// Owner-scoped session index contracts.
 pub mod session_list;
+mod speed;
 /// Streams of a session: stream facts, bases, and segments.
 pub mod streams;
 /// Local calendar days for summaries grouped by day.
