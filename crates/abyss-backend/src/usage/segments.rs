@@ -64,6 +64,8 @@ pub struct SegmentExchangeResponse {
     pub model: Option<String>,
     pub request_tokens: Option<TokenCounts>,
     pub response_tokens: Option<TokenCounts>,
+    /// Response output tokens per second from request to response.
+    pub response_tps: Option<f64>,
     pub request: Option<ConversationPreview>,
     pub response: Option<ConversationPreview>,
 }
@@ -124,15 +126,21 @@ pub fn segment_response(
         .map(|exchange| {
             let request = exchange.request_pk.and_then(|pk| events.remove(&pk));
             let response = exchange.response_pk.and_then(|pk| events.remove(&pk));
+            let requested_at = request.as_ref().map(|event| event.observed_at);
+            let responded_at = response.as_ref().map(|event| event.observed_at);
+            let response_tokens = response.as_ref().map(TokenCounts::of);
+            let output = response_tokens.as_ref().map_or(0, |tokens| tokens.output);
             SegmentExchangeResponse {
-                requested_at: request.as_ref().map(|event| event.observed_at),
-                responded_at: response.as_ref().map(|event| event.observed_at),
+                response_tps: super::speed::timed(requested_at, responded_at, output)
+                    .map(super::speed::per_second),
+                requested_at,
+                responded_at,
                 model: request
                     .as_ref()
                     .or(response.as_ref())
                     .map(|event| event.llm.model.clone()),
                 request_tokens: request.as_ref().map(TokenCounts::of),
-                response_tokens: response.as_ref().map(TokenCounts::of),
+                response_tokens,
                 request: request.map(|event| preview(event, window)),
                 response: response.map(|event| preview(event, window)),
                 exchange,
