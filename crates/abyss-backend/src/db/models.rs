@@ -165,29 +165,23 @@ pub struct UsageEvent {
     pub conversation: Option<Value>,
 }
 
-#[derive(Queryable, Selectable)]
-#[diesel(table_name = llm_usage_event_attachments)]
-#[diesel(check_for_backend(diesel::pg::Pg))]
-/// Persisted metadata and optional bytes for one event image.
+#[derive(Queryable)]
+/// One event image with the metadata of the blob it refers to.
 pub struct UsageEventAttachment {
     /// Server-generated attachment primary key.
     pub id: Uuid,
-    /// Owning user identifier copied for direct authorization.
-    pub user_id: Uuid,
     /// Parent usage-event primary key.
     pub event_pk: Uuid,
     /// Unique display position within the event.
     pub position: i32,
     /// Validated browser-safe MIME type.
     pub media_type: String,
-    /// Declared decoded content length.
+    /// Decoded content length.
     pub byte_size: i64,
     /// Binary SHA-256 digest.
     pub sha256: Vec<u8>,
-    /// Optional image bytes for metadata-only attachments.
-    pub content: Option<Vec<u8>>,
-    /// Server insertion time.
-    pub created_at: DateTime<Utc>,
+    /// Whether the blob holds the image bytes.
+    pub content_available: bool,
 }
 
 #[derive(Insertable)]
@@ -375,14 +369,8 @@ pub struct NewUsageEventAttachment {
     pub event_pk: Uuid,
     /// Unique display position within the event.
     pub position: i32,
-    /// Validated browser-safe MIME type.
-    pub media_type: String,
-    /// Decoded content length.
-    pub byte_size: i64,
-    /// Binary SHA-256 digest.
+    /// Binary SHA-256 digest of the referenced blob.
     pub sha256: Vec<u8>,
-    /// Optional decoded image bytes.
-    pub content: Option<Vec<u8>>,
     /// Server insertion time.
     pub created_at: DateTime<Utc>,
 }

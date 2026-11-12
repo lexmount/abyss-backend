@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use diesel::{
-    ExpressionMethods, IntoSql, NullableExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl,
-    SelectableHelper, SqliteConnection,
+    BoolExpressionMethods, ExpressionMethods, IntoSql, JoinOnDsl, NullableExpressionMethods,
+    QueryDsl, QueryableByName, RunQueryDsl, SelectableHelper, SqliteConnection,
     dsl::{max, min},
     result::OptionalExtension,
     sql_query,
@@ -52,7 +52,8 @@ use super::{
     },
     schema::{
         agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, app_users,
-        devices, llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
+        attachment_blobs, devices, llm_usage_event_attachments, llm_usage_event_stream_facts,
+        llm_usage_events,
     },
     search::index_event,
     session_titles,
@@ -204,6 +205,9 @@ fn insert_attachments(
     attachments: Vec<ValidatedImageAttachment>,
     now: i64,
 ) -> Result<(), AppError> {
+    for attachment in &attachments {
+        store_blob(connection, user_id, attachment, now)?;
+    }
     let attachment_rows = attachments
         .into_iter()
         .map(|attachment| NewAttachment {
@@ -211,10 +215,7 @@ fn insert_attachments(
             user_id: user_id.to_string(),
             event_pk: event_pk.to_string(),
             position: attachment.position,
-            media_type: attachment.media_type.as_str().to_owned(),
-            byte_size: attachment.byte_size,
             sha256: attachment.sha256,
-            content: attachment.content,
             created_at: now,
         })
         .collect::<Vec<_>>();
@@ -224,6 +225,29 @@ fn insert_attachments(
             .execute(connection)?;
     }
 
+    Ok(())
+}
+
+/// Stores a user's image blob once per digest; an event carrying an image the
+/// user already stored only refers to it.
+fn store_blob(
+    connection: &mut SqliteConnection,
+    user_id: Uuid,
+    attachment: &ValidatedImageAttachment,
+    now: i64,
+) -> Result<(), AppError> {
+    diesel::insert_into(attachment_blobs::table)
+        .values((
+            attachment_blobs::user_id.eq(user_id.to_string()),
+            attachment_blobs::sha256.eq(&attachment.sha256),
+            attachment_blobs::media_type.eq(attachment.media_type.as_str()),
+            attachment_blobs::byte_size.eq(attachment.byte_size),
+            attachment_blobs::content.eq(attachment.content.as_deref()),
+            attachment_blobs::created_at.eq(now),
+        ))
+        .on_conflict((attachment_blobs::user_id, attachment_blobs::sha256))
+        .do_nothing()
+        .execute(connection)?;
     Ok(())
 }
 
@@ -848,27 +872,38 @@ pub(super) fn image_attachment(
     user_id: Uuid,
     attachment_id: Uuid,
 ) -> Result<StoredImageAttachment, AppError> {
-    let row = llm_usage_event_attachments::table
+    let (media_type, byte_size, sha256, content) = llm_usage_event_attachments::table
+        .inner_join(
+            attachment_blobs::table.on(attachment_blobs::user_id
+                .eq(llm_usage_event_attachments::user_id)
+                .and(attachment_blobs::sha256.eq(llm_usage_event_attachments::sha256))),
+        )
         .filter(llm_usage_event_attachments::id.eq(attachment_id.to_string()))
         .filter(llm_usage_event_attachments::user_id.eq(user_id.to_string()))
-        .select(AttachmentRow::as_select())
-        .first::<AttachmentRow>(connection)
+        .select((
+            attachment_blobs::media_type,
+            attachment_blobs::byte_size,
+            attachment_blobs::sha256,
+            attachment_blobs::content,
+        ))
+        .first::<(String, i64, Vec<u8>, Option<Vec<u8>>)>(connection)
         .optional()?
-        .ok_or_else(|| AppError::not_found(format!("image attachment not found: {attachment_id}")))?
-        .into_record()?;
-    let content = row.content.ok_or_else(|| {
+        .ok_or_else(|| {
+            AppError::not_found(format!("image attachment not found: {attachment_id}"))
+        })?;
+    let content = content.ok_or_else(|| {
         AppError::not_found(format!(
             "image attachment content not found: {attachment_id}"
         ))
     })?;
-    if i64::try_from(content.len()).ok() != Some(row.byte_size) {
+    if i64::try_from(content.len()).ok() != Some(byte_size) {
         return Err(AppError::internal(format!(
             "stored image attachment byte size mismatch: {attachment_id}"
         )));
     }
     Ok(StoredImageAttachment {
-        media_type: ImageMediaType::from_stored(&row.media_type)?,
-        sha256: hex::encode(row.sha256),
+        media_type: ImageMediaType::from_stored(&media_type)?,
+        sha256: hex::encode(sha256),
         content,
     })
 }
@@ -1257,12 +1292,25 @@ fn load_attachments(
         .map(|event| event.id.to_string())
         .collect::<Vec<_>>();
     let rows = llm_usage_event_attachments::table
+        .inner_join(
+            attachment_blobs::table.on(attachment_blobs::user_id
+                .eq(llm_usage_event_attachments::user_id)
+                .and(attachment_blobs::sha256.eq(llm_usage_event_attachments::sha256))),
+        )
         .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
         .order_by((
             llm_usage_event_attachments::event_pk.asc(),
             llm_usage_event_attachments::position.asc(),
         ))
-        .select(AttachmentRow::as_select())
+        .select((
+            llm_usage_event_attachments::id,
+            llm_usage_event_attachments::event_pk,
+            llm_usage_event_attachments::position,
+            attachment_blobs::media_type,
+            attachment_blobs::byte_size,
+            attachment_blobs::sha256,
+            attachment_blobs::content.is_not_null(),
+        ))
         .load::<AttachmentRow>(connection)?
         .into_iter()
         .map(AttachmentRow::into_record)
@@ -1278,7 +1326,7 @@ fn load_attachments(
                 media_type: ImageMediaType::from_stored(&row.media_type)?,
                 byte_size: row.byte_size,
                 sha256: hex::encode(row.sha256),
-                content_available: row.content.is_some(),
+                content_available: row.content_available,
             });
     }
     Ok(by_event)
