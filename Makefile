@@ -13,6 +13,7 @@ test:
 	cargo test --locked --workspace
 	cargo test --locked --no-default-features --features sqlite-fts --workspace
 	python3 scripts/tests/test_native_release_contract.py
+	python3 -m unittest discover -s scripts/tests -p test_capture_delivery.py
 
 test-blackbox: test-blackbox-postgres test-blackbox-sqlite
 
