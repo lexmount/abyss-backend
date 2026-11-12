@@ -100,17 +100,27 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::{BigInt, Bytea, Integer, Nullable, Text, Timestamptz, Uuid};
+    use diesel::sql_types::{BigInt, Bytea, Nullable, Text, Timestamptz, Uuid};
+
+    attachment_blobs (user_id, sha256) {
+        user_id -> Uuid,
+        sha256 -> Bytea,
+        media_type -> Text,
+        byte_size -> BigInt,
+        content -> Nullable<Bytea>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::{Bytea, Integer, Timestamptz, Uuid};
 
     llm_usage_event_attachments (id) {
         id -> Uuid,
         user_id -> Uuid,
         event_pk -> Uuid,
         position -> Integer,
-        media_type -> Text,
-        byte_size -> BigInt,
         sha256 -> Bytea,
-        content -> Nullable<Bytea>,
         created_at -> Timestamptz,
     }
 }
@@ -196,6 +206,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_captures,
     agent_sessions,
     app_users,
+    attachment_blobs,
     devices,
     llm_usage_events,
     llm_usage_event_attachments,

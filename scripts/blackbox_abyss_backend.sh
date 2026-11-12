@@ -155,8 +155,8 @@ cargo "${CARGO_RUN_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 wait_for_backend
 
-EXPECTED_TABLES="$(query_database "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('app_users', 'devices', 'agent_sessions', 'llm_usage_events', 'llm_usage_event_attachments', 'agent_diagnostic_captures', 'agent_diagnostic_capture_events', 'search_outbox', 'session_titles', 'llm_usage_event_stream_facts');")"
-[[ "${EXPECTED_TABLES}" == "10" ]] || fail "the migrations did not create all event-store tables"
+EXPECTED_TABLES="$(query_database "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('app_users', 'devices', 'agent_sessions', 'llm_usage_events', 'llm_usage_event_attachments', 'attachment_blobs', 'agent_diagnostic_captures', 'agent_diagnostic_capture_events', 'search_outbox', 'session_titles', 'llm_usage_event_stream_facts');")"
+[[ "${EXPECTED_TABLES}" == "11" ]] || fail "the migrations did not create all event-store tables"
 
 python3 scripts/tests/blackbox_api.py \
   --base-url "${BASE_URL}" \
@@ -168,6 +168,7 @@ CAPTURE_COUNT="$(query_database "SELECT count(*) FROM agent_diagnostic_captures 
 
 CAPTURE_LINK_COUNT="$(query_database "SELECT count(*) FROM agent_diagnostic_capture_events links JOIN agent_diagnostic_captures captures ON captures.id = links.capture_pk WHERE captures.capture_id = 'capture-${RUN_ID}';")"
 [[ "${CAPTURE_LINK_COUNT}" == "2" ]] || fail "diagnostic capture was not linked to both events"
+
 
 echo "blackbox: standalone PostgreSQL, HTTP, attachment, diagnostics, and search contracts passed"
 
