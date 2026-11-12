@@ -45,3 +45,15 @@ The generic endpoint change is [abyss-rs PR 85](https://github.com/lexmount/abys
 This verifier can merge independently; it requires no schema or API rollout.
 Production provider and residential egress validation remains an operator
 integration step and is not inferred from local fixtures.
+
+## Coordinated review
+
+- [Endpoint PR 85](https://github.com/lexmount/abyss-rs/pull/85) and [runtime design](https://github.com/lexmount/abyss-rs/blob/task/lexmount-vpn/docs/lexmount-vpn.md).
+- [Desktop PR 86](https://github.com/lexmount/AbyssApp/pull/86) and [product design](https://github.com/lexmount/AbyssApp/blob/task/lexmount-vpn/docs/lexmount-vpn.md).
+- [Services PR 25](https://github.com/lexmount/abyss-services/pull/25) and [service design](https://github.com/lexmount/abyss-services/blob/task/lexmount-vpn/docs/lexmount-vpn.md).
+- [Standalone PR 16](https://github.com/lexmount/abyss-backend/pull/16) and [persistence design](https://github.com/lexmount/abyss-backend/blob/task/lexmount-vpn/docs/lexmount-vpn.md).
+
+The standalone verifier is independent. Integrate the public runtime primitives
+before the product composition. The enterprise service is opt-in; production
+packaging additionally requires a published endpoint release and normal release
+pins. Review packages consume explicit immutable development artifacts only.
