@@ -222,8 +222,6 @@ struct HitRow {
     session_id: String,
     #[diesel(sql_type = BigInt)]
     observed_at: i64,
-    #[diesel(sql_type = BigInt)]
-    started_at: i64,
     #[diesel(sql_type = Text)]
     event_type: String,
     #[diesel(sql_type = Nullable<Integer>)]
@@ -250,13 +248,12 @@ fn session_hits(
     }
     let mut sql = String::from(
         "SELECT r.event_pk AS event_pk, e.session_pk AS session_pk, \
-             e.session_id AS session_id, e.observed_at AS observed_at, s.started_at AS started_at, \
+             e.session_id AS session_id, e.observed_at AS observed_at, \
              e.event_type AS event_type, f.new_from AS new_from, \
              r.entry_index AS entry_index, r.field AS field, r.text_id AS text_id \
          FROM json_each(?) AS m \
          CROSS JOIN search_refs AS r ON r.text_id = m.value \
          CROSS JOIN llm_usage_events AS e ON e.id = r.event_pk \
-         INNER JOIN agent_sessions AS s ON s.id = e.session_pk AND s.user_id = e.user_id \
          LEFT JOIN llm_usage_event_stream_facts AS f ON f.event_pk = e.id \
          WHERE e.user_id = ?",
     );
@@ -293,7 +290,6 @@ fn session_hits(
                 event_pk: parse_uuid(&row.event_pk, "search event id")?,
                 session_pk: parse_uuid(&row.session_pk, "search session id")?,
                 session_id: row.session_id,
-                started_at: timestamp_from_micros(row.started_at)?,
                 observed_at: timestamp_from_micros(row.observed_at)?,
                 entry_index,
                 field: field(&row.field)?,

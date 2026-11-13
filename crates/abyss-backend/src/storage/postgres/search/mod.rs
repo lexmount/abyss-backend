@@ -55,50 +55,14 @@ impl SearchService {
     /// Validates and executes one owner-scoped session search.
     pub(super) async fn search(
         &self,
-        pool: &crate::db::DbPool,
         user_id: Uuid,
         query: SessionSearchQuery,
     ) -> Result<SearchExecution, AppError> {
         let query = query.validate()?;
-        let matching_ids = self
-            .client
-            .matching_session_ids(user_id, &query)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, %user_id, "session search request failed");
-                AppError::unavailable("session search is temporarily unavailable".to_owned())
-            })?;
-        let pool = pool.clone();
-        let offset = query.offset;
-        let page_size = query.page_size;
-        let (total_sessions, session_ids) = tokio::task::spawn_blocking(move || {
-            let mut connection = pool.get()?;
-            outbox::SearchOutboxRepository::ordered_session_page(
-                &mut connection,
-                user_id,
-                &matching_ids,
-                offset,
-                page_size,
-            )
-        })
-        .await
-        .map_err(|error| AppError::internal(format!("search ordering task failed: {error}")))??;
-        let mut page = self
-            .client
-            .search(user_id, &query, &session_ids)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, %user_id, "session search previews failed");
-                AppError::unavailable("session search is temporarily unavailable".to_owned())
-            })?;
-        let order = session_ids
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (*id, index))
-            .collect::<HashMap<_, _>>();
-        page.sessions
-            .sort_by_key(|session| order.get(&session.session_pk).copied());
-        page.total_sessions = total_sessions;
+        let page = self.client.search(user_id, &query).await.map_err(|error| {
+            tracing::warn!(%error, %user_id, "session search request failed");
+            AppError::unavailable("session search is temporarily unavailable".to_owned())
+        })?;
         Ok(SearchExecution { query, page })
     }
 }

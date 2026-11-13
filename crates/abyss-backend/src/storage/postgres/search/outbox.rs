@@ -250,37 +250,6 @@ impl SearchOutboxRepository {
         Ok(())
     }
 
-    /// Counts and selects existing owner sessions before preview hydration.
-    pub fn ordered_session_page(
-        connection: &mut PgConnection,
-        user_id: Uuid,
-        matching_ids: &[Uuid],
-        offset: u32,
-        page_size: u32,
-    ) -> Result<(u64, Vec<Uuid>), AppError> {
-        connection
-            .build_transaction()
-            .read_only()
-            .repeatable_read()
-            .run(|connection| {
-                let matching = agent_sessions::table
-                    .filter(agent_sessions::user_id.eq(user_id))
-                    .filter(agent_sessions::id.eq_any(matching_ids));
-                let total = matching.clone().count().get_result::<i64>(connection)?;
-                let ids = matching
-                    .order((
-                        agent_sessions::started_at.desc(),
-                        agent_sessions::session_id.asc(),
-                        agent_sessions::id.asc(),
-                    ))
-                    .offset(i64::from(offset))
-                    .limit(i64::from(page_size))
-                    .select(agent_sessions::id)
-                    .load::<Uuid>(connection)?;
-                Ok((u64::try_from(total).unwrap_or_default(), ids))
-            })
-    }
-
     /// Reloads session/device rows under the authenticated owner boundary.
     pub fn session_details(
         connection: &mut PgConnection,

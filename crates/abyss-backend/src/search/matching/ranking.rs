@@ -34,8 +34,6 @@ pub struct SearchHit {
     pub session_pk: Uuid,
     /// Agent-native identifier of that session.
     pub session_id: String,
-    /// Authoritative session start, including nonmatching events.
-    pub started_at: DateTime<Utc>,
     /// Event holding the piece.
     pub event_pk: Uuid,
     /// Observation time of the event.
@@ -55,7 +53,7 @@ pub struct SearchHit {
 pub struct RankedPage {
     /// Sessions with at least one matching event.
     pub total_sessions: u64,
-    /// The page's sessions, newest session start first.
+    /// The page's sessions, most recently matching first.
     pub sessions: Vec<RankedSession>,
 }
 
@@ -115,7 +113,6 @@ pub struct SessionDetails {
 
 /// The hits of one event.
 struct EventHits {
-    started_at: DateTime<Utc>,
     session_pk: Uuid,
     session_id: String,
     observed_at: DateTime<Utc>,
@@ -155,7 +152,7 @@ impl EventHits {
 
 /// Groups hits into matching events and sessions and keeps one page.
 ///
-/// Sessions order by their authoritative start time, newest first, then by
+/// Sessions order by their latest matching event, newest first, then by
 /// session id, then by session key. A session shows its matching events with a new hit, earliest
 /// first, then fills up with its earliest events whose hits are all in the
 /// inherited context; events at the same time order by key.
@@ -166,7 +163,6 @@ pub fn rank_sessions(hits: Vec<SearchHit>, offset: usize, page_size: usize) -> R
         let SearchHit {
             session_pk,
             session_id,
-            started_at,
             event_pk,
             observed_at,
             entry_index,
@@ -179,7 +175,6 @@ pub fn rank_sessions(hits: Vec<SearchHit>, offset: usize, page_size: usize) -> R
             .or_insert_with(|| EventHits {
                 session_pk,
                 session_id,
-                started_at,
                 observed_at,
                 hits: Vec::new(),
             })
@@ -201,17 +196,17 @@ pub fn rank_sessions(hits: Vec<SearchHit>, offset: usize, page_size: usize) -> R
     let mut sessions = sessions
         .into_iter()
         .map(|(session_pk, events)| {
-            let started_at = events.first().map(|(_, event)| event.started_at);
+            let latest = events.iter().map(|(_, event)| event.observed_at).max();
             let session_id = events
                 .first()
                 .map_or_else(Default::default, |(_, event)| event.session_id.clone());
-            ((started_at, session_id, session_pk), events)
+            ((latest, session_id, session_pk), events)
         })
         .collect::<Vec<_>>();
     sessions.sort_by(
-        |((left_start, left_id, left_pk), _), ((right_start, right_id, right_pk), _)| {
-            right_start
-                .cmp(left_start)
+        |((left_latest, left_id, left_pk), _), ((right_latest, right_id, right_pk), _)| {
+            right_latest
+                .cmp(left_latest)
                 .then_with(|| left_id.cmp(right_id))
                 .then_with(|| left_pk.cmp(right_pk))
         },
@@ -422,7 +417,6 @@ mod tests {
             session_id: session.to_owned(),
             event_pk: Uuid::from_u128(event),
             observed_at: at(second),
-            started_at: at(second),
             entry_index: entry,
             field: PieceField::Text,
             text_id,
@@ -447,20 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn sessions_order_by_start_even_when_an_older_session_has_a_newer_match() {
-        let mut hits = vec![
+    fn sessions_order_by_their_latest_matching_event_then_by_id() {
+        let hits = vec![
             hit("old", 1, 1, 0, 1, true),
             hit("tie-b", 2, 5, 0, 1, true),
             hit("tie-a", 3, 5, 0, 1, false),
-            hit("old", 4, 10, 0, 1, true),
+            hit("old", 4, 2, 0, 1, true),
             hit("new", 5, 9, 0, 1, false),
-            hit("new", 6, 9, 0, 1, true),
+            hit("new", 6, 0, 0, 1, true),
         ];
-        for hit in &mut hits {
-            if hit.session_id == "old" {
-                hit.started_at = at(1);
-            }
-        }
         let all = ["old", "tie-a", "tie-b", "new"];
         let page = rank_sessions(hits.clone(), 0, 10);
         assert_eq!(page.total_sessions, 4);

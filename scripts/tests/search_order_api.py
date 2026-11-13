@@ -109,11 +109,9 @@ def run(base, credential, *, cookie=False, run_id=None, output=None, scan_sessio
         time.sleep(.2)
 
     def expected(**filters):
-        starts = {}
-        eligible = set()
+        latest = {}
         for item in events:
             sid, stamp = item["session_id"], item["observed_at"]
-            starts[sid] = min(stamp, starts.get(sid, stamp))
             if marker not in item["conversation"]["entries"][0]["text"]:
                 continue
             if filters.get("to") and stamp >= filters["to"]:
@@ -122,8 +120,8 @@ def run(base, credential, *, cookie=False, run_id=None, output=None, scan_sessio
                 continue
             if filters.get("llm_provider") and item["llm"]["provider"] != filters["llm_provider"]:
                 continue
-            eligible.add(sid)
-        return sorted(sorted(eligible), key=lambda sid: starts[sid], reverse=True)
+            latest[sid] = max(stamp, latest.get(sid, stamp))
+        return sorted(sorted(latest), key=lambda sid: latest[sid], reverse=True)
 
     late = event("session-24", "2025-06-01T00:00:00Z", "earlier unrelated event")
     already_delivered = any(item["session_id"] == late["session_id"] and item["started_at"].startswith("2025-06-01")
@@ -132,8 +130,8 @@ def run(base, credential, *, cookie=False, run_id=None, output=None, scan_sessio
         events.append(late)
     actual_ids = [item["session_id"] for item in all_results["items"]]
     assert actual_ids == expected(), {"expected": expected(), "actual": actual_ids}
-    # An earlier nonmatching event changes the card time immediately, including
-    # when existing matching documents were indexed before its arrival.
+    # An earlier nonmatching event changes the card start time but must not
+    # change latest-matching-event order, including after indexing.
     request("/events", {"events": [late]})
     if not already_delivered:
         events.append(late)
@@ -152,7 +150,6 @@ def run(base, credential, *, cookie=False, run_id=None, output=None, scan_sessio
             assert all(item["matches"] for item in result["items"]), result
             actual.extend(ids)
             starts.extend(item["started_at"] for item in result["items"])
-        assert starts == sorted(starts, reverse=True), starts
         assert len(set(actual)) == len(wanted)
         evidence.append({"filters": filters, "sessions": len(actual), "ordered_ids": actual, "started_at": starts})
     assert [x["session_id"] for x in search(page_size=20)["items"]] == expected()[:20]

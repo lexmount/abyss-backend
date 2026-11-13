@@ -339,7 +339,7 @@ impl StorageBackend for PostgresEsBackend {
             let search = self.search.clone().ok_or_else(|| {
                 AppError::unavailable("session search is not configured".to_owned())
             })?;
-            let execution = search.search(&self.pool, user_id, query).await?;
+            let execution = search.search(user_id, query).await?;
             let session_ids = execution.session_ids();
             self.run_db(move |connection| {
                 connection

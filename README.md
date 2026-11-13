@@ -213,8 +213,8 @@ at least the request's `new_from`; otherwise it is in the inherited context.
 
 `GET /v1/agent-usage/search?q=…` also takes `from`, `to`, `agent_name`,
 `llm_provider`, `llm_model`, `event_type`, `page` (from 1), and `page_size`
-(at most 50). Sessions are ordered by their session start time, newest
-first, matching the timestamp displayed on each result card. Each item carries `match_count`, its matching events,
+(at most 50). Sessions are ordered by their latest matching event, newest
+first. Each item carries `match_count`, its matching events,
 `new_match_count`, those with a new hit, and up to three `matches`: the events
 with a new hit, earliest first, then the earliest events whose hits are all
 inherited. A match says whether it is `new` and carries up to two `fragments`
@@ -233,8 +233,8 @@ most 100,000 hits are returned; `truncated` says whether more were left out.
 
 The PostgreSQL profile searches through Elasticsearch, requires every
 whitespace-separated term to match, counts every match as new, and does not
-support search within a session. Both profiles order sessions by their authoritative
-start time before pagination, with session ID and then session key ascending
+support search within a session. Both profiles order sessions by their latest
+matching event before pagination, with session ID and then session key ascending
 for equal times. PostgreSQL event previews retain relevance ordering.
 
 ## Configuration
