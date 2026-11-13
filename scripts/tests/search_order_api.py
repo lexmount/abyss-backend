@@ -16,7 +16,9 @@ import uuid
 
 
 def run(base, credential, *, cookie=False, run_id=None, output=None):
-    marker = "recencysorting" + (run_id or uuid.uuid4().hex)
+    suffix = run_id or uuid.uuid4().hex
+    marker = "recencysorting" + suffix
+    session_prefix = "sorting-" + suffix
     headers = {"Content-Type": "application/json"}
     headers["Cookie" if cookie else "Authorization"] = (
         "abyss_session=" + credential if cookie else "Bearer " + credential
@@ -35,7 +37,7 @@ def run(base, credential, *, cookie=False, run_id=None, output=None):
             "observed_at": stamp,
             "device": {"host_name": "sorting-review", "platform": "linux", "os_version": "test"},
             "agent": {"name": "codex", "version": "sorting-review"},
-            "session_id": marker + "-" + session,
+            "session_id": session_prefix + "-" + session,
             "response_id": marker + session + stamp,
             "event_type": "response",
             "llm": {"provider": provider, "model": "sorting-review"},
