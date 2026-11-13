@@ -101,17 +101,27 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::{BigInt, Binary, Integer, Nullable, Text};
+    use diesel::sql_types::{BigInt, Binary, Nullable, Text};
+
+    attachment_blobs (user_id, sha256) {
+        user_id -> Text,
+        sha256 -> Binary,
+        media_type -> Text,
+        byte_size -> BigInt,
+        content -> Nullable<Binary>,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::{BigInt, Binary, Integer, Text};
 
     llm_usage_event_attachments (id) {
         id -> Text,
         user_id -> Text,
         event_pk -> Text,
         position -> Integer,
-        media_type -> Text,
-        byte_size -> BigInt,
         sha256 -> Binary,
-        content -> Nullable<Binary>,
         created_at -> BigInt,
     }
 }
@@ -200,6 +210,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     agent_diagnostic_captures,
     agent_sessions,
     app_users,
+    attachment_blobs,
     devices,
     llm_usage_events,
     llm_usage_event_attachments,

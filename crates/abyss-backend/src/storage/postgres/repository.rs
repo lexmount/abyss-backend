@@ -11,8 +11,9 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use diesel::{
-    Connection, ExpressionMethods, IntoSql, NullableExpressionMethods, PgConnection, QueryDsl,
-    QueryableByName, RunQueryDsl, define_sql_function,
+    BoolExpressionMethods, Connection, ExpressionMethods, IntoSql, JoinOnDsl,
+    NullableExpressionMethods, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
+    define_sql_function,
     result::OptionalExtension,
     sql_query,
     sql_types::{
@@ -32,9 +33,9 @@ use crate::{
             StreamEventRow, UsageEvent, UsageEventAttachment,
         },
         schema::{
-            agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions, devices,
-            llm_usage_event_attachments, llm_usage_event_stream_facts, llm_usage_events,
-            search_outbox,
+            agent_diagnostic_capture_events, agent_diagnostic_captures, agent_sessions,
+            attachment_blobs, devices, llm_usage_event_attachments, llm_usage_event_stream_facts,
+            llm_usage_events, search_outbox,
         },
     },
     error::AppError,
@@ -452,36 +453,38 @@ pub fn image_attachment(
     user_id: Uuid,
     attachment_id: Uuid,
 ) -> Result<StoredImageAttachment, AppError> {
-    let attachment = llm_usage_event_attachments::table
+    let (media_type, byte_size, sha256, content) = llm_usage_event_attachments::table
+        .inner_join(
+            attachment_blobs::table.on(attachment_blobs::user_id
+                .eq(llm_usage_event_attachments::user_id)
+                .and(attachment_blobs::sha256.eq(llm_usage_event_attachments::sha256))),
+        )
         .filter(llm_usage_event_attachments::id.eq(attachment_id))
         .filter(llm_usage_event_attachments::user_id.eq(user_id))
-        .first::<UsageEventAttachment>(connection)
+        .select((
+            attachment_blobs::media_type,
+            attachment_blobs::byte_size,
+            attachment_blobs::sha256,
+            attachment_blobs::content,
+        ))
+        .first::<(String, i64, Vec<u8>, Option<Vec<u8>>)>(connection)
         .optional()?
         .ok_or_else(|| {
             AppError::not_found(format!("image attachment not found: {attachment_id}"))
         })?;
-    let content = attachment.content.ok_or_else(|| {
+    let content = content.ok_or_else(|| {
         AppError::not_found(format!(
             "image attachment content not found: {attachment_id}"
         ))
     })?;
-    if i64::try_from(content.len()).ok() != Some(attachment.byte_size) {
+    if i64::try_from(content.len()).ok() != Some(byte_size) {
         return Err(AppError::internal(format!(
             "stored image attachment byte size mismatch: {attachment_id}"
         )));
     }
-    let media_type = ImageMediaType::from_stored(&attachment.media_type)?;
-    // These columns are selected by the reusable Diesel row model but are not
-    // part of the download response. Touch them to keep dead-code linting useful
-    // without creating a second, nearly identical query model.
-    std::hint::black_box((
-        attachment.user_id,
-        attachment.event_pk,
-        attachment.created_at,
-    ));
     Ok(StoredImageAttachment {
-        media_type,
-        sha256: hex::encode(attachment.sha256),
+        media_type: ImageMediaType::from_stored(&media_type)?,
+        sha256: hex::encode(sha256),
         content,
     })
 }
@@ -909,6 +912,9 @@ fn insert_attachments(
     attachments: Vec<ValidatedImageAttachment>,
     now: DateTime<Utc>,
 ) -> Result<(), AppError> {
+    for attachment in &attachments {
+        store_blob(connection, user_id, attachment, now)?;
+    }
     let attachment_rows = attachments
         .into_iter()
         .map(|attachment| NewUsageEventAttachment {
@@ -916,15 +922,35 @@ fn insert_attachments(
             user_id,
             event_pk,
             position: attachment.position,
-            media_type: attachment.media_type.as_str().to_owned(),
-            byte_size: attachment.byte_size,
             sha256: attachment.sha256,
-            content: attachment.content,
             created_at: now,
         })
         .collect::<Vec<_>>();
     diesel::insert_into(llm_usage_event_attachments::table)
         .values(&attachment_rows)
+        .execute(connection)?;
+    Ok(())
+}
+
+/// Stores a user's image blob once per digest; an event carrying an image the
+/// user already stored only refers to it.
+fn store_blob(
+    connection: &mut PgConnection,
+    user_id: Uuid,
+    attachment: &ValidatedImageAttachment,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    diesel::insert_into(attachment_blobs::table)
+        .values((
+            attachment_blobs::user_id.eq(user_id),
+            attachment_blobs::sha256.eq(&attachment.sha256),
+            attachment_blobs::media_type.eq(attachment.media_type.as_str()),
+            attachment_blobs::byte_size.eq(attachment.byte_size),
+            attachment_blobs::content.eq(attachment.content.as_deref()),
+            attachment_blobs::created_at.eq(now),
+        ))
+        .on_conflict((attachment_blobs::user_id, attachment_blobs::sha256))
+        .do_nothing()
         .execute(connection)?;
     Ok(())
 }
@@ -1142,20 +1168,30 @@ fn load_attachments_for_events(
     }
 
     let attachments = llm_usage_event_attachments::table
+        .inner_join(
+            attachment_blobs::table.on(attachment_blobs::user_id
+                .eq(llm_usage_event_attachments::user_id)
+                .and(attachment_blobs::sha256.eq(llm_usage_event_attachments::sha256))),
+        )
         .filter(llm_usage_event_attachments::event_pk.eq_any(event_ids))
         .order((
             llm_usage_event_attachments::event_pk.asc(),
             llm_usage_event_attachments::position.asc(),
         ))
+        .select((
+            llm_usage_event_attachments::id,
+            llm_usage_event_attachments::event_pk,
+            llm_usage_event_attachments::position,
+            attachment_blobs::media_type,
+            attachment_blobs::byte_size,
+            attachment_blobs::sha256,
+            attachment_blobs::content.is_not_null(),
+        ))
         .load::<UsageEventAttachment>(connection)?;
     let mut by_event = HashMap::new();
     for attachment in attachments {
-        let event_pk = attachment.event_pk;
-        // The shared row model includes authorization/audit columns that are not
-        // repeated in each event response attachment object.
-        std::hint::black_box((attachment.user_id, attachment.created_at));
         by_event
-            .entry(event_pk)
+            .entry(attachment.event_pk)
             .or_insert_with(Vec::new)
             .push(UsageEventAttachmentResponse {
                 id: attachment.id,
@@ -1163,7 +1199,7 @@ fn load_attachments_for_events(
                 media_type: ImageMediaType::from_stored(&attachment.media_type)?,
                 byte_size: attachment.byte_size,
                 sha256: hex::encode(attachment.sha256),
-                content_available: attachment.content.is_some(),
+                content_available: attachment.content_available,
             });
     }
     Ok(by_event)

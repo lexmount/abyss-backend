@@ -1,6 +1,8 @@
 //! Self-contained SQLite source-of-truth with its search index written in
 //! the same transactions.
 
+#[cfg(test)]
+mod attachment_tests;
 mod comparison;
 mod connection;
 mod day_offsets;

@@ -81,6 +81,7 @@ expected = {
     "agent_sessions",
     "llm_usage_events",
     "llm_usage_event_attachments",
+    "attachment_blobs",
     "agent_diagnostic_captures",
     "agent_diagnostic_capture_events",
     "session_titles",
