@@ -109,6 +109,11 @@ class ElasticsearchHandler(BaseHTTPRequestHandler):
             for document in documents
             if matches_filters(document, filters) and matches_query(document, query_text)
         ]
+        # Apply the public sort contract before collapse and pagination.
+        for clause in reversed(request.get("sort", [])):
+            field, direction = next(iter(clause.items()))
+            field = field.removesuffix(".keyword")
+            matching.sort(key=lambda document: document[field], reverse=direction == "desc")
         grouped: dict[str, list[dict[str, Any]]] = {}
         for document in matching:
             grouped.setdefault(document["session_pk"], []).append(document)

@@ -221,7 +221,7 @@ impl ElasticsearchClient {
 pub struct SearchMatchPage {
     /// Approximate number of distinct matching sessions.
     pub total_sessions: u64,
-    /// Collapsed session hits in Elasticsearch relevance order.
+    /// Collapsed session hits ordered by their latest matching event, newest first.
     pub sessions: Vec<SessionMatches>,
 }
 
@@ -323,6 +323,13 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
         "size": query.page_size,
         "track_total_hits": false,
         "_source": ["session_pk"],
+        // Collapse selects each session's newest matching event before paging.
+        // Stable session ties match the standalone SQLite ordering.
+        "sort": [
+            {"observed_at": "desc"},
+            {"session_id.keyword": "asc"},
+            {"session_pk": "asc"}
+        ],
         "query": {
             "bool": {
                 "filter": filters,
@@ -632,6 +639,37 @@ mod tests {
                 .any(|filter| filter["terms"].get("llm_provider").is_some())
         );
         assert_eq!(request["collapse"]["field"], "session_pk");
+    }
+
+    #[test]
+    fn search_pages_are_ordered_by_latest_match_with_stable_session_ties() {
+        let query = ValidatedSearchQuery {
+            text: "timeout".to_owned(),
+            from: None,
+            to: None,
+            agent_names: Vec::new(),
+            llm_providers: Vec::new(),
+            llm_models: Vec::new(),
+            event_type: None,
+            page: 2,
+            page_size: 20,
+            offset: 20,
+        };
+        let request = search_request(Uuid::now_v7(), &query);
+
+        assert_eq!(
+            request["sort"],
+            json!([
+                {"observed_at": "desc"},
+                {"session_id.keyword": "asc"},
+                {"session_pk": "asc"}
+            ])
+        );
+        assert_eq!(request["collapse"]["field"], "session_pk");
+        assert_eq!(request["from"], 20);
+        assert_eq!(request["size"], 20);
+        // Relevance still selects the bounded event previews within a session.
+        assert!(request["collapse"]["inner_hits"].get("sort").is_none());
     }
 
     #[test]
