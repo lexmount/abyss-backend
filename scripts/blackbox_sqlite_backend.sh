@@ -139,4 +139,7 @@ if link_count != 2:
     raise SystemExit("diagnostic capture was not linked to both events")
 PY
 
+READING_TEST_URL="${BASE_URL}/v1/agent-usage" READING_TEST_TOKEN="${API_TOKEN}" \
+  python3 scripts/tests/reading_api.py
+
 echo "blackbox: standalone SQLite, HTTP, attachment, diagnostics, and search contracts passed"

@@ -65,6 +65,14 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(health))
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/read",
+            get(read_session),
+        )
+        .route(
+            "/v1/agent-usage/sessions/{session_pk}/directory",
+            get(session_directory),
+        )
         .route("/readyz", get(ready))
         .route(
             "/v1/agent-usage/events",
@@ -384,4 +392,34 @@ struct RootResponse {
 struct ServiceStatus {
     service: &'static str,
     status: &'static str,
+}
+
+async fn session_directory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+    Query(query): Query<crate::usage::reading::DirectoryQuery>,
+) -> Result<Json<crate::usage::reading::DirectoryPage>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state
+            .storage
+            .session_directory(user_id, session_pk, query)
+            .await?,
+    ))
+}
+
+async fn read_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_pk): Path<Uuid>,
+    Query(query): Query<crate::usage::reading::ReadQuery>,
+) -> Result<Json<crate::usage::reading::ReadPage>, AppError> {
+    let user_id = state.identity.authenticate(&headers)?;
+    Ok(Json(
+        state
+            .storage
+            .read_session(user_id, session_pk, query)
+            .await?,
+    ))
 }

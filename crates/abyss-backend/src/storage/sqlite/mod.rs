@@ -6,6 +6,7 @@ mod connection;
 mod day_offsets;
 mod migrations;
 mod models;
+mod reading;
 mod repository;
 mod schema;
 mod search;
@@ -74,6 +75,32 @@ impl SqliteFtsBackend {
 }
 
 impl StorageBackend for SqliteFtsBackend {
+    fn session_directory(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: crate::usage::reading::DirectoryQuery,
+    ) -> BoxedFuture<'_, Result<crate::usage::reading::DirectoryPage, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                reading::directory(connection, user_id, session_pk, &query)
+            })
+            .await
+        })
+    }
+
+    fn read_session(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: crate::usage::reading::ReadQuery,
+    ) -> BoxedFuture<'_, Result<crate::usage::reading::ReadPage, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| reading::read(connection, user_id, session_pk, &query))
+                .await
+        })
+    }
+
     fn ready(&self) -> BoxedFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
             self.run_db(|connection| {

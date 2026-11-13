@@ -16,6 +16,7 @@ mod event;
 pub mod persistence;
 /// Previews of an event's conversation entries.
 pub mod preview;
+pub mod reading;
 /// One segment's exchanges for the session page.
 pub mod segments;
 /// The header of the session page.

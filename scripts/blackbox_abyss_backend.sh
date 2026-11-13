@@ -169,4 +169,7 @@ CAPTURE_COUNT="$(query_database "SELECT count(*) FROM agent_diagnostic_captures 
 CAPTURE_LINK_COUNT="$(query_database "SELECT count(*) FROM agent_diagnostic_capture_events links JOIN agent_diagnostic_captures captures ON captures.id = links.capture_pk WHERE captures.capture_id = 'capture-${RUN_ID}';")"
 [[ "${CAPTURE_LINK_COUNT}" == "2" ]] || fail "diagnostic capture was not linked to both events"
 
+READING_TEST_URL="${BASE_URL}/v1/agent-usage" READING_TEST_TOKEN="${API_TOKEN}" \
+  python3 scripts/tests/reading_api.py
+
 echo "blackbox: standalone PostgreSQL, HTTP, attachment, diagnostics, and search contracts passed"

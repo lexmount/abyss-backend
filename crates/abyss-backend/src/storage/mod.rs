@@ -40,6 +40,22 @@ pub type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Complete object-safe event-store contract consumed by the HTTP layer.
 pub trait StorageBackend: Send + Sync {
+    /// Reads an owner-scoped, revision-checked page of recorded session history.
+    fn session_directory(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: crate::usage::reading::DirectoryQuery,
+    ) -> BoxedFuture<'_, Result<crate::usage::reading::DirectoryPage, AppError>>;
+
+    /// Reads an owner-scoped, revision-checked page of recorded session history.
+    fn read_session(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: crate::usage::reading::ReadQuery,
+    ) -> BoxedFuture<'_, Result<crate::usage::reading::ReadPage, AppError>>;
+
     /// Verifies that the authoritative database can serve requests.
     fn ready(&self) -> BoxedFuture<'_, Result<(), AppError>>;
 

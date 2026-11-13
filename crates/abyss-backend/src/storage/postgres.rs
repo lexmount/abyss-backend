@@ -1,6 +1,7 @@
 //! PostgreSQL source-of-truth and Elasticsearch projection implementation.
 
 mod comparison;
+mod reading;
 mod repository;
 mod search;
 mod session_list;
@@ -97,6 +98,32 @@ impl PostgresEsBackend {
 }
 
 impl StorageBackend for PostgresEsBackend {
+    fn session_directory(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: crate::usage::reading::DirectoryQuery,
+    ) -> BoxedFuture<'_, Result<crate::usage::reading::DirectoryPage, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| {
+                reading::directory(connection, user_id, session_pk, &query)
+            })
+            .await
+        })
+    }
+
+    fn read_session(
+        &self,
+        user_id: Uuid,
+        session_pk: Uuid,
+        query: crate::usage::reading::ReadQuery,
+    ) -> BoxedFuture<'_, Result<crate::usage::reading::ReadPage, AppError>> {
+        Box::pin(async move {
+            self.run_db(move |connection| reading::read(connection, user_id, session_pk, &query))
+                .await
+        })
+    }
+
     fn ready(&self) -> BoxedFuture<'_, Result<(), AppError>> {
         Box::pin(async move { self.run_db(db::check_ready).await })
     }

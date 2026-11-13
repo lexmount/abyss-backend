@@ -406,3 +406,25 @@ The PostgreSQL case starts an ephemeral container and an Elasticsearch contract
 double; the SQLite case uses only a temporary local database file. Both verify
 schema creation, authentication, event ingestion, attachment retrieval, raw
 diagnostic retention, summary, streams, and search behavior.
+
+### Resumable recorded-session reads
+
+`GET /v1/agent-usage/sessions/{session_pk}/directory` returns owner-scoped event
+identities in observation order. Use `offset` and `limit` (1–100); carry the
+returned `revision` into later pages. The absolute event index is the directory
+page offset plus its position in the page.
+
+`GET /v1/agent-usage/sessions/{session_pk}/read` accepts `event_index` for a
+targeted first read or `cursor` for continuation, optional `revision`, and
+`max_bytes` (4–32768, default 32768). Concatenate `content_json` chunks for each
+event, checking byte offsets and `content_sha256`, before parsing the recorded
+JSON. Persist each chunk and its `next_cursor` together to resume after an
+interruption. `session_complete` marks the end of stored scope; it does not
+assert complete network capture. The `capture` object reports absent
+conversations, collector completeness, omissions and attachment references.
+
+Late ingestion invalidates the directory revision and requires restarting the
+traversal. Changes to an event representation invalidate its continuation. These
+are live, revision-checked reads, not durable snapshots. Both SQLite and
+PostgreSQL implement the same contract. Product MCP remains in `abyss-services`.
+See the [technical design](docs/product-mcp.md).
