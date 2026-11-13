@@ -29,7 +29,7 @@ IDs. Both local review stacks, formatting, both Clippy profiles, workspace tests
 and existing black-box suites must pass. The services PR owns MCP authentication
 and protocol validation. These changes have no merge-order dependency.
 
-The persistent HTML report and companion PR will be linked after validation.
+The persistent HTML report and companion PR are linked below.
 
 ## Review evidence
 
@@ -40,3 +40,5 @@ URL is `http://127.0.0.1:25221`; product login is
 `http://127.0.0.1:25222/review/login`.
 The [companion product design](https://github.com/lexmount/abyss-services/blob/task/product-mcp/docs/product-mcp.md)
 describes the shared MCP transport and Identity boundary.
+
+Companion implementation: [abyss-services PR](https://github.com/lexmount/abyss-services/pull/27).
