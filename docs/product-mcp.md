@@ -43,6 +43,12 @@ describes the shared MCP transport and Identity boundary.
 
 Companion implementation: [abyss-services PR](https://github.com/lexmount/abyss-services/pull/27).
 
+The product companion now also implements browser-based MCP OAuth authorization
+in Identity and Agent Data. Standalone keeps its configured deployment bearer
+token and the same recorded-session read contract; it does not acquire product
+SSO, OAuth grant storage or an MCP transport. See the
+[OAuth design](https://github.com/lexmount/abyss-services/blob/task/product-mcp/docs/product-mcp-oauth.md).
+
 Validation uses Rust 1.100, matching CI. Equivalent optional-value defaults and
 unused dependency declarations were cleaned up for its stricter checks while
 retaining compatibility with the existing Rust 1.98 build.
