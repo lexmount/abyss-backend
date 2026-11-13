@@ -666,8 +666,8 @@ mod tests {
             ])
         );
         assert_eq!(request["collapse"]["field"], "session_pk");
-        assert_eq!(request["from"], 20);
-        assert_eq!(request["size"], 20);
+        assert_eq!(request["from"], 20_u32);
+        assert_eq!(request["size"], 20_u32);
         // Relevance still selects the bounded event previews within a session.
         assert!(request["collapse"]["inner_hits"].get("sort").is_none());
     }
