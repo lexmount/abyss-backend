@@ -233,7 +233,9 @@ most 100,000 hits are returned; `truncated` says whether more were left out.
 
 The PostgreSQL profile searches through Elasticsearch, requires every
 whitespace-separated term to match, counts every match as new, and does not
-support search within a session.
+support search within a session. Both profiles order sessions by their latest
+matching event before pagination, with session ID and then session key ascending
+for equal times. PostgreSQL event previews retain relevance ordering.
 
 ## Configuration
 

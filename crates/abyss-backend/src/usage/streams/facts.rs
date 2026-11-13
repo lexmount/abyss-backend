@@ -68,8 +68,7 @@ impl Entry {
 /// decoded.
 fn conversation_entries(conversation: Option<&Value>) -> Vec<Entry> {
     Conversation::read(conversation)
-        .map(|conversation| conversation.entries)
-        .unwrap_or_default()
+        .map_or_else(Default::default, |conversation| conversation.entries)
 }
 
 /// One skeleton entry: an entry's role and key, its call id, else its

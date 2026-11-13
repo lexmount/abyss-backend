@@ -66,8 +66,7 @@ pub fn session_header(
     let event_count = events.len();
     let session_id = events
         .first()
-        .map(|event| event.session_id.clone())
-        .unwrap_or_default();
+        .map_or_else(Default::default, |event| event.session_id.clone());
     let mut agents = BTreeSet::new();
     let mut providers = BTreeSet::new();
     let mut models = BTreeSet::new();
