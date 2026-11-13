@@ -173,3 +173,8 @@ READING_TEST_URL="${BASE_URL}/v1/agent-usage" READING_TEST_TOKEN="${API_TOKEN}" 
   python3 scripts/tests/reading_api.py
 
 echo "blackbox: standalone PostgreSQL, HTTP, attachment, diagnostics, and search contracts passed"
+
+printf '%s' "${API_TOKEN}" >"${TEMP_DIR}/search-order.token"
+python3 scripts/tests/search_order_api.py \
+  --base-url "${BASE_URL}/v1/agent-usage" \
+  --credential-file "${TEMP_DIR}/search-order.token"
