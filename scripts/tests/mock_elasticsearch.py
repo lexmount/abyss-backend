@@ -118,6 +118,18 @@ class ElasticsearchHandler(BaseHTTPRequestHandler):
         for document in matching:
             grouped.setdefault(document["session_pk"], []).append(document)
 
+        composite = request.get("aggs", {}).get("sessions", {}).get("composite")
+        if composite is not None:
+            keys = sorted(grouped)
+            after = composite.get("after", {}).get("session_pk")
+            keys = [key for key in keys if after is None or key > after]
+            keys = keys[:composite["size"]]
+            page = {"buckets": [{"key": {"session_pk": key}, "doc_count": len(grouped[key])} for key in keys]}
+            if keys:
+                page["after_key"] = {"session_pk": keys[-1]}
+            self._json_response(200, {"aggregations": {"sessions": page}, "hits": {"hits": []}})
+            return
+
         start = int(request.get("from", 0))
         size = int(request.get("size", 20))
         selected = list(grouped.items())[start : start + size]

@@ -181,18 +181,65 @@ impl ElasticsearchClient {
             .collect())
     }
 
-    /// Executes an owner-scoped, session-collapsed full-text query.
+    /// Enumerates matching session keys; PostgreSQL owns their start-time order.
+    pub async fn matching_session_ids(
+        &self,
+        user_id: Uuid,
+        query: &ValidatedSearchQuery,
+    ) -> Result<Vec<Uuid>, SearchClientError> {
+        let mut session_ids = Vec::new();
+        let mut after = None;
+        loop {
+            let response = self
+                .request(
+                    Method::POST,
+                    self.endpoint_url(&format!("{SEARCH_INDEX}/_search")),
+                )
+                .json(&session_keys_request(user_id, query, after))
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(response_error("enumerate matching sessions", response).await);
+            }
+            let response = response.json::<SessionKeysResponse>().await?;
+            let page = response.aggregations.sessions;
+            if page.buckets.is_empty() {
+                break;
+            }
+            session_ids.extend(page.buckets.into_iter().map(|bucket| bucket.key.session_pk));
+            let next = page.after_key.map(|key| key.session_pk);
+            if next.is_none() {
+                break;
+            }
+            if next == after {
+                return Err(SearchClientError::Protocol(
+                    "session cursor did not advance".to_owned(),
+                ));
+            }
+            after = next;
+        }
+        Ok(session_ids)
+    }
+
+    /// Fetches previews only for a page already selected by PostgreSQL.
     pub async fn search(
         &self,
         user_id: Uuid,
         query: &ValidatedSearchQuery,
+        session_ids: &[Uuid],
     ) -> Result<SearchMatchPage, SearchClientError> {
+        if session_ids.is_empty() {
+            return Ok(SearchMatchPage {
+                total_sessions: 0,
+                sessions: Vec::new(),
+            });
+        }
         let response = self
             .request(
                 Method::POST,
                 self.endpoint_url(&format!("{SEARCH_INDEX}/_search")),
             )
-            .json(&search_request(user_id, query))
+            .json(&selected_sessions_request(user_id, query, session_ids))
             .send()
             .await?;
         if !response.status().is_success() {
@@ -221,7 +268,7 @@ impl ElasticsearchClient {
 pub struct SearchMatchPage {
     /// Approximate number of distinct matching sessions.
     pub total_sessions: u64,
-    /// Collapsed session hits ordered by their latest matching event, newest first.
+    /// Collapsed session previews; the caller applies authoritative session order.
     pub sessions: Vec<SessionMatches>,
 }
 
@@ -299,6 +346,65 @@ fn index_definition() -> Value {
     })
 }
 
+/// Only session keys cross the full-match scan; previews stay page-bounded.
+fn session_keys_request(user_id: Uuid, query: &ValidatedSearchQuery, after: Option<Uuid>) -> Value {
+    let mut request = json!({
+        "size": 0_u32,
+        "track_total_hits": false,
+        "query": search_request(user_id, query)["query"],
+        "aggs": {"sessions": {"composite": {
+            "size": 1000_u32,
+            "sources": [{"session_pk": {"terms": {"field": "session_pk"}}}]
+        }}}
+    });
+    if let Some(after) = after {
+        request["aggs"]["sessions"]["composite"]["after"] = json!({"session_pk": after});
+    }
+    request
+}
+
+fn selected_sessions_request(
+    user_id: Uuid,
+    query: &ValidatedSearchQuery,
+    session_ids: &[Uuid],
+) -> Value {
+    let mut request = search_request(user_id, query);
+    // The SQL page has already consumed the offset. Apply all event filters again.
+    request["from"] = json!(0_u32);
+    request["size"] = json!(session_ids.len());
+    request["query"]["bool"]["filter"]
+        .as_array_mut()
+        .expect("filter array")
+        .push(json!({"terms": {"session_pk": session_ids}}));
+    request
+}
+
+#[derive(Deserialize)]
+struct SessionKeysResponse {
+    aggregations: SessionKeysAggregations,
+}
+
+#[derive(Deserialize)]
+struct SessionKeysAggregations {
+    sessions: SessionKeysPage,
+}
+
+#[derive(Deserialize)]
+struct SessionKeysPage {
+    buckets: Vec<SessionKeyBucket>,
+    after_key: Option<SessionKey>,
+}
+
+#[derive(Deserialize)]
+struct SessionKeyBucket {
+    key: SessionKey,
+}
+
+#[derive(Deserialize)]
+struct SessionKey {
+    session_pk: Uuid,
+}
+
 fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
     // Authorization is encoded as a mandatory filter rather than a scoring
     // clause, guaranteeing that foreign documents cannot enter the hit set.
@@ -323,13 +429,6 @@ fn search_request(user_id: Uuid, query: &ValidatedSearchQuery) -> Value {
         "size": query.page_size,
         "track_total_hits": false,
         "_source": ["session_pk"],
-        // Collapse selects each session's newest matching event before paging.
-        // Stable session ties match the standalone SQLite ordering.
-        "sort": [
-            {"observed_at": "desc"},
-            {"session_id.keyword": "asc"},
-            {"session_pk": "asc"}
-        ],
         "query": {
             "bool": {
                 "filter": filters,
@@ -642,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn search_pages_are_ordered_by_latest_match_with_stable_session_ties() {
+    fn search_previews_keep_the_sql_page_and_aggregation_preserves_filters() {
         let query = ValidatedSearchQuery {
             text: "timeout".to_owned(),
             from: None,
@@ -655,19 +754,28 @@ mod tests {
             page_size: 20,
             offset: 20,
         };
-        let request = search_request(Uuid::now_v7(), &query);
-
-        assert_eq!(
-            request["sort"],
-            json!([
-                {"observed_at": "desc"},
-                {"session_id.keyword": "asc"},
-                {"session_pk": "asc"}
-            ])
-        );
+        let user_id = Uuid::now_v7();
+        let session_pk = Uuid::now_v7();
+        let request = super::selected_sessions_request(user_id, &query, &[session_pk]);
         assert_eq!(request["collapse"]["field"], "session_pk");
-        assert_eq!(request["from"], 20_u32);
-        assert_eq!(request["size"], 20_u32);
+        assert_eq!(request["from"], 0_u32);
+        assert_eq!(request["size"], 1_u32);
+        let filters = request["query"]["bool"]["filter"].as_array().unwrap();
+        assert!(filters.contains(&json!({"term": {"user_id": user_id}})));
+        assert!(filters.contains(&json!({"terms": {"session_pk": [session_pk]}})));
+        let first = super::session_keys_request(user_id, &query, None);
+        let next = super::session_keys_request(user_id, &query, Some(session_pk));
+        assert_eq!(first["size"], 0_u32);
+        assert_eq!(first["query"], search_request(user_id, &query)["query"]);
+        assert!(
+            first["aggs"]["sessions"]["composite"]
+                .get("after")
+                .is_none()
+        );
+        assert_eq!(
+            next["aggs"]["sessions"]["composite"]["after"],
+            json!({"session_pk": session_pk})
+        );
         // Relevance still selects the bounded event previews within a session.
         assert!(request["collapse"]["inner_hits"].get("sort").is_none());
     }

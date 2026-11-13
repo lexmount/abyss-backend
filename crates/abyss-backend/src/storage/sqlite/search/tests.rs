@@ -441,14 +441,15 @@ fn session_search_returns_the_naive_greps_hit_events() {
             }
         }
         let mut order = expected
-            .iter()
-            .map(|(session, (hit_events, _))| {
-                let latest = hit_events
+            .keys()
+            .map(|session| {
+                let start = events
                     .iter()
-                    .map(|pk| times[pk])
-                    .max()
-                    .expect("a session has hits");
-                (std::cmp::Reverse(latest), session.clone())
+                    .filter(|event| &event.session_id == session)
+                    .map(|event| event.observed_at)
+                    .min()
+                    .expect("a session has events");
+                (std::cmp::Reverse(start), session.clone())
             })
             .collect::<Vec<_>>();
         order.sort();
@@ -475,7 +476,7 @@ fn session_search_returns_the_naive_greps_hit_events() {
                 .iter()
                 .map(|(_, session)| session.clone())
                 .collect::<Vec<_>>(),
-            "sessions order by their latest hit event for {query:?}"
+            "sessions order by their authoritative start time for {query:?}"
         );
         for item in &found {
             let (hit_events, new_events) = &expected[&item.session_id];
