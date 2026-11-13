@@ -42,3 +42,7 @@ The [companion product design](https://github.com/lexmount/abyss-services/blob/t
 describes the shared MCP transport and Identity boundary.
 
 Companion implementation: [abyss-services PR](https://github.com/lexmount/abyss-services/pull/27).
+
+Validation uses Rust 1.100, matching CI. Equivalent optional-value defaults and
+unused dependency declarations were cleaned up for its stricter checks while
+retaining compatibility with the existing Rust 1.98 build.

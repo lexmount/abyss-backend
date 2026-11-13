@@ -30,8 +30,7 @@ impl SearchProjection {
         let entries = conversation
             .and_then(|conversation| conversation.get("entries"))
             .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .map_or_else(Default::default, Vec::as_slice);
         let mut tool_names = Vec::new();
         let mut texts = Vec::new();
         for entry in entries {
