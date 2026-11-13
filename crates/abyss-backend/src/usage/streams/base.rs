@@ -294,8 +294,9 @@ fn continued(
     let output = exchanges[emitter]
         .response
         .as_ref()
-        .map(|response| response.facts.output_skeleton.as_slice())
-        .unwrap_or_default();
+        .map_or_else(Default::default, |response| {
+            response.facts.output_skeleton.as_slice()
+        });
     if said_after(output, last, trailing) {
         Ok((emitter, BaseRule::LastOutput))
     } else {

@@ -21,3 +21,7 @@ Unit coverage checks the Elasticsearch sort, collapse, and offset contract. A re
 The persistent HTML report is `artifacts/fix-search-sorting/test-report.html` in the coordinator workspace. It records tested revisions, commands, results, review URLs, and supporting logs. See the companion designs: [abyss-services](https://github.com/lexmount/abyss-services/blob/task/fix-search-sorting/docs/fix-search-sorting.md), [abyss-dashboard](https://github.com/lexmount/abyss-dashboard/blob/task/fix-search-sorting/docs/fix-search-sorting.md), [abyss-frontend](https://github.com/lexmount/abyss-frontend/blob/task/fix-search-sorting/docs/fix-search-sorting.md).
 
 Elasticsearch's [collapse contract](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/collapse-search-results) selects the top sorted document per collapse key.
+
+## CI toolchain compatibility
+
+Rust 1.100 in CI newly flags existing `Option::map(...).unwrap_or_default()` expressions. The affected projections and session reconstruction helpers now use equivalent `map_or_else(Default::default, ...)` expressions, which also compile with the locally supported Rust 1.98 toolchain. These changes preserve empty defaults and successful values; full unit and storage black-box suites cover the touched paths.

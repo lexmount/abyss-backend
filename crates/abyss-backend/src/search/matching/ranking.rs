@@ -199,8 +199,7 @@ pub fn rank_sessions(hits: Vec<SearchHit>, offset: usize, page_size: usize) -> R
             let latest = events.iter().map(|(_, event)| event.observed_at).max();
             let session_id = events
                 .first()
-                .map(|(_, event)| event.session_id.clone())
-                .unwrap_or_default();
+                .map_or_else(Default::default, |(_, event)| event.session_id.clone());
             ((latest, session_id, session_pk), events)
         })
         .collect::<Vec<_>>();
@@ -400,8 +399,7 @@ mod tests {
                 sessions
                     .iter()
                     .find(|session| pk(session) == *session_pk)
-                    .map(|session| (*session).to_owned())
-                    .unwrap_or_default()
+                    .map_or_else(Default::default, |session| (*session).to_owned())
             })
             .collect()
     }
