@@ -71,3 +71,5 @@ Companion: [product CLS design](https://github.com/lexmount/abyss-services/blob/
 The product owns regional collection manifests and the tccli rollout runbook.
 The PRs can merge independently; standalone users are not required to configure
 CLS. No dashboard changes or package release dependency is introduced.
+
+Companion implementation: [abyss-services PR](https://github.com/lexmount/abyss-services/pull/28).
