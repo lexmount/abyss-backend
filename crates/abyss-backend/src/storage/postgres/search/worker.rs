@@ -92,14 +92,20 @@ impl SearchIndexerWorker {
         // Historical rows are queued incrementally so enabling search on an
         // existing installation does not require a separate migration job.
         if !*backfill_complete && let Err(error) = self.advance_backfill(backfill_complete).await {
-            tracing::error!(%error, "queue session search backfill batch");
+            tracing::error!(
+                error_kind = error.log_kind(),
+                "queue session search backfill batch"
+            );
             return PollSchedule::AfterInterval;
         }
 
         let tasks = match self.claim_tasks().await {
             Ok(tasks) => tasks,
             Err(error) => {
-                tracing::error!(%error, "claim session search outbox tasks");
+                tracing::error!(
+                    error_kind = error.log_kind(),
+                    "claim session search outbox tasks"
+                );
                 return PollSchedule::AfterInterval;
             }
         };
@@ -120,7 +126,10 @@ impl SearchIndexerWorker {
             return true;
         }
         if let Err(error) = self.client.ensure_index().await {
-            tracing::warn!(%error, "session search index is unavailable");
+            tracing::warn!(
+                error_kind = error.log_kind(),
+                "session search index is unavailable"
+            );
             return false;
         }
         *ready = true;
@@ -167,7 +176,10 @@ impl SearchIndexerWorker {
             })
             .collect();
         if let Err(error) = self.record_results(results).await {
-            tracing::error!(%error, "record session search outbox results");
+            tracing::error!(
+                error_kind = error.log_kind(),
+                "record session search outbox results"
+            );
         }
         task_count
     }

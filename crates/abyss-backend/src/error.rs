@@ -42,6 +42,21 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// Stable diagnostic category that cannot contain request data or secrets.
+    pub const fn log_kind(&self) -> &'static str {
+        match self {
+            Self::Config(..) => "config",
+            Self::Database(..) => "database",
+            Self::Pool(..) => "pool",
+            Self::NotFound(..) => "notfound",
+            Self::Unauthorized(..) => "unauthorized",
+            #[cfg(feature = "postgres-es")]
+            Self::Unavailable(..) => "unavailable",
+            Self::Validation(..) => "validation",
+            Self::Internal(..) => "internal",
+        }
+    }
+
     /// Constructs a configuration error.
     pub const fn config(message: String) -> Self {
         Self::Config(message)
@@ -93,11 +108,11 @@ impl IntoResponse for AppError {
         let status = self.status_code();
         let error = match &self {
             Self::Config(_) | Self::Pool(_) | Self::Internal(_) => {
-                tracing::error!(error = %self, "internal error");
+                tracing::error!(error_kind = self.log_kind(), "internal error");
                 "internal server error".to_owned()
             }
             Self::Database(_) => {
-                tracing::error!(error = %self, "internal error");
+                tracing::error!(error_kind = self.log_kind(), "internal error");
                 "internal server error".to_owned()
             }
             Self::NotFound(_) | Self::Unauthorized(_) | Self::Validation(_) => self.to_string(),

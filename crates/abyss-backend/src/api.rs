@@ -16,7 +16,6 @@ use axum::{
 // axum's own Query cannot collect repeated keys.
 use axum_extra::extract::Query;
 use serde::Serialize;
-use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::{
@@ -109,7 +108,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/agent-usage/events/{event_pk}/conversation",
             get(event_conversation),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(crate::telemetry::log_request))
         .with_state(state)
 }
 

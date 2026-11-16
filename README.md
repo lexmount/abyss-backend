@@ -408,3 +408,11 @@ The PostgreSQL case starts an ephemeral container and an Elasticsearch contract
 double; the SQLite case uses only a temporary local database file. Both verify
 schema creation, authentication, event ingestion, attachment retrieval, raw
 diagnostic retention, summary, streams, and search behavior.
+
+## Structured operational logs
+
+Set `ABYSS_LOG_FORMAT=json` to emit JSON to stdout for a node collector such as
+Tencent Cloud CLS. The default remains text; existing log-level controls and
+`RUST_LOG` still apply. HTTP responses include a generated `x-request-id`, also
+recorded with the route template, status and duration. Successful probes are
+suppressed. See [the design](docs/cls-logging.md) for fields and limitations.

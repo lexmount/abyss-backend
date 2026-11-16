@@ -18,6 +18,7 @@ mod error;
 mod identity;
 mod search;
 mod storage;
+mod telemetry;
 mod usage;
 
 #[cfg(all(feature = "postgres-es", feature = "sqlite-fts"))]
@@ -30,13 +31,12 @@ use std::error::Error;
 
 use config::Config;
 use identity::IdentityAuthenticator;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config = Config::from_env()?;
     validate_runtime_config(&config)?;
-    init_tracing(&config);
+    telemetry::init("abyss-backend", &config.environment, &config.log_level)?;
 
     let storage = storage::build(&config)?;
 
@@ -78,14 +78,6 @@ fn validate_runtime_config(config: &Config) -> Result<(), error::AppError> {
         ));
     }
     Ok(())
-}
-
-fn init_tracing(config: &Config) {
-    // RUST_LOG takes precedence for standard operational overrides. The
-    // configured level is only the fallback when no valid filter is supplied.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(config.log_level.clone()));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 async fn shutdown_signal() {

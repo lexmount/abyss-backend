@@ -60,7 +60,10 @@ impl SearchService {
     ) -> Result<SearchExecution, AppError> {
         let query = query.validate()?;
         let page = self.client.search(user_id, &query).await.map_err(|error| {
-            tracing::warn!(%error, %user_id, "session search request failed");
+            tracing::warn!(
+                error_kind = error.log_kind(),
+                "session search request failed"
+            );
             AppError::unavailable("session search is temporarily unavailable".to_owned())
         })?;
         Ok(SearchExecution { query, page })

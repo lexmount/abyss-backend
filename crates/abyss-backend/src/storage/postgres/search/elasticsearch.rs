@@ -275,6 +275,18 @@ pub enum SearchClientError {
     Protocol(String),
 }
 
+impl SearchClientError {
+    /// Diagnostic category without remote response bodies or request URLs.
+    pub const fn log_kind(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "elasticsearch_transport",
+            Self::Serialization(_) => "elasticsearch_serialization",
+            Self::Response { .. } => "elasticsearch_response",
+            Self::Protocol(_) => "elasticsearch_protocol",
+        }
+    }
+}
+
 fn index_definition() -> Value {
     // Strict dynamic mapping rejects accidental expansion when a projection
     // field is added without an intentional mapping and review.
