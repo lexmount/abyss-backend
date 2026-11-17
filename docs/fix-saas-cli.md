@@ -16,4 +16,14 @@ No event schema, storage migration, authentication protocol, TLS policy or relea
 
 ## Validation
 
-Run the repository-required unit, black-box and quality checks. Reproduce Bash command hashing and validate the shipped Linux CLI against its actual policy. Render the updated guide, deploy both local stacks, seed identifiable CLI scenarios, and record exact source revisions and outcomes in the persistent HTML report at `task-artifacts/fix-saas-cli/test-report.html` in the coordinator workspace. Final PR and evidence links will be recorded before handoff.
+Run the repository-required unit, black-box and quality checks. Reproduce Bash command hashing and validate the shipped Linux CLI against its actual policy. Render the updated guide, deploy both local stacks, seed identifiable CLI scenarios, and record exact source revisions and outcomes in the persistent HTML report at `task-artifacts/fix-saas-cli/test-report.html` in the coordinator workspace.
+
+## Review links
+
+- [abyss-services PR](https://github.com/lexmount/abyss-services/pull/30) and [design](https://github.com/lexmount/abyss-services/blob/task/fix-saas-cli/docs/fix-saas-cli.md).
+- [AbyssApp PR](https://github.com/lexmount/AbyssApp/pull/90) and [design](https://github.com/lexmount/AbyssApp/blob/task/fix-saas-cli/docs/fix-saas-cli.md).
+- [abyss-frontend PR](https://github.com/lexmount/abyss-frontend/pull/86) and [design](https://github.com/lexmount/abyss-frontend/blob/task/fix-saas-cli/docs/fix-saas-cli.md).
+- [abyss-backend PR](https://github.com/lexmount/abyss-backend/pull/22) and [design](https://github.com/lexmount/abyss-backend/blob/task/fix-saas-cli/docs/fix-saas-cli.md).
+- [abyss-dashboard PR](https://github.com/lexmount/abyss-dashboard/pull/23) and [design](https://github.com/lexmount/abyss-dashboard/blob/task/fix-saas-cli/docs/fix-saas-cli.md).
+
+The [HTML evidence report](http://127.0.0.1:16209/test-report.html), [standalone review](http://127.0.0.1:16201/), and [product review](http://127.0.0.1:16202/review/login) are local to the review host. The report includes immutable task artifacts, exact commands and source revisions.
