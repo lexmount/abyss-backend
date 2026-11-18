@@ -13,9 +13,10 @@ using completed GitHub Actions logs. This document records the corresponding
 standalone assessment at baseline
 `6c516820b50cd774dc556dce8e987567a96d89a2`.
 
-The requested deliverable is an investigation and optimization plan. Neither
-repository changes runtime code, image workflows, registries, APIs, stored data,
-or production deployments in this task.
+The task delivers the investigation and removes ARM64 from product service and
+frontend image publishing after the user confirmed AMD64-only Kubernetes
+clusters. This repository keeps its image workflow and runtime unchanged. No
+repository changes APIs, stored data, or production deployments in this task.
 
 ## Ownership and compatibility
 
@@ -43,9 +44,9 @@ it must not point standalone deployments at product service images or add
 product Identity dependencies to the generic backend.
 
 The coordination requirement is satisfied by reviewing the actual workflow and
-recording this boundary decision. The companion PR can merge independently;
+recording this boundary decision. The companion PRs can merge independently;
 there is no artifact version bump, migration, or integration ordering between
-these documentation changes. The persistent Chinese HTML report under
+these changes. The persistent Chinese HTML report under
 `artifacts/optimize-services-deploy/` in the coordinator workspace records actual
 validation and any outstanding protocol checks. Historical product publication
-logs establish diagnosis only, not an implemented speedup.
+logs establish diagnosis only, not a measured speedup for the new AMD64-only workflows.
