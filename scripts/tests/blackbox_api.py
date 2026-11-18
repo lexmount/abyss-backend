@@ -149,6 +149,17 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     )
     require_status(wrong_token, 401, "incorrect bearer token")
 
+    # The dashboard strips /api at its proxy. Neither spelling may expose
+    # enterprise credentials to a standalone deployment's single owner.
+    for prefix in ("/api/v1/ai-accounts", "/v1/ai-accounts"):
+        for method, suffix in (
+            ("GET", "/me/harnesses/codex"),
+            ("PUT", f"/employees/{OWNER_ID}/harnesses/codex"),
+            ("DELETE", f"/employees/{OWNER_ID}/harnesses/codex"),
+        ):
+            response = request(base_url, method, prefix + suffix, token=token)
+            require_status(response, 404, "enterprise account route on standalone")
+
     ingest_payload = {
         "events": [
             event(
