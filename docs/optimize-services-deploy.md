@@ -50,3 +50,9 @@ these changes. The persistent Chinese HTML report under
 `artifacts/optimize-services-deploy/` in the coordinator workspace records actual
 validation and any outstanding protocol checks. Historical product publication
 logs establish diagnosis only, not a measured speedup for the new AMD64-only workflows.
+
+## Coordinated PR set
+
+- [abyss-services #33](https://github.com/lexmount/abyss-services/pull/33) and [design](https://github.com/lexmount/abyss-services/blob/task/optimize-services-deploy/docs/optimize-services-deploy.md).
+- [abyss-frontend #88](https://github.com/lexmount/abyss-frontend/pull/88) and [design](https://github.com/lexmount/abyss-frontend/blob/task/optimize-services-deploy/docs/optimize-services-deploy.md).
+- [abyss-dashboard #25](https://github.com/lexmount/abyss-dashboard/pull/25) and [design](https://github.com/lexmount/abyss-dashboard/blob/task/optimize-services-deploy/docs/optimize-services-deploy.md).
