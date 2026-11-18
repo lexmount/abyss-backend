@@ -7,7 +7,7 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -246,7 +246,7 @@ pub struct MatchedEvent {
     /// Provider-specific model identifier.
     pub llm_model: String,
     /// Collector observation time.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Ordered raw fragments containing backend sentinel markers.
     pub fragments: Vec<String>,
 }
@@ -542,7 +542,7 @@ struct RawMatchedSource {
     event_type: String,
     llm_provider: String,
     llm_model: String,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 }
 
 impl TryFrom<RawSearchResponse> for SearchMatchPage {
@@ -602,7 +602,7 @@ fn ordered_fragments(highlights: &HashMap<String, Vec<String>>) -> Vec<String> {
 mod tests {
     use std::collections::HashMap;
 
-    use chrono::{TimeZone as _, Utc};
+    use jiff::Timestamp;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -614,7 +614,7 @@ mod tests {
         let user_id = Uuid::now_v7();
         let query = ValidatedSearchQuery {
             text: "timeout".to_owned(),
-            from: Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap()),
+            from: Some("2026-08-01T00:00:00Z".parse::<Timestamp>().unwrap()),
             to: None,
             agent_names: vec!["claude-code".to_owned(), "codex".to_owned()],
             llm_providers: Vec::new(),

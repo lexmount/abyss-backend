@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -19,7 +19,7 @@ pub struct IngestDiagnosticCapture {
     /// Collector-generated idempotency key scoped to the owner.
     pub capture_id: String,
     /// Time at which the diagnostic evidence was observed.
-    pub captured_at: DateTime<Utc>,
+    pub captured_at: Timestamp,
     /// Collector flow identifier used to correlate related captures.
     pub flow_id: String,
     /// Usage-event identifiers that explain the capture context.
@@ -72,7 +72,7 @@ impl IngestDiagnosticCapture {
 mod tests {
     use std::collections::HashSet;
 
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::json;
 
     use super::IngestDiagnosticCapture;
@@ -114,7 +114,7 @@ mod tests {
     fn capture(event_ids: Vec<&str>, payload: serde_json::Value) -> IngestDiagnosticCapture {
         IngestDiagnosticCapture {
             capture_id: "diag-test".to_owned(),
-            captured_at: Utc::now(),
+            captured_at: Timestamp::now(),
             flow_id: "flow-test".to_owned(),
             event_ids: event_ids.into_iter().map(str::to_owned).collect(),
             collector_version: "test".to_owned(),

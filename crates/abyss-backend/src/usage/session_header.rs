@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -18,7 +18,7 @@ pub struct HeaderEvent {
     pub agent_version: Option<String>,
     pub provider: String,
     pub model: String,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     pub tokens: TokenCounts,
 }
 
@@ -34,9 +34,9 @@ pub struct SessionHeaderResponse {
     /// Agents that reported events, by name and version.
     pub agents: Vec<HeaderAgent>,
     /// Earliest event time.
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
     /// Latest event time.
-    pub end: DateTime<Utc>,
+    pub end: Timestamp,
     pub event_count: usize,
     pub exchange_count: usize,
     /// Requests that open a turn.

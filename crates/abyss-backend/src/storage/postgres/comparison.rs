@@ -8,7 +8,6 @@ use crate::{
         ComparisonDimension, ComparisonOption, ComparisonQuery, ComparisonResponse, ComparisonRow,
     },
 };
-use chrono::{DateTime, Utc};
 use diesel::pg::Pg;
 use diesel::{
     IntoSql, PgConnection, define_sql_function,
@@ -16,6 +15,8 @@ use diesel::{
     prelude::*,
     sql_types::{BigInt, Bool, Nullable, Numeric, Text, Timestamptz},
 };
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel as _;
 use uuid::Uuid;
 
 // A query-local CTE, not a persistent table or migration.
@@ -66,7 +67,13 @@ pub(super) fn compare(
     let buckets = query
         .buckets
         .iter()
-        .map(|bucket| (bucket.start.timestamp_millis(), bucket.start, bucket.end))
+        .map(|bucket| {
+            (
+                bucket.start_millis(),
+                bucket.start.to_diesel(),
+                bucket.end.to_diesel(),
+            )
+        })
         .collect();
     let source = b::table
         .inner_join(
@@ -111,8 +118,8 @@ pub(super) fn compare(
     let source = e::table
         .inner_join(devices::table)
         .filter(e::user_id.eq(user_id))
-        .filter(e::observed_at.ge(first.start))
-        .filter(e::observed_at.lt(last.end));
+        .filter(e::observed_at.ge(first.start.to_diesel()))
+        .filter(e::observed_at.lt(last.end.to_diesel()));
     let mut options = source
         .select(("agent".into_sql::<Text>(), e::agent_name))
         .union(source.select(("model".into_sql::<Text>(), e::llm_model)))
@@ -144,12 +151,15 @@ type ComparisonPredicate<'a> =
 
 fn comparison_filters(
     query: &ComparisonQuery,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: Timestamp,
+    to: Timestamp,
 ) -> ComparisonPredicate<'_> {
     use llm_usage_events as e;
-    let mut predicate: ComparisonPredicate<'_> =
-        Box::new(e::observed_at.ge(from).and(e::observed_at.lt(to)));
+    let mut predicate: ComparisonPredicate<'_> = Box::new(
+        e::observed_at
+            .ge(from.to_diesel())
+            .and(e::observed_at.lt(to.to_diesel())),
+    );
     if !query.filters.agent.is_empty() {
         predicate = Box::new(predicate.and(e::agent_name.eq_any(&query.filters.agent)));
     }

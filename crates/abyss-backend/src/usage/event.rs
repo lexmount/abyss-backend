@@ -3,7 +3,7 @@
 //! purpose, omitted categories, request path, and headers inside `metadata`;
 //! they come back out as typed fields here.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -25,7 +25,7 @@ pub struct UsageEventResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<EventLocation>,
     /// Collector observation timestamp.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Request or response.
     pub event_type: String,
     /// Agent that produced the event.
@@ -192,7 +192,7 @@ pub struct UsageEventListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<EventLocation>,
     /// Collector observation timestamp.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Request or response.
     pub event_type: String,
     /// Agent that produced the event.

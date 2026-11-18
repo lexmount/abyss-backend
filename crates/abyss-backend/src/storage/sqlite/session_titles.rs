@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
 use diesel::{
     ExpressionMethods, OptionalExtension, QueryDsl, QueryableByName, RunQueryDsl, SqliteConnection,
     sql_query,
     sql_types::{Integer, Nullable, Text},
 };
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use super::{models::parse_uuid, schema::session_titles};
@@ -48,7 +48,7 @@ pub(super) fn capture(
     if stored.is_some_and(|(at, pk)| (at, pk) <= (event.observed_at, event_pk.clone())) {
         return Ok(false);
     }
-    let now = Utc::now().timestamp_micros();
+    let now = Timestamp::now().as_microsecond();
     diesel::insert_into(session_titles::table)
         .values((
             session_titles::session_pk.eq(&session),

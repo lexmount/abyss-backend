@@ -19,7 +19,7 @@ mod turns;
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -52,7 +52,7 @@ pub struct StreamEvent {
     /// Collector-generated idempotency key.
     pub event_id: String,
     /// Collector observation time.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Shared by the request and response events of one exchange.
     pub response_id: Option<String>,
     /// Response the request names as the one it continues.
@@ -89,9 +89,9 @@ pub struct StreamSegment {
     /// Id of the first exchange's base.
     pub forked_from: Option<String>,
     /// Earliest event time of the segment.
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
     /// Latest event time of the segment.
-    pub end: DateTime<Utc>,
+    pub end: Timestamp,
     /// Number of exchanges in the segment.
     pub exchange_count: usize,
     /// The new user words of the segment's first request.
@@ -474,7 +474,7 @@ impl SessionStructure {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeDelta;
+    use jiff::SignedDuration;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -593,8 +593,8 @@ mod tests {
         // A segment spans from its first request to its last response.
         let first = &streams.segments[0];
         assert_eq!(
-            first.end.signed_duration_since(first.start),
-            TimeDelta::milliseconds(1_500)
+            first.end.duration_since(first.start),
+            SignedDuration::from_millis(1_500)
         );
     }
     #[test]

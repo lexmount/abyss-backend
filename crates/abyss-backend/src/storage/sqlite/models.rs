@@ -1,7 +1,7 @@
 //! Diesel row and insert models for SQLite relational tables.
 
-use chrono::{DateTime, Utc};
 use diesel::{Insertable, Queryable, Selectable};
+use jiff::Timestamp;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
@@ -378,7 +378,7 @@ pub(super) struct EventRecord {
     pub(super) cache_write_tokens: i64,
     pub(super) reasoning_tokens: i64,
     pub(super) total_tokens: i64,
-    pub(super) observed_at: DateTime<Utc>,
+    pub(super) observed_at: Timestamp,
     pub(super) metadata: Value,
     pub(super) response_id: Option<String>,
     pub(super) previous_response_id: Option<String>,
@@ -461,8 +461,8 @@ pub(super) fn parse_uuid(value: &str, field: &str) -> Result<Uuid, AppError> {
         .map_err(|error| AppError::internal(format!("stored {field} is not a UUID: {error}")))
 }
 
-pub(super) fn timestamp_from_micros(value: i64) -> Result<DateTime<Utc>, AppError> {
-    DateTime::from_timestamp_micros(value).ok_or_else(|| {
+pub(super) fn timestamp_from_micros(value: i64) -> Result<Timestamp, AppError> {
+    Timestamp::from_microsecond(value).map_err(|_| {
         AppError::internal(format!(
             "stored timestamp microseconds are out of range: {value}"
         ))

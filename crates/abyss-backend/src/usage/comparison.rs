@@ -1,7 +1,7 @@
 //! Validated, content-free comparison queries with explicit local-time bucket boundaries.
 
 use crate::error::AppError;
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -26,8 +26,16 @@ pub struct ComparisonFilters {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComparisonBucket {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
+    pub start: Timestamp,
+    pub end: Timestamp,
+}
+
+impl ComparisonBucket {
+    /// Bucket identifiers count whole milliseconds from the epoch, rounding down.
+    pub(crate) fn start_millis(&self) -> i64 {
+        i64::try_from(self.start.as_nanosecond().div_euclid(1_000_000))
+            .expect("all Jiff timestamps fit in i64 milliseconds")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +54,7 @@ impl ComparisonQuery {
             return Err(invalid("at least one time bucket is required"));
         };
         if self.buckets.len() > 400
-            || last.end.signed_duration_since(first.start) > Duration::days(367)
+            || last.end.duration_since(first.start) > SignedDuration::from_hours(367 * 24)
         {
             return Err(invalid(
                 "comparison range must not exceed 367 days or 400 buckets",
@@ -147,25 +155,24 @@ mod tests {
 
     #[test]
     fn limits_bucket_count_and_total_duration_before_building_the_query() {
-        use chrono::{Duration, TimeZone, Utc};
+        use jiff::{SignedDuration, Timestamp};
 
-        let start = Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .single()
+        let start = "2026-01-01T00:00:00Z"
+            .parse::<Timestamp>()
             .expect("valid timestamp");
         let buckets: Vec<_> = (0..400)
             .map(|index| {
                 serde_json::json!({
-                    "start": start + Duration::minutes(index),
-                    "end": start + Duration::minutes(index + 1),
+                    "start": start + SignedDuration::from_mins(index),
+                    "end": start + SignedDuration::from_mins(index + 1),
                 })
             })
             .collect();
         let mut value = query(&serde_json::json!(buckets));
         assert!(value.validate().is_ok(), "400 bound buckets are supported");
         value.buckets.push(super::ComparisonBucket {
-            start: start + Duration::minutes(400),
-            end: start + Duration::minutes(401),
+            start: start + SignedDuration::from_mins(400),
+            end: start + SignedDuration::from_mins(401),
         });
         assert!(
             value.validate().is_err(),
@@ -174,17 +181,26 @@ mod tests {
 
         let mut value = query(&serde_json::json!([{
             "start": start,
-            "end": start + Duration::days(367),
+            "end": start + SignedDuration::from_hours(367 * 24),
         }]));
         assert!(
             value.validate().is_ok(),
             "the documented maximum span is inclusive"
         );
-        value.buckets[0].end += Duration::microseconds(1);
+        value.buckets[0].end += SignedDuration::from_micros(1);
         assert!(
             value.validate().is_err(),
             "even a fractional excess is rejected"
         );
+    }
+
+    #[test]
+    fn pre_epoch_bucket_keeps_its_millisecond_key() {
+        let value = query(&serde_json::json!([{
+            "start": "1969-12-31T15:59:59.999999999-08:00",
+            "end": "1970-01-01T00:00:00Z"
+        }]));
+        assert_eq!(value.buckets[0].start_millis(), -1);
     }
 
     #[test]

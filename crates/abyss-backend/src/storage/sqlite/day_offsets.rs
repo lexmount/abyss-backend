@@ -3,14 +3,12 @@
 //! SQLite has no time zone database, so the offsets a zone applies across the
 //! summarized events are worked out here and handed to the query as JSON.
 
-use chrono::{DateTime, Offset, TimeZone, Utc};
-use chrono_tz::Tz;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::error::AppError;
 
 const MICROS_PER_SECOND: i64 = 1_000_000;
-/// Seconds in one day; no zone changes its offset more than once a day.
-const DAY_SECONDS: i64 = 86_400;
 
 /// One UTC offset of a zone and the instant it takes effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,12 +23,17 @@ struct UtcOffsetChange {
 /// (inclusive, in microseconds), as a JSON list of `[start, offset]`
 /// microsecond pairs ordered by start. The first pair also covers every
 /// earlier instant; `None` means no events, which UTC's single offset covers.
-pub(super) fn day_offsets_json(zone: Tz, events: Option<(i64, i64)>) -> Result<String, AppError> {
+pub(super) fn day_offsets_json(
+    zone: &TimeZone,
+    events: Option<(i64, i64)>,
+) -> Result<String, AppError> {
     let changes = match events {
-        Some((first, last)) if zone != Tz::UTC => utc_offset_changes(
+        Some((first, last)) if zone != &TimeZone::UTC => utc_offset_changes(
             zone,
-            first.div_euclid(MICROS_PER_SECOND),
-            last.div_euclid(MICROS_PER_SECOND).saturating_add(1),
+            Timestamp::from_microsecond(first)
+                .map_err(|error| AppError::internal(error.to_string()))?,
+            Timestamp::from_microsecond(last)
+                .map_err(|error| AppError::internal(error.to_string()))?,
         ),
         _ => Vec::new(),
     };
@@ -51,74 +54,45 @@ pub(super) fn day_offsets_json(zone: Tz, events: Option<(i64, i64)>) -> Result<S
         .map_err(|error| AppError::internal(format!("serialize day offsets: {error}")))
 }
 
-/// The offsets `zone` applies from `from_second` up to `to_second`, in order.
-///
-/// The range is stepped a day at a time and each change found is narrowed to
-/// the exact second it takes effect.
-fn utc_offset_changes(zone: Tz, from_second: i64, to_second: i64) -> Vec<UtcOffsetChange> {
-    let mut current = offset_at(zone, from_second);
-    let mut changes = vec![UtcOffsetChange {
-        start_second: from_second,
-        offset_seconds: current,
-    }];
-    let mut cursor = from_second;
-    while cursor < to_second {
-        let next = cursor.saturating_add(DAY_SECONDS).min(to_second);
-        if offset_at(zone, next) == current {
-            cursor = next;
-            continue;
-        }
-        // `low` keeps the current offset and `high` does not.
-        let (mut low, mut high) = (cursor, next);
-        while high.saturating_sub(low) > 1_i64 {
-            let middle = low.midpoint(high);
-            if offset_at(zone, middle) == current {
-                low = middle;
-            } else {
-                high = middle;
-            }
-        }
-        current = offset_at(zone, high);
-        changes.push(UtcOffsetChange {
-            start_second: high,
-            offset_seconds: current,
-        });
-        cursor = high;
-    }
-    changes
-}
-
-fn offset_at(zone: Tz, unix_second: i64) -> i32 {
-    DateTime::<Utc>::from_timestamp(unix_second, 0).map_or(0_i32, |instant| {
-        zone.offset_from_utc_datetime(&instant.naive_utc())
-            .fix()
-            .local_minus_utc()
-    })
+/// Includes the offset at the first event and every transition through the last event.
+fn utc_offset_changes(zone: &TimeZone, first: Timestamp, last: Timestamp) -> Vec<UtcOffsetChange> {
+    let initial = UtcOffsetChange {
+        start_second: first.as_second(),
+        offset_seconds: zone.to_offset(first).seconds(),
+    };
+    std::iter::once(initial)
+        .chain(
+            zone.following(first)
+                .take_while(|change| change.timestamp() <= last)
+                .map(|change| UtcOffsetChange {
+                    start_second: change.timestamp().as_second(),
+                    offset_seconds: change.offset().seconds(),
+                }),
+        )
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::DateTime;
-    use chrono_tz::Tz;
+    use jiff::Timestamp;
+    use jiff::tz::TimeZone;
 
     use super::{UtcOffsetChange, day_offsets_json, utc_offset_changes};
 
-    fn second(value: &str) -> i64 {
-        DateTime::parse_from_rfc3339(value)
-            .expect("timestamp should parse")
-            .timestamp()
+    fn instant(value: &str) -> Timestamp {
+        value.parse::<Timestamp>().expect("timestamp should parse")
     }
 
     #[test]
     fn zone_without_changes_keeps_one_offset() {
         assert_eq!(
             utc_offset_changes(
-                Tz::Asia__Shanghai,
-                second("2026-01-01T00:00:00Z"),
-                second("2026-12-31T00:00:00Z"),
+                &TimeZone::get("Asia/Shanghai").expect("Shanghai zone"),
+                instant("2026-01-01T00:00:00Z"),
+                instant("2026-12-31T00:00:00Z"),
             ),
             [UtcOffsetChange {
-                start_second: second("2026-01-01T00:00:00Z"),
+                start_second: instant("2026-01-01T00:00:00Z").as_second(),
                 offset_seconds: 8 * 3600,
             }]
         );
@@ -130,21 +104,21 @@ mod tests {
         // 2026-11-01 02:00 PDT.
         assert_eq!(
             utc_offset_changes(
-                Tz::America__Los_Angeles,
-                second("2026-02-01T00:00:00Z"),
-                second("2026-12-01T00:00:00Z"),
+                &TimeZone::get("America/Los_Angeles").expect("Los Angeles zone"),
+                instant("2026-02-01T00:00:00Z"),
+                instant("2026-12-01T00:00:00Z"),
             ),
             [
                 UtcOffsetChange {
-                    start_second: second("2026-02-01T00:00:00Z"),
+                    start_second: instant("2026-02-01T00:00:00Z").as_second(),
                     offset_seconds: -8 * 3600,
                 },
                 UtcOffsetChange {
-                    start_second: second("2026-03-08T10:00:00Z"),
+                    start_second: instant("2026-03-08T10:00:00Z").as_second(),
                     offset_seconds: -7 * 3600,
                 },
                 UtcOffsetChange {
-                    start_second: second("2026-11-01T09:00:00Z"),
+                    start_second: instant("2026-11-01T09:00:00Z").as_second(),
                     offset_seconds: -8 * 3600,
                 },
             ]
@@ -155,15 +129,23 @@ mod tests {
     fn offsets_cover_every_instant_and_default_to_utc() {
         let minimum = i64::MIN;
         assert_eq!(
-            day_offsets_json(Tz::UTC, Some((0, 1))).expect("utc offsets"),
+            day_offsets_json(&TimeZone::UTC, Some((0, 1))).expect("utc offsets"),
             format!("[[{minimum},0]]")
         );
         assert_eq!(
-            day_offsets_json(Tz::Asia__Shanghai, None).expect("no events"),
+            day_offsets_json(
+                &TimeZone::get("Asia/Shanghai").expect("Shanghai zone"),
+                None
+            )
+            .expect("no events"),
             format!("[[{minimum},0]]")
         );
         assert_eq!(
-            day_offsets_json(Tz::Asia__Shanghai, Some((0, 1))).expect("shanghai offsets"),
+            day_offsets_json(
+                &TimeZone::get("Asia/Shanghai").expect("Shanghai zone"),
+                Some((0, 1))
+            )
+            .expect("shanghai offsets"),
             format!("[[{minimum},28800000000]]")
         );
     }

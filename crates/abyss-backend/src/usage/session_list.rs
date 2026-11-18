@@ -1,6 +1,6 @@
 //! Owner-scoped session index: one page of sessions ordered by latest activity.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,9 +13,9 @@ const MAX_PAGE_SIZE: u32 = 100;
 #[derive(Debug, Default, Deserialize)]
 pub struct SessionListQuery {
     /// Keeps sessions whose latest activity is at or after this instant.
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Keeps sessions that started before this instant.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// Agent-name filter, matched exactly as reported; repeat the key for
     /// several Agents.
     #[serde(default)]
@@ -35,8 +35,8 @@ pub struct SessionListQuery {
 /// Session list query with normalized filters and a resolved page window.
 #[derive(Debug)]
 pub struct ValidatedSessionListQuery {
-    pub from: Option<DateTime<Utc>>,
-    pub to: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
+    pub to: Option<Timestamp>,
     /// Stored agent names to match, or empty for every Agent.
     pub agent_names: Vec<String>,
     /// Exact providers; a session must have used one, or empty for any.
@@ -101,10 +101,10 @@ pub struct SessionListItem {
     pub agent_version: Option<String>,
     pub host_name: String,
     pub platform: String,
-    pub started_at: DateTime<Utc>,
-    pub ended_at: Option<DateTime<Utc>>,
+    pub started_at: Timestamp,
+    pub ended_at: Option<Timestamp>,
     /// Latest event observation, or the session start when it has no events.
-    pub last_activity_at: DateTime<Utc>,
+    pub last_activity_at: Timestamp,
     /// Turns the session's structure derives, as its header counts them.
     pub turns: usize,
     pub events: i64,
@@ -137,7 +137,6 @@ impl SessionListResponse {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
 
     use super::*;
 
@@ -191,7 +190,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_windows_and_page_sizes() {
-        let at = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let at = "2026-09-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let reversed = SessionListQuery {
             from: Some(at),
             to: Some(at),

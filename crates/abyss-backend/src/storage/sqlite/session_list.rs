@@ -201,8 +201,8 @@ fn json_list(values: &[String], filter: &str) -> Result<String, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
     use diesel::{Connection, SqliteConnection};
+    use jiff::Timestamp;
     use serde_json::{Value, json};
     use uuid::Uuid;
 
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(alpha.host_name, "alice-mbp");
         assert_eq!(
             alpha.last_activity_at,
-            Utc.with_ymd_and_hms(2026, 9, 3, 0, 0, 0).unwrap()
+            "2026-09-03T00:00:00Z".parse::<Timestamp>().unwrap()
         );
         let order: Vec<_> = response
             .items
@@ -323,8 +323,8 @@ mod tests {
 
         // gamma went quiet before the window; alpha is still active inside it.
         let window = SessionListQuery {
-            from: Some(Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap()),
-            to: Some(Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap()),
+            from: Some("2026-08-15T00:00:00Z".parse::<Timestamp>().unwrap()),
+            to: Some("2026-09-02T12:00:00Z".parse::<Timestamp>().unwrap()),
             ..SessionListQuery::default()
         };
         let ids: Vec<_> = list(&mut database, window)

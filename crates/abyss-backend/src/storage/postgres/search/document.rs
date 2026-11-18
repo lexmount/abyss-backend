@@ -35,7 +35,7 @@ pub struct SearchDocument {
     /// Request or response value used for exact filtering.
     pub event_type: String,
     /// Collector observation time used for range filtering.
-    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub observed_at: jiff::Timestamp,
     /// Bounded prompt or response text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -71,7 +71,7 @@ impl SearchDocument {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -165,9 +165,9 @@ mod tests {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: 1,
-            observed_at: Utc::now(),
+            observed_at: Timestamp::now(),
             metadata: json!({}),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             response_id: None,
             previous_response_id: None,
             conversation: None,

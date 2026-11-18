@@ -1,10 +1,11 @@
 //! PostgreSQL session index ordered by latest activity.
 
-use chrono::{DateTime, Utc};
 use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{Array, BigInt, Bool, Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid},
 };
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel as _;
 use uuid::Uuid;
 
 use crate::{
@@ -78,11 +79,14 @@ struct SessionListRow {
     #[diesel(sql_type = Text)]
     platform: String,
     #[diesel(sql_type = Timestamptz)]
-    started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    started_at: Timestamp,
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    ended_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::NullableTimestamp)]
+    ended_at: Option<Timestamp>,
     #[diesel(sql_type = Timestamptz)]
-    last_activity_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    last_activity_at: Timestamp,
     #[diesel(sql_type = BigInt)]
     events: i64,
     #[diesel(sql_type = BigInt)]
@@ -111,8 +115,8 @@ pub(super) fn list_sessions(
     query: &ValidatedSessionListQuery,
 ) -> Result<SessionListResponse, AppError> {
     let has_agents = !query.agent_names.is_empty();
-    let from = query.from.unwrap_or(DateTime::UNIX_EPOCH);
-    let to = query.to.unwrap_or(DateTime::UNIX_EPOCH);
+    let from = query.from.unwrap_or(Timestamp::UNIX_EPOCH);
+    let to = query.to.unwrap_or(Timestamp::UNIX_EPOCH);
 
     let total = sql_query(format!(
         "{ACTIVITY_CTE} SELECT COUNT(*)::bigint AS total FROM filtered"
@@ -121,9 +125,9 @@ pub(super) fn list_sessions(
     .bind::<Bool, _>(has_agents)
     .bind::<Array<Text>, _>(&query.agent_names)
     .bind::<Bool, _>(query.from.is_some())
-    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(from.to_diesel())
     .bind::<Bool, _>(query.to.is_some())
-    .bind::<Timestamptz, _>(to)
+    .bind::<Timestamptz, _>(to.to_diesel())
     .bind::<Bool, _>(!query.llm_providers.is_empty())
     .bind::<Array<Text>, _>(&query.llm_providers)
     .bind::<Bool, _>(!query.llm_models.is_empty())
@@ -139,9 +143,9 @@ pub(super) fn list_sessions(
     .bind::<Bool, _>(has_agents)
     .bind::<Array<Text>, _>(&query.agent_names)
     .bind::<Bool, _>(query.from.is_some())
-    .bind::<Timestamptz, _>(from)
+    .bind::<Timestamptz, _>(from.to_diesel())
     .bind::<Bool, _>(query.to.is_some())
-    .bind::<Timestamptz, _>(to)
+    .bind::<Timestamptz, _>(to.to_diesel())
     .bind::<Bool, _>(!query.llm_providers.is_empty())
     .bind::<Array<Text>, _>(&query.llm_providers)
     .bind::<Bool, _>(!query.llm_models.is_empty())

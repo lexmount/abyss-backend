@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 #[cfg(feature = "postgres-es")]
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::error::AppError;
 
@@ -124,8 +124,8 @@ pub fn non_negative_count(value: i64) -> usize {
 }
 
 #[cfg(feature = "postgres-es")]
-pub const fn unix_epoch() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(0_i64, 0_u32).expect("unix epoch must be a valid timestamp")
+pub const fn unix_epoch() -> Timestamp {
+    Timestamp::UNIX_EPOCH
 }
 
 #[cfg(any(feature = "postgres-es", test))]

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -61,9 +61,9 @@ pub(super) struct Exchange {
     /// Consumed when the session structure builds its event lookup.
     pub(super) event_pks: Vec<Uuid>,
     /// Request time, else response time.
-    pub(super) at: DateTime<Utc>,
+    pub(super) at: Timestamp,
     /// Latest event time.
-    pub(super) end: DateTime<Utc>,
+    pub(super) end: Timestamp,
     pub(super) request: Option<Side<RequestFacts>>,
     pub(super) response: Option<Side<ResponseFacts>>,
     /// Ids the client declared: the request's, else the response's.

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::{
@@ -37,7 +37,7 @@ pub struct SearchHit {
     /// Event holding the piece.
     pub event_pk: Uuid,
     /// Observation time of the event.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Position of the piece's entry.
     pub entry_index: u32,
     /// Which value of the entry the piece is.
@@ -76,7 +76,7 @@ pub struct RankedMatch {
     /// The event.
     pub event_pk: Uuid,
     /// Observation time of the event.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Whether the event has a new hit.
     pub new: bool,
     /// Texts its fragments come from, at most [`FRAGMENTS_PER_MATCH`].
@@ -106,16 +106,16 @@ pub struct SessionDetails {
     /// Authoritative device platform.
     pub platform: String,
     /// Earliest event observation in the session.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// Latest event observation in the session.
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<Timestamp>,
 }
 
 /// The hits of one event.
 struct EventHits {
     session_pk: Uuid,
     session_id: String,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     hits: Vec<PieceHit>,
 }
 
@@ -361,7 +361,7 @@ fn sorted_distinct<'a>(values: impl Iterator<Item = &'a String>) -> Vec<String> 
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, TimeZone as _, Utc};
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     use std::collections::HashMap;
@@ -377,9 +377,9 @@ mod tests {
         usage::UsageEventType,
     };
 
-    fn at(second: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 10, 18, 0, 0, second)
-            .single()
+    fn at(second: u32) -> Timestamp {
+        format!("2026-10-18T00:00:{second:02}Z")
+            .parse::<Timestamp>()
             .expect("valid time")
     }
 

@@ -2,8 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
 use diesel::{
     ExpressionMethods, IntoSql, NullableExpressionMethods, QueryDsl, QueryableByName, RunQueryDsl,
     SelectableHelper, SqliteConnection,
@@ -12,6 +10,8 @@ use diesel::{
     sql_query,
     sql_types::{BigInt, Bool, Nullable, Text},
 };
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use uuid::Uuid;
 
 use crate::{
@@ -118,7 +118,7 @@ fn ingest_one_event(
     }
 
     let observed_at = timestamp_to_micros(event.observed_at);
-    let now = timestamp_to_micros(Utc::now());
+    let now = timestamp_to_micros(Timestamp::now());
     let agent_name = event.agent.name.clone();
     let agent_version = event.agent.version.clone();
     let provider = event.llm.provider.clone();
@@ -667,7 +667,7 @@ fn ingest_one_diagnostic_capture(
             captured_at: timestamp_to_micros(capture.captured_at),
             collector_version: normalize_text(&capture.collector_version),
             payload: serialize_json(&capture.payload, "diagnostic payload")?,
-            created_at: timestamp_to_micros(Utc::now()),
+            created_at: timestamp_to_micros(Timestamp::now()),
         })
         .on_conflict((
             agent_diagnostic_captures::user_id,
@@ -729,8 +729,8 @@ pub(super) fn raw_events(
 
 struct EventFilters<'a> {
     user_id: Uuid,
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
+    from: Option<Timestamp>,
+    to: Option<Timestamp>,
     /// Each list matches any of its values; an empty list matches everything.
     agent_names: &'a [String],
     session_ids: &'a [String],
@@ -906,7 +906,7 @@ pub(super) fn usage_summary(
     let from = query.from.map_or(i64::MIN, timestamp_to_micros);
     let to = query.to.map_or(i64::MAX, timestamp_to_micros);
     let day_offsets = if dimensions.enabled(SummaryDimension::Day) {
-        day_offsets(connection, user_id, zone, from, to)?
+        day_offsets(connection, user_id, &zone, from, to)?
     } else {
         "[]".to_owned()
     };
@@ -962,11 +962,11 @@ pub(super) fn usage_summary(
 fn day_offsets(
     connection: &mut SqliteConnection,
     user_id: Uuid,
-    zone: Tz,
+    zone: &TimeZone,
     from: i64,
     to: i64,
 ) -> Result<String, AppError> {
-    if zone == Tz::UTC {
+    if zone == &TimeZone::UTC {
         return day_offsets_json(zone, None);
     }
     let (first, last) = llm_usage_events::table
@@ -1402,8 +1402,10 @@ fn serialize_json(value: &serde_json::Value, field: &str) -> Result<String, AppE
         .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
 }
 
-pub(super) const fn timestamp_to_micros(value: DateTime<Utc>) -> i64 {
-    value.timestamp_micros()
+pub(super) fn timestamp_to_micros(value: Timestamp) -> i64 {
+    // SQLite stores integer microseconds rounded toward the preceding instant.
+    i64::try_from(value.as_nanosecond().div_euclid(1_000))
+        .expect("all Jiff timestamps fit in i64 microseconds")
 }
 
 #[cfg(test)]
@@ -1446,6 +1448,14 @@ mod tests {
         let mut database = SqliteConnection::establish(":memory:").expect("SQLite should open");
         migrations::run(&mut database).expect("migration should succeed");
         database
+    }
+
+    #[test]
+    fn submicrosecond_instant_before_epoch_stays_before_epoch() {
+        let timestamp = "1969-12-31T23:59:59.999999999Z"
+            .parse()
+            .expect("valid timestamp");
+        assert_eq!(super::timestamp_to_micros(timestamp), -1);
     }
 
     #[test]
@@ -2189,8 +2199,8 @@ mod tests {
             ("codex", ["gpt-5".to_owned()].as_slice())
         );
         assert_eq!(
-            header.end.signed_duration_since(header.start),
-            chrono::TimeDelta::seconds(3)
+            header.end.duration_since(header.start),
+            jiff::SignedDuration::from_secs(3)
         );
         assert_eq!(
             header.title.as_ref().map(|label| label.text.as_str()),
