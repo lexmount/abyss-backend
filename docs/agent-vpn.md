@@ -7,3 +7,5 @@ A standalone deployment maps its backend bearer token to one fixed event owner. 
 The shared HTTP black-box suite exercises employee lookup and administrator assignment paths with a valid standalone credential, using both the product prefix and the prefix after dashboard proxy rewriting. Both storage profiles must return 404. The product service owns the database migration and deploys independently.
 
 [Product service design](https://github.com/lexmount/abyss-services/blob/task/agent-vpn/docs/agent-vpn.md)
+
+[Product service PR](https://github.com/lexmount/abyss-services/pull/34) · [Standalone validation](https://github.com/lexmount/abyss-backend/pull/24/checks)
