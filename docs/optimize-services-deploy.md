@@ -2,6 +2,8 @@
 
 Task: `optimize-services-deploy.md`.
 
+Companion PR: [lexmount/abyss-services#33](https://github.com/lexmount/abyss-services/pull/33).
+
 ## Problem and scope
 
 The product service images are slow to publish to Tencent Cloud. The
