@@ -153,9 +153,14 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     # enterprise credentials to a standalone deployment's single owner.
     for prefix in ("/api/v1/ai-accounts", "/v1/ai-accounts"):
         for method, suffix in (
-            ("GET", "/me/harnesses/codex"),
-            ("PUT", f"/employees/{OWNER_ID}/harnesses/codex"),
-            ("DELETE", f"/employees/{OWNER_ID}/harnesses/codex"),
+            ("GET", "/me/config"),
+            ("GET", "/providers"),
+            ("PUT", "/providers/relay"),
+            ("GET", f"/employees/{OWNER_ID}/providers"),
+            ("PUT", f"/employees/{OWNER_ID}/providers/openai/credentials/primary"),
+            ("DELETE", f"/employees/{OWNER_ID}/providers/openai/credentials/primary"),
+            ("GET", "/harnesses"),
+            ("PUT", "/harnesses/codex/providers"),
         ):
             response = request(base_url, method, prefix + suffix, token=token)
             require_status(response, 404, "enterprise account route on standalone")
