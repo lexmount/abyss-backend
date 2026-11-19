@@ -4,8 +4,8 @@
 //! Insert models make server-assigned fields explicit and prevent
 //! HTTP payloads from being written directly without normalization.
 
-use chrono::{DateTime, Utc};
 use diesel::{Insertable, Queryable, Selectable};
+use jiff::Timestamp;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -30,13 +30,17 @@ pub struct Device {
     /// Most recently observed OS version.
     pub os_version: Option<String>,
     /// Earliest event observation associated with the device.
-    pub first_seen_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub first_seen_at: Timestamp,
     /// Latest event observation associated with the device.
-    pub last_seen_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub last_seen_at: Timestamp,
     /// Row creation time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
     /// Last metadata update time.
-    pub updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Insertable)]
@@ -54,13 +58,17 @@ pub struct NewDevice {
     /// Optional observed OS version.
     pub os_version: Option<String>,
     /// Initial earliest observation time.
-    pub first_seen_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub first_seen_at: Timestamp,
     /// Initial latest observation time.
-    pub last_seen_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub last_seen_at: Timestamp,
     /// Row creation time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
     /// Initial metadata update time.
-    pub updated_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: Timestamp,
 }
 
 #[derive(Clone, Debug, Queryable, Selectable)]
@@ -77,9 +85,11 @@ pub struct AgentSession {
     /// Agent-native session identifier.
     pub session_id: String,
     /// Earliest event observation in the session.
-    pub started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub started_at: Timestamp,
     /// Latest event observation in the session.
-    pub ended_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::NullableTimestamp)]
+    pub ended_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Insertable)]
@@ -99,15 +109,19 @@ pub struct NewAgentSession {
     /// Agent-native session identifier.
     pub session_id: String,
     /// Initial earliest observation time.
-    pub started_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub started_at: Timestamp,
     /// Initial latest observation time.
-    pub ended_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = jiff_diesel::NullableTimestamp)]
+    pub ended_at: Option<Timestamp>,
     /// Stable allowlisted session metadata.
     pub metadata: Value,
     /// Row creation time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
     /// Initial metadata update time.
-    pub updated_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: Timestamp,
     /// Changes whenever ingestion adds an event to the session.
     pub structure_revision: i64,
 }
@@ -152,11 +166,13 @@ pub struct UsageEvent {
     /// Provider-reported or derived total-token count.
     pub total_tokens: i64,
     /// Collector observation time.
-    pub observed_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub observed_at: Timestamp,
     /// Collector metadata retained with the event.
     pub metadata: Value,
     /// Server insertion time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
     /// Provider identity of the response the exchange produced.
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
@@ -187,7 +203,8 @@ pub struct UsageEventAttachment {
     /// Optional image bytes for metadata-only attachments.
     pub content: Option<Vec<u8>>,
     /// Server insertion time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
 }
 
 #[derive(Insertable)]
@@ -207,13 +224,15 @@ pub struct NewAgentDiagnosticCapture {
     /// Collector flow identifier.
     pub flow_id: String,
     /// Collector observation time.
-    pub captured_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub captured_at: Timestamp,
     /// Collector version that produced the payload.
     pub collector_version: String,
     /// Opaque diagnostic JSON.
     pub payload: Value,
     /// Server insertion time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
 }
 
 #[derive(Insertable)]
@@ -265,11 +284,13 @@ pub struct NewUsageEvent {
     /// Provider-reported or derived total-token count.
     pub total_tokens: i64,
     /// Collector observation time.
-    pub observed_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub observed_at: Timestamp,
     /// Collector metadata retained with the event.
     pub metadata: Value,
     /// Server insertion time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
     /// Provider identity of the response the exchange produced.
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
@@ -289,7 +310,8 @@ pub struct StreamEventRow {
     /// Canonical request or response value.
     pub event_type: String,
     /// Collector observation time.
-    pub observed_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub observed_at: Timestamp,
     /// Provider identity of the response the exchange produced.
     pub response_id: Option<String>,
     /// Response whose conversation the exchange's request continues.
@@ -384,7 +406,8 @@ pub struct NewUsageEventAttachment {
     /// Optional decoded image bytes.
     pub content: Option<Vec<u8>>,
     /// Server insertion time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
 }
 
 #[derive(Insertable)]
@@ -396,5 +419,6 @@ pub struct NewSearchOutboxTask {
     /// Owning user identifier retained for projection bookkeeping.
     pub user_id: Uuid,
     /// Source event insertion time.
-    pub created_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub created_at: Timestamp,
 }

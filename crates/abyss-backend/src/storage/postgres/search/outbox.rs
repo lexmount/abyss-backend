@@ -6,9 +6,9 @@
 //! concurrently and recover work abandoned by a crashed process. Item failures
 //! are retried with bounded backoff and eventually retained as dead letters.
 
+use jiff_diesel::ToDiesel as _;
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, Utc};
 use diesel::{
     ExpressionMethods, IntoSql, PgConnection, QueryDsl, QueryableByName, RunQueryDsl,
     SelectableHelper,
@@ -16,6 +16,7 @@ use diesel::{
     sql_query,
     sql_types::{BigInt, Integer, Text, Uuid as SqlUuid},
 };
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::{
@@ -193,14 +194,14 @@ impl SearchOutboxRepository {
         connection: &mut PgConnection,
         results: Vec<OutboxTaskResult>,
     ) -> Result<(), AppError> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         for task in results {
             match task.result {
                 Ok(()) => {
                     diesel::update(search_outbox::table.find(task.id))
                         .set((
-                            search_outbox::processed_at.eq(Some(now)),
-                            search_outbox::claimed_at.eq::<Option<DateTime<Utc>>>(None),
+                            search_outbox::processed_at.eq(Some(now.to_diesel())),
+                            search_outbox::claimed_at.eq::<Option<jiff_diesel::Timestamp>>(None),
                             search_outbox::claimed_by.eq::<Option<String>>(None),
                             search_outbox::last_error.eq::<Option<String>>(None),
                         ))
@@ -215,8 +216,9 @@ impl SearchOutboxRepository {
                         diesel::update(search_outbox::table.find(task.id))
                             .set((
                                 search_outbox::attempt_count.eq(attempt_count),
-                                search_outbox::dead_lettered_at.eq(Some(now)),
-                                search_outbox::claimed_at.eq::<Option<DateTime<Utc>>>(None),
+                                search_outbox::dead_lettered_at.eq(Some(now.to_diesel())),
+                                search_outbox::claimed_at
+                                    .eq::<Option<jiff_diesel::Timestamp>>(None),
                                 search_outbox::claimed_by.eq::<Option<String>>(None),
                                 search_outbox::last_error.eq(Some(error)),
                             ))
@@ -228,8 +230,8 @@ impl SearchOutboxRepository {
                         );
                     } else {
                         let available_at = now
-                            .checked_add_signed(Duration::seconds(retry_delay(attempt_count)))
-                            .ok_or_else(|| {
+                            .checked_add(SignedDuration::from_secs(retry_delay(attempt_count)))
+                            .map_err(|_| {
                                 AppError::internal(
                                     "session search retry timestamp overflow".to_owned(),
                                 )
@@ -237,8 +239,9 @@ impl SearchOutboxRepository {
                         diesel::update(search_outbox::table.find(task.id))
                             .set((
                                 search_outbox::attempt_count.eq(attempt_count),
-                                search_outbox::available_at.eq(available_at),
-                                search_outbox::claimed_at.eq::<Option<DateTime<Utc>>>(None),
+                                search_outbox::available_at.eq(available_at.to_diesel()),
+                                search_outbox::claimed_at
+                                    .eq::<Option<jiff_diesel::Timestamp>>(None),
                                 search_outbox::claimed_by.eq::<Option<String>>(None),
                                 search_outbox::last_error.eq(Some(error)),
                             ))

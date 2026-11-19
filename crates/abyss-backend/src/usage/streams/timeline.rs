@@ -1,7 +1,7 @@
 //! The turn view of one session: one node per turn, holding the groups of
 //! the turn's exchanges, each with its main-line segment and side segments.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -24,9 +24,9 @@ pub struct TurnNode {
     /// The declared value, or the id of the exchange that opened the turn.
     pub turn_id: Option<String>,
     /// Earliest event time of the turn's segments.
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
     /// Latest event time of the turn's segments.
-    pub end: DateTime<Utc>,
+    pub end: Timestamp,
     /// Number of exchanges in the turn's segments.
     pub exchange_count: usize,
     /// Label of the first labelled exchange on the main line of the first
@@ -59,7 +59,7 @@ pub struct TurnExecutor {
     /// Number of exchanges in the executor's segments.
     pub exchange_count: usize,
     /// Earliest start of the executor's segments.
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
 }
 
 /// One executor's segments, as indices into the session's segments.

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -57,9 +57,9 @@ pub struct SegmentExchangeResponse {
     #[serde(flatten)]
     pub exchange: SegmentExchange,
     /// Observation time of the request event.
-    pub requested_at: Option<DateTime<Utc>>,
+    pub requested_at: Option<Timestamp>,
     /// Observation time of the response event.
-    pub responded_at: Option<DateTime<Utc>>,
+    pub responded_at: Option<Timestamp>,
     /// Model of the request, else of the response.
     pub model: Option<String>,
     pub request_tokens: Option<TokenCounts>,

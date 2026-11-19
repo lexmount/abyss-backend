@@ -1,6 +1,6 @@
 //! Conversation entries and sessions the stream tests build on.
 
-use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -77,16 +77,15 @@ pub(super) fn ids(values: &[&str]) -> Vec<String> {
 /// A session built from exchanges with conversation entries; exchange
 /// `name` shares `name` as its response id.
 pub(super) struct Session {
-    start: DateTime<Utc>,
+    start: Timestamp,
     pub(super) events: Vec<StreamEvent>,
 }
 
 impl Session {
     pub(super) fn new() -> Self {
         Self {
-            start: Utc
-                .with_ymd_and_hms(2026, 10, 20, 0, 0, 0)
-                .single()
+            start: "2026-10-20T00:00:00Z"
+                .parse::<Timestamp>()
                 .expect("valid time"),
             events: Vec::new(),
         }
@@ -101,7 +100,7 @@ impl Session {
     ) {
         let at = self
             .start
-            .checked_add_signed(TimeDelta::milliseconds(millis))
+            .checked_add(SignedDuration::from_millis(millis))
             .expect("test times stay in range");
         self.events.push(StreamEvent {
             pk: Uuid::now_v7(),

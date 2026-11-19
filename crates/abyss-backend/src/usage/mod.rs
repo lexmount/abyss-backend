@@ -29,7 +29,7 @@ pub mod time_zone;
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -57,7 +57,7 @@ pub struct IngestUsageEvent {
     /// Collector-generated global idempotency key.
     pub event_id: String,
     /// Time at which the collector observed the event.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Host context associated with the event.
     pub device: DevicePayload,
     /// Agent implementation that produced the event.
@@ -193,9 +193,9 @@ pub struct IngestEventsResponse {
 /// Filters, dimensions, and bounds for token-usage aggregation.
 pub struct SummaryQuery {
     /// Inclusive lower observation-time bound.
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Exclusive upper observation-time bound.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// Comma-separated grouping dimensions.
     pub group_by: Option<String>,
     /// IANA time zone whose calendar days the `day` dimension follows; UTC
@@ -237,9 +237,9 @@ pub enum SummaryFields {
 /// Full summary response grouped by the requested dimensions.
 pub struct SummaryResponse {
     /// Inclusive lower bound echoed from the request.
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Exclusive upper bound echoed from the request.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// Normalized grouping dimensions actually applied.
     pub group_by: Vec<String>,
     /// Aggregate rows ordered by token usage and stable tie-breakers.
@@ -343,9 +343,9 @@ where
 /// Reduced summary response used by token-usage-only consumers.
 pub struct TokenUsageSummaryResponse {
     /// Inclusive lower bound echoed from the request.
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Exclusive upper bound echoed from the request.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// Normalized grouping dimensions actually applied.
     pub group_by: Vec<String>,
     /// Token-only aggregate rows.
@@ -406,9 +406,9 @@ impl From<SummaryRow> for TokenUsageSummaryRow {
 /// Filters and offset pagination for the raw-event endpoint.
 pub struct RawEventsQuery {
     /// Inclusive lower observation-time bound.
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Exclusive upper observation-time bound.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// Agent-name filter; repeat the key to match any of several Agents.
     #[serde(default)]
     pub agent_name: Vec<String>,

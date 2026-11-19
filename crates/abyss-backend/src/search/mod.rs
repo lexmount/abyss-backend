@@ -17,7 +17,7 @@
 )]
 pub mod matching;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,9 +38,9 @@ pub struct SessionSearchQuery {
     /// Required query, matched as one literal substring.
     pub q: String,
     /// Inclusive lower observation-time bound.
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Exclusive upper observation-time bound.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// Optional Agent filter, matched exactly; repeat the key to match any of several.
     #[serde(default)]
     pub agent_name: Vec<String>,
@@ -121,9 +121,9 @@ pub struct ValidatedSearchQuery {
     /// Trimmed query.
     pub text: String,
     /// Inclusive lower observation-time bound.
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Exclusive upper observation-time bound.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// Trimmed Agent names to match exactly, any of, or empty for every Agent.
     pub agent_names: Vec<String>,
     /// Trimmed providers to match any of, or empty for every provider.
@@ -175,9 +175,9 @@ pub struct SessionSearchResult {
     /// Authoritative device platform.
     pub platform: String,
     /// Earliest event observation in the session.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// Latest event observation in the session.
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<Timestamp>,
     /// Sorted providers represented by the returned matching events.
     pub providers: Vec<String>,
     /// Sorted models represented by the returned matching events.
@@ -206,7 +206,7 @@ pub struct SessionSearchMatch {
     /// Provider-specific model identifier.
     pub llm_model: String,
     /// Collector observation time.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Whether the event has a hit outside its inherited context.
     pub new: bool,
     /// Highlighted fragments of the event's matching pieces.

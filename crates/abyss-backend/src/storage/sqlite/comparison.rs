@@ -1,5 +1,6 @@
 //! Typed comparison aggregation and authorized filter options; no event content is loaded.
 
+use super::repository::timestamp_to_micros;
 use crate::storage::comparison_buckets::WithBuckets;
 use crate::{
     error::AppError,
@@ -72,9 +73,9 @@ pub(super) fn compare(
         .iter()
         .map(|bucket| {
             (
-                bucket.start.timestamp_millis(),
-                bucket.start.timestamp_micros(),
-                bucket.end.timestamp_micros(),
+                bucket.start_millis(),
+                timestamp_to_micros(bucket.start),
+                timestamp_to_micros(bucket.end),
             )
         })
         .collect();
@@ -88,8 +89,8 @@ pub(super) fn compare(
         .filter(e::user_id.eq(&user_id))
         .filter(comparison_filters(
             query,
-            first.start.timestamp_micros(),
-            last.end.timestamp_micros(),
+            timestamp_to_micros(first.start),
+            timestamp_to_micros(last.end),
         ));
 
     // Each enum arm keeps the selected and grouped column statically identical.
@@ -125,8 +126,8 @@ pub(super) fn compare(
     let source = e::table
         .inner_join(devices::table)
         .filter(e::user_id.eq(&user_id))
-        .filter(e::observed_at.ge(first.start.timestamp_micros()))
-        .filter(e::observed_at.lt(last.end.timestamp_micros()));
+        .filter(e::observed_at.ge(timestamp_to_micros(first.start)))
+        .filter(e::observed_at.lt(timestamp_to_micros(last.end)));
     let mut options = source
         .select(("agent".into_sql::<Text>(), e::agent_name))
         .union(source.select(("model".into_sql::<Text>(), e::llm_model)))

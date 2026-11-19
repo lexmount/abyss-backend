@@ -1,12 +1,13 @@
 //! The earliest request anchors a session's title to its stored stream label.
 
+use jiff_diesel::ToDiesel as _;
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use diesel::{
     PgConnection, QueryableByName, RunQueryDsl, sql_query,
     sql_types::{Array, Integer, Nullable, Text, Timestamptz, Uuid as SqlUuid},
 };
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::{error::AppError, usage::streams::EntryLabel};
@@ -17,7 +18,7 @@ pub(super) struct CapturedEvent<'a> {
     pub(super) session_pk: Uuid,
     pub(super) event_pk: Uuid,
     pub(super) event_type: &'a str,
-    pub(super) observed_at: DateTime<Utc>,
+    pub(super) observed_at: Timestamp,
 }
 
 /// Registers the earliest request even when that request has no label.
@@ -44,7 +45,7 @@ pub(super) fn capture(
     .bind::<SqlUuid, _>(event.session_pk)
     .bind::<SqlUuid, _>(event.user_id)
     .bind::<SqlUuid, _>(event.event_pk)
-    .bind::<Timestamptz, _>(event.observed_at)
+    .bind::<Timestamptz, _>(event.observed_at.to_diesel())
     .execute(connection)?;
     Ok(changed == 1)
 }

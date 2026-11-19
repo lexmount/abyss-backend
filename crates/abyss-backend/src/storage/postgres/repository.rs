@@ -6,10 +6,9 @@
 //! enqueues search projection in the same commit. Query functions always apply
 //! the authenticated owner before returning conversation or attachment data.
 
+use jiff_diesel::ToDiesel as _;
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
 use diesel::{
     Connection, ExpressionMethods, IntoSql, NullableExpressionMethods, PgConnection, QueryDsl,
     QueryableByName, RunQueryDsl, define_sql_function,
@@ -20,6 +19,8 @@ use diesel::{
     },
     upsert::excluded,
 };
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
@@ -225,7 +226,7 @@ fn ingest_one_diagnostic_capture(
     }
 
     let capture_pk = Uuid::now_v7();
-    let now = Utc::now();
+    let now = Timestamp::now();
     let inserted = diesel::insert_into(agent_diagnostic_captures::table)
         .values(NewAgentDiagnosticCapture {
             id: capture_pk,
@@ -289,7 +290,7 @@ pub fn usage_summary(
             offset: 0,
         },
         &group_by,
-        zone,
+        &zone,
     )?;
     let columns = rows
         .iter()
@@ -320,7 +321,7 @@ fn load_filtered_summary_rows(
     connection: &mut PgConnection,
     filters: &EventFilters<'_>,
     group_by: &[String],
-    zone: Tz,
+    zone: &TimeZone,
 ) -> Result<Vec<SummaryAggregateRow>, AppError> {
     let dimensions = SummaryDimensions::from_group_by(group_by);
     let sql_filters = SummarySqlFilters::from_event_filters(filters)?;
@@ -359,9 +360,9 @@ fn load_filtered_summary_rows(
         .bind::<Bool, _>(dimensions.enabled(SummaryDimension::EventType))
         .bind::<SqlUuid, _>(user_id)
         .bind::<Bool, _>(has_from)
-        .bind::<Timestamptz, _>(from)
+        .bind::<Timestamptz, _>(from.to_diesel())
         .bind::<Bool, _>(has_to)
-        .bind::<Timestamptz, _>(to)
+        .bind::<Timestamptz, _>(to.to_diesel())
         .bind::<Bool, _>(has_user_filter)
         .bind::<SqlUuid, _>(user_filter_id)
         .bind::<Bool, _>(has_user_filter_id)
@@ -379,7 +380,7 @@ fn load_filtered_summary_rows(
         .bind::<Bool, _>(has_event_type_filter)
         .bind::<Text, _>(&event_type)
         .bind::<BigInt, _>(filters.limit)
-        .bind::<Text, _>(zone.name())
+        .bind::<Text, _>(zone.iana_name().unwrap_or("UTC"))
         .load::<SummaryAggregateRow>(connection)
         .map_err(AppError::from)
 }
@@ -557,7 +558,7 @@ type HeaderColumns = (
     Option<String>,
     String,
     String,
-    DateTime<Utc>,
+    jiff_diesel::Timestamp,
     i64,
     i64,
     i64,
@@ -637,7 +638,7 @@ fn header_event(
         agent_version,
         provider,
         model,
-        observed_at,
+        observed_at: observed_at.to_jiff(),
         tokens: TokenCounts {
             input,
             output,
@@ -814,7 +815,7 @@ fn ingest_one_event(
     }
 
     let observed_at = event.observed_at;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let agent_name = event.agent.name.clone();
     let agent_version = event.agent.version.clone();
     let provider = event.llm.provider.clone();
@@ -907,7 +908,7 @@ fn insert_attachments(
     user_id: Uuid,
     event_pk: Uuid,
     attachments: Vec<ValidatedImageAttachment>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), AppError> {
     let attachment_rows = attachments
         .into_iter()
@@ -924,7 +925,7 @@ fn insert_attachments(
         })
         .collect::<Vec<_>>();
     diesel::insert_into(llm_usage_event_attachments::table)
-        .values(&attachment_rows)
+        .values(attachment_rows)
         .execute(connection)?;
     Ok(())
 }
@@ -933,8 +934,8 @@ fn upsert_device(
     connection: &mut PgConnection,
     user_id: Uuid,
     event: &IngestUsageEvent,
-    observed_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    observed_at: Timestamp,
+    now: Timestamp,
 ) -> Result<Device, AppError> {
     // We do not require a stable OS-level device id. The current product only
     // needs a user-visible device context, so host/platform identify one user's
@@ -963,7 +964,7 @@ fn upsert_device(
                 devices::last_seen_at,
                 excluded(devices::last_seen_at),
             )),
-            devices::updated_at.eq(now),
+            devices::updated_at.eq(now.to_diesel()),
         ))
         .get_result::<Device>(connection)
         .map_err(AppError::from)
@@ -1013,7 +1014,7 @@ fn upsert_session(
                 coalesce(agent_sessions::ended_at, excluded(agent_sessions::ended_at)),
                 excluded(agent_sessions::ended_at),
             )),
-            agent_sessions::updated_at.eq(input.now),
+            agent_sessions::updated_at.eq(input.now.to_diesel()),
             agent_sessions::structure_revision.eq(agent_sessions::structure_revision + 1_i64),
         ))
         .returning(agent_sessions::id)
@@ -1040,10 +1041,10 @@ fn load_filtered_events(
     query = query.filter(llm_usage_events::user_id.eq(filters.user_id));
 
     if let Some(from) = filters.from {
-        query = query.filter(llm_usage_events::observed_at.ge(from));
+        query = query.filter(llm_usage_events::observed_at.ge(from.to_diesel()));
     }
     if let Some(to) = filters.to {
-        query = query.filter(llm_usage_events::observed_at.lt(to));
+        query = query.filter(llm_usage_events::observed_at.lt(to.to_diesel()));
     }
     let agent_names = exact_values_filter(filters.agent_names);
     if !agent_names.is_empty() {
@@ -1297,10 +1298,7 @@ const fn touch_device_metadata(device: &Device) {
 }
 
 #[cfg(test)]
-fn latest_optional(
-    left: Option<DateTime<Utc>>,
-    right: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+fn latest_optional(left: Option<Timestamp>, right: Option<Timestamp>) -> Option<Timestamp> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
@@ -1310,8 +1308,8 @@ fn latest_optional(
 
 struct EventFilters<'a> {
     user_id: Uuid,
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
+    from: Option<Timestamp>,
+    to: Option<Timestamp>,
     user_filter: Option<&'a str>,
     /// Each list matches any of its values; an empty list matches everything.
     agent_names: &'a [String],
@@ -1374,8 +1372,8 @@ impl SummaryDimensions {
 
 struct SummarySqlFilters {
     user_id: Uuid,
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
+    from: Option<Timestamp>,
+    to: Option<Timestamp>,
     user_filter_id: Option<Uuid>,
     user_filter_pattern: Option<String>,
     agent_names: Vec<String>,
@@ -1495,8 +1493,8 @@ struct UpsertSessionInput<'a> {
     event: &'a IngestUsageEvent,
     agent_name: &'a str,
     agent_version: Option<String>,
-    observed_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    observed_at: Timestamp,
+    now: Timestamp,
 }
 
 #[cfg(test)]
@@ -1505,7 +1503,7 @@ mod tests {
         EventFilters, SummaryDimension, SummaryDimensions, SummarySqlFilters, event_response,
         latest_optional, normalize_limit, parse_group_by, validate_batch, validate_event_type,
     };
-    use chrono::{DateTime, TimeZone, Utc};
+    use jiff::Timestamp;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -1520,13 +1518,11 @@ mod tests {
 
     #[test]
     fn latest_optional_keeps_the_newer_timestamp() {
-        let early = Utc
-            .with_ymd_and_hms(2026, 5, 20, 1, 0, 0)
-            .single()
+        let early = "2026-05-20T01:00:00Z"
+            .parse::<Timestamp>()
             .expect("valid timestamp");
-        let late = Utc
-            .with_ymd_and_hms(2026, 5, 20, 2, 0, 0)
-            .single()
+        let late = "2026-05-20T02:00:00Z"
+            .parse::<Timestamp>()
             .expect("valid timestamp");
 
         assert_eq!(
@@ -1776,9 +1772,9 @@ mod tests {
         }
     }
 
-    fn timestamp(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 5, 20, hour, minute, second)
-            .single()
+    fn timestamp(hour: u32, minute: u32, second: u32) -> Timestamp {
+        format!("2026-05-20T{hour:02}:{minute:02}:{second:02}Z")
+            .parse::<Timestamp>()
             .expect("valid timestamp")
     }
 
