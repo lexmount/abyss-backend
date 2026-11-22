@@ -142,6 +142,12 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
     require_status(health, 200, "health check")
     require(health.json()["status"] == "ok", "health check must report ok")
 
+    registration = request(
+        base_url, "POST", "/api/auth/mcp/register",
+        json_body={"redirect_uris": ["http://127.0.0.1:1234/oauth/callback"]},
+    )
+    require_status(registration, 404, "MCP registration belongs to product Identity")
+
     unauthenticated = request(base_url, "GET", "/v1/agent-usage/events")
     require_status(unauthenticated, 401, "unauthenticated event query")
     wrong_token = request(

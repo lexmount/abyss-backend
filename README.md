@@ -5,7 +5,8 @@ It accepts normalized Agent events and exposes APIs for event history,
 summaries, session streams, attachments, and session search.
 
 This repository is intentionally focused on standalone event storage, queries,
-and search.
+and search. For the product MCP connector and its OAuth endpoint, see the
+[deployment boundary](docs/fix-workbuddy-mcp.md).
 
 ## Capabilities
 
