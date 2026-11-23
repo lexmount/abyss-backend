@@ -283,19 +283,16 @@ fn json_text<T: Serialize>(value: &T, field: &str) -> Result<String, AppError> {
         .map_err(|error| AppError::internal(format!("serialize {field}: {error}")))
 }
 
-#[derive(Queryable, Selectable)]
-#[diesel(table_name = llm_usage_event_attachments)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+/// An event's attachment with the metadata of the blob it refers to.
+#[derive(Queryable)]
 pub(super) struct AttachmentRow {
     pub(super) id: String,
-    pub(super) user_id: String,
     pub(super) event_pk: String,
     pub(super) position: i32,
     pub(super) media_type: String,
     pub(super) byte_size: i64,
     pub(super) sha256: Vec<u8>,
-    pub(super) content: Option<Vec<u8>>,
-    pub(super) created_at: i64,
+    pub(super) content_available: bool,
 }
 
 #[derive(Insertable)]
@@ -305,10 +302,7 @@ pub(super) struct NewAttachment {
     pub(super) user_id: String,
     pub(super) event_pk: String,
     pub(super) position: i32,
-    pub(super) media_type: String,
-    pub(super) byte_size: i64,
     pub(super) sha256: Vec<u8>,
-    pub(super) content: Option<Vec<u8>>,
     pub(super) created_at: i64,
 }
 
@@ -392,7 +386,7 @@ pub(super) struct AttachmentRecord {
     pub(super) media_type: String,
     pub(super) byte_size: i64,
     pub(super) sha256: Vec<u8>,
-    pub(super) content: Option<Vec<u8>>,
+    pub(super) content_available: bool,
 }
 
 impl DeviceRow {
@@ -443,7 +437,6 @@ impl EventRow {
 
 impl AttachmentRow {
     pub(super) fn into_record(self) -> Result<AttachmentRecord, AppError> {
-        let _ = (&self.user_id, self.created_at);
         Ok(AttachmentRecord {
             id: parse_uuid(&self.id, "attachment id")?,
             event_pk: parse_uuid(&self.event_pk, "attachment event id")?,
@@ -451,7 +444,7 @@ impl AttachmentRow {
             media_type: self.media_type,
             byte_size: self.byte_size,
             sha256: self.sha256,
-            content: self.content,
+            content_available: self.content_available,
         })
     }
 }
