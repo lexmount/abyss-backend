@@ -148,6 +148,11 @@ def run(base_url: str, token: str, run_id: str, in_session: bool) -> None:
         base_url, "GET", "/v1/agent-usage/events", token="wrong-token"
     )
     require_status(wrong_token, 401, "incorrect bearer token")
+    registration = request(
+        base_url, "POST", "/api/auth/mcp/register",
+        json_body={"redirect_uris": ["http://localhost:54321/callback"]},
+    )
+    require_status(registration, 404, "MCP client registration belongs to product Identity")
 
     ingest_payload = {
         "events": [

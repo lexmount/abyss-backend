@@ -49,6 +49,9 @@ Standalone deployments use one bearer token mapped to a fixed deployment
 owner. Configure only its SHA-256 digest; clients send the original token in
 the standard `Authorization: Bearer` header.
 
+Desktop MCP clients that register a localhost OAuth callback connect to the
+product gateway's `/api/mcp` endpoint. [MCP client setup](docs/abyss-mcp-oauth-localhost-redirect-fix.md)
+
 ```bash
 export ABYSS_API_TOKEN="$(openssl rand -hex 32)"
 export ABYSS_BACKEND_API_TOKEN_SHA256="$(printf '%s' "${ABYSS_API_TOKEN}" | openssl dgst -sha256 -r | cut -d' ' -f1)"
